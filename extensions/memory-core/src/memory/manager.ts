@@ -1146,7 +1146,15 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         : undefined,
       vector: {
         enabled: this.vector.enabled,
-        storeAvailable: this.vector.available ?? undefined,
+        storeAvailable:
+          (this.vector.available ??
+          (
+            this.db.prepare("SELECT 1 as found FROM chunks LIMIT 1").get() as
+              | { found: number }
+              | undefined
+          )?.found === 1)
+            ? true
+            : undefined,
         semanticAvailable: this.vector.semanticAvailable,
         available: this.vector.semanticAvailable,
         extensionPath: this.vector.extensionPath,
