@@ -34,6 +34,27 @@ describe("execSchtasks", () => {
     });
   });
 
+  it("uses the caller timeout for read-only status probes", async () => {
+    runCommandWithTimeout.mockResolvedValue({
+      stdout: "ok",
+      stderr: "",
+      code: 0,
+      signal: null,
+      killed: false,
+      termination: "exit",
+    });
+
+    await expect(execSchtasks(["/Query"], { timeoutMs: 3000 })).resolves.toEqual({
+      stdout: "ok",
+      stderr: "",
+      code: 0,
+    });
+    expect(runCommandWithTimeout).toHaveBeenCalledWith(["schtasks", "/Query"], {
+      timeoutMs: 3000,
+      noOutputTimeoutMs: 3000,
+    });
+  });
+
   it("maps a timeout into a non-zero schtasks result", async () => {
     runCommandWithTimeout.mockResolvedValue({
       stdout: "",

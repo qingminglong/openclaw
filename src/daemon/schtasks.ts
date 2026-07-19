@@ -41,6 +41,7 @@ import type {
   GatewayServiceEnvArgs,
   GatewayServiceInstallArgs,
   GatewayServiceManageArgs,
+  GatewayServiceReadOptions,
   GatewayServiceRenderArgs,
   GatewayServiceRestartResult,
 } from "./service-types.js";
@@ -455,8 +456,8 @@ function buildHiddenLauncherScript(params: { description?: string; scriptPath: s
   return `${lines.join("\r\n")}\r\n`;
 }
 
-async function assertSchtasksAvailable() {
-  const res = await execSchtasks(["/Query"]);
+async function assertSchtasksAvailable(options?: GatewayServiceReadOptions) {
+  const res = await execSchtasks(["/Query"], options);
   if (res.code === 0) {
     return;
   }
@@ -513,9 +514,12 @@ async function waitForScheduledTaskRunningEvidence(env: GatewayServiceEnv): Prom
   }
 }
 
-async function isRegisteredScheduledTask(env: GatewayServiceEnv): Promise<boolean> {
+async function isRegisteredScheduledTask(
+  env: GatewayServiceEnv,
+  options?: GatewayServiceReadOptions,
+): Promise<boolean> {
   const taskName = resolveTaskName(env);
-  const res = await execSchtasks(["/Query", "/TN", taskName]).catch(() => ({
+  const res = await execSchtasks(["/Query", "/TN", taskName], options).catch(() => ({
     code: 1,
     stdout: "",
     stderr: "",
@@ -2074,7 +2078,7 @@ export async function restartScheduledTask({
 
 export async function isScheduledTaskInstalled(args: GatewayServiceEnvArgs): Promise<boolean> {
   const effectiveEnv = args.env ?? (process.env as GatewayServiceEnv);
-  if (await isRegisteredScheduledTask(effectiveEnv)) {
+  if (await isRegisteredScheduledTask(effectiveEnv, { timeoutMs: args.timeoutMs })) {
     return true;
   }
   return await isStartupEntryInstalled(effectiveEnv);
@@ -2082,9 +2086,10 @@ export async function isScheduledTaskInstalled(args: GatewayServiceEnvArgs): Pro
 
 export async function readScheduledTaskRuntime(
   env: GatewayServiceEnv = process.env as GatewayServiceEnv,
+  options?: GatewayServiceReadOptions,
 ): Promise<GatewayServiceRuntime> {
   try {
-    await assertSchtasksAvailable();
+    await assertSchtasksAvailable(options);
   } catch (err) {
     if (await isStartupEntryInstalled(env)) {
       return await resolveFallbackRuntime(env);
@@ -2095,7 +2100,7 @@ export async function readScheduledTaskRuntime(
     };
   }
   const taskName = resolveTaskName(env);
-  const res = await execSchtasks(["/Query", "/TN", taskName, "/V", "/FO", "LIST"]);
+  const res = await execSchtasks(["/Query", "/TN", taskName, "/V", "/FO", "LIST"], options);
   if (res.code !== 0) {
     if (await isStartupEntryInstalled(env)) {
       return await resolveFallbackRuntime(env);

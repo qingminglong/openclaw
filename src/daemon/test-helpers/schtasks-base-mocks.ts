@@ -1,6 +1,7 @@
 /** Base Vitest mocks for Windows schtasks daemon tests. */
 import { vi } from "vitest";
 import {
+  schtasksCallOptions,
   inspectPortUsage,
   killProcessTree,
   schtasksCalls,
@@ -9,8 +10,9 @@ import {
 
 // Shared Windows schtasks mocks for daemon tests.
 vi.mock("../schtasks-exec.js", () => ({
-  execSchtasks: async (argv: string[]) => {
+  execSchtasks: async (argv: string[], options?: { timeoutMs?: number }) => {
     schtasksCalls.push(argv);
+    schtasksCallOptions.push(options);
     return schtasksResponses.shift() ?? { code: 0, stdout: "", stderr: "" };
   },
 }));

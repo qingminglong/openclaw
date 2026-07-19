@@ -27,6 +27,8 @@ import {
   inspectPortUsage,
   killProcessTree,
   resetSchtasksBaseMocks,
+  schtasksCallOptions,
+  schtasksCalls,
   schtasksResponses,
   withWindowsEnv,
   writeGatewayScript,
@@ -1561,6 +1563,24 @@ describe("Windows startup fallback", () => {
     });
   });
 
+  it("passes status read timeouts to scheduled task runtime probes", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      schtasksResponses.push(
+        { code: 0, stdout: "", stderr: "" },
+        { code: 0, stdout: runningTaskQueryOutput(), stderr: "" },
+      );
+
+      const runtime = await readScheduledTaskRuntime(env, { timeoutMs: 3000 });
+
+      expect(runtime.status).toBe("running");
+      expect(schtasksCalls.slice(0, 2)).toEqual([
+        ["/Query"],
+        ["/Query", "/TN", "OpenClaw Gateway", "/V", "/FO", "LIST"],
+      ]);
+      expect(schtasksCallOptions.slice(0, 2)).toEqual([{ timeoutMs: 3000 }, { timeoutMs: 3000 }]);
+    });
+  });
+
   it("reports the exact scheduled gateway process while its listener is still starting", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       vi.spyOn(process, "platform", "get").mockReturnValue("win32");
@@ -1700,6 +1720,17 @@ describe("Windows startup fallback", () => {
       await writeStartupFallbackEntry(env);
 
       await expect(isScheduledTaskInstalled({ env })).resolves.toBe(true);
+    });
+  });
+
+  it("passes status read timeouts to scheduled task installed checks", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      schtasksResponses.push({ code: 1, stdout: "", stderr: "not found" });
+
+      await expect(isScheduledTaskInstalled({ env, timeoutMs: 3000 })).resolves.toBe(false);
+
+      expect(schtasksCalls[0]).toEqual(["/Query", "/TN", "OpenClaw Gateway"]);
+      expect(schtasksCallOptions[0]).toEqual({ timeoutMs: 3000 });
     });
   });
 
