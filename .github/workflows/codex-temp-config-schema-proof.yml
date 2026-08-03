@@ -84,19 +84,15 @@ jobs:
           }
 
           walk(schema, "");
-          const selected = matches.filter(({ path }) =>
-            path.includes("agents.defaults.skipBootstrap") ||
-            path.includes("agents.defaults.contextInjection"),
-          );
+          const selected = matches;
           console.log(JSON.stringify(selected, null, 2));
-          if (
-            !selected.some(({ path }) => path.includes("agents.defaults.skipBootstrap")) ||
-            !selected.some(({ path, schema: value }) =>
-              path.includes("agents.defaults.contextInjection") &&
-              Array.isArray(value.enum) &&
-              ["always", "continuation-skip", "never"].every((item) => value.enum.includes(item)),
-            )
-          ) {
+          const skip = selected.find(({ path }) => path.endsWith(".skipBootstrap") || path === "skipBootstrap");
+          const context = selected.find(({ path, schema: value }) =>
+            (path.endsWith(".contextInjection") || path === "contextInjection") &&
+            Array.isArray(value.enum) &&
+            ["always", "continuation-skip", "never"].every((item) => value.enum.includes(item)),
+          );
+          if (!skip || !context) {
             console.error("Required schema entries or enum values were not found.");
             process.exit(1);
           }
