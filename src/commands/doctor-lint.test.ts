@@ -155,7 +155,7 @@ describe("runDoctorLintCli", () => {
     try {
       const exitCode = await runDoctorLintCli(runtime, {
         json: true,
-        onlyIds: ["core/doctor/session-locks"],
+        onlyIds: ["core/doctor/not-a-check"],
       });
 
       expect(exitCode).toBe(1);
@@ -167,7 +167,7 @@ describe("runDoctorLintCli", () => {
           {
             checkId: "core/doctor/lint-selection",
             severity: "error",
-            path: "core/doctor/session-locks",
+            path: "core/doctor/not-a-check",
           },
         ],
       });
@@ -219,7 +219,9 @@ describe("runDoctorLintCli", () => {
         ],
       });
       expect(payload.findings[0].message).toContain("Codex plugin is disabled by config");
-      expect(payload.findings[0].fixHint).toContain("openclaw doctor --fix");
+      // Explicit plugins.entries.codex.enabled=false blocks auto-repair, so the
+      // hint names the manual action instead of promising doctor --fix.
+      expect(payload.findings[0].fixHint).toContain("Enable plugins.entries.codex");
     } finally {
       stdout.mockRestore();
     }
@@ -242,6 +244,7 @@ describe("runDoctorLintCli", () => {
             checkId: "plugin/example/lint",
             severity: "info",
             message: "plugin finding",
+            fixHint: "Review the plugin finding.",
           },
         ];
       },
@@ -281,6 +284,7 @@ describe("runDoctorLintCli", () => {
             checkId: "plugin/example/lint",
             severity: "info",
             message: "plugin finding",
+            fixHint: "Review the plugin finding.",
           },
         ];
       },
@@ -302,6 +306,7 @@ describe("runDoctorLintCli", () => {
           checkId: "plugin/example/lint",
           severity: "info",
           message: "plugin finding",
+          fixHint: "Review the plugin finding.",
         },
       ]);
     } finally {

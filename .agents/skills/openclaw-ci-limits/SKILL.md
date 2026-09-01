@@ -1,6 +1,6 @@
 ---
 name: openclaw-ci-limits
-description: Manage OpenClaw GitHub Actions and Blacksmith CI capacity, runner-registration budgets, fanout caps, main-push debounce, shard sizing, hosted-runner offload, queue health, and safe ramp-down/ramp-up changes. Use when tuning `.github/workflows/*`, `docs/ci.md`, CI runner labels, matrix `max-parallel`, ClawSweeper/Blacksmith burst protection, CodeQL runner placement, or investigating slow/queued OpenClaw CI.
+description: Manage OpenClaw GitHub Actions and Blacksmith CI capacity, runner-registration budgets, fanout caps, main-push single-flight, shard sizing, hosted-runner offload, queue health, and safe ramp-down/ramp-up changes. Use when tuning `.github/workflows/*`, `docs/ci.md`, CI runner labels, matrix `max-parallel`, ClawSweeper/Blacksmith burst protection, CodeQL runner placement, or investigating slow/queued OpenClaw CI.
 ---
 
 # OpenClaw CI Limits
@@ -13,13 +13,17 @@ registration edge limit.
 
 - The scarce resource is Blacksmith runner registrations, not Blacksmith vCPU
   capacity.
-- GitHub runner registrations are capped at 1,500 per 5 minutes per repository,
-  organization, or enterprise. The `openclaw` organization shares one bucket.
+- GitHub runner registrations for `openclaw` currently report a 10,000 per
+  5-minute bucket in `actions_runner_registration`. Verify the live bucket
+  before each tuning pass because GitHub can change it. The `openclaw`
+  organization shares one bucket.
 - Core REST quota does not draw down this bucket. Check
   `actions_runner_registration` separately; core quota can be healthy while
   runner registration is throttled.
-- Use 1,000 registrations per 5 minutes as the operating target. Leave the last
-  third for other repos, retries, and burst overlap.
+- Use about 60% of the live bucket as the operating target. With the current
+  10,000-registration bucket, keep planned Blacksmith burst load under 6,000
+  registrations per 5 minutes and leave the rest for other repos, retries, and
+  burst overlap.
 - Jobs that route, notify, summarize, choose shards, or run short CodeQL quality
   scans should stay on GitHub-hosted runners unless measured evidence says
   Blacksmith is required.
@@ -80,25 +84,24 @@ and register more runners before the window resets. Use job duration, retries,
 and queue turnover to justify any lower estimate. Add non-matrix Blacksmith jobs
 such as `preflight`, `security-fast`, `build-artifacts`, and platform lanes.
 
-For repeated pushes, multiply by the number of runs expected to reach
-Blacksmith admission in the same 5-minute window, including runs canceled after
-admission. The debounce only suppresses pushes that arrive while
-`runner-admission` is still sleeping; once Blacksmith jobs register, those
-registrations are spent even if a later push cancels the run. If timing is
-uncertain, count every sequential push in the window.
+For repeated pull-request pushes, multiply by the number of runs expected to
+reach Blacksmith admission in the same 5-minute window, including runs canceled
+after admission. Canonical `main` is single-flight: one run completes while
+GitHub's default single pending slot is replaced by the newest push. Count one
+active main matrix plus its next pending matrix, not every intermediate merge.
 
-Reject a change unless the org-level worst case stays below 1,000 registrations
-per 5 minutes with headroom for ClawSweeper, ClawHub, Clownfish, OpenClaw RTT,
-and Clawbench.
+Reject a change unless the org-level worst case stays below about 60% of the
+live bucket. With the current 10,000-registration bucket, keep planned
+Blacksmith burst load under 6,000 registrations per 5 minutes with headroom for
+ClawSweeper, ClawHub, Clownfish, OpenClaw RTT, and Clawbench.
 
 ## Safe Levers
 
 Prefer these in order:
 
-1. Add or preserve concurrency groups that cancel superseded PR and canonical
-   `main` runs before Blacksmith work starts.
-2. Keep the `runner-admission` hosted debounce for canonical `main` pushes.
-   Change `OPENCLAW_MAIN_CI_DEBOUNCE_SECONDS` only with evidence.
+1. Preserve cancel-in-progress for superseded pull-request heads.
+2. Preserve canonical `main` single-flight without canceling its running
+   integration cycle; GitHub's default pending slot coalesces to the newest tip.
 3. Move high-frequency, short, non-build jobs to `ubuntu-24.04`.
 4. Reduce matrix rows by bundling related tests inside one runner job when the
    combined job stays under timeout and keeps useful failure names.
@@ -115,24 +118,33 @@ Do not:
 - raise all `max-parallel` values at once;
 - make manual `workflow_dispatch` runs cancel normal push/PR validation;
 - delete coverage just to reduce runner count;
-- treat cancelled superseded runs as failures without checking the newest run
-  for the same ref.
+- treat cancelled superseded pull-request runs as failures without checking the
+  newest run for the same ref.
 
 ## Current OpenClaw Knobs
 
 These are intentionally guarded by `test/scripts/ci-workflow-guards.test.ts`:
 
-- `CI` concurrency key version and `cancel-in-progress` for PRs and canonical
-  `main` pushes.
-- `runner-admission` on `ubuntu-24.04` with
-  `OPENCLAW_MAIN_CI_DEBOUNCE_SECONDS=90`.
-- `preflight` and `security-fast` needing `runner-admission`.
-- CI matrix caps: fast/check lanes at 8, compact Node PR plan at current caps,
-  Windows and Android at 2.
+- `CI` concurrency key version, PR cancellation, and non-canceling canonical
+  `main` single-flight with one coalesced pending tip.
+- `preflight` and hosted `security-fast` start immediately without a debounce
+  or standalone admission job. On Node-relevant canonical main pushes,
+  preflight also owns the sole dependency sticky-disk write and 8 GiB prune
+  before fanout; replacement visibility is proved only by a later exact-marker
+  restore because Blacksmith snapshot promotion can lag job completion.
+- CI matrix caps: fast/check lanes at 12, Node test shards at 28, Windows and
+  Android at 2.
+- Canonical PR Node tests use one precise changed-target job when possible;
+  broad, deleted, unknown, or planner-failed changes fall back to the 14-job
+  compact full-suite plan. Targeted plans retain the full built-artifact
+  boundary gate. `main`, manual, and release runs stay full.
 - `build-artifacts` on `blacksmith-16vcpu-ubuntu-2404`.
 - lower-weight Node/check shards on `blacksmith-4vcpu-ubuntu-2404`.
 - heavy retained Linux/Android shards on `blacksmith-8vcpu-ubuntu-2404`.
 - CodeQL Critical Quality on `ubuntu-24.04` with no `blacksmith-` labels.
+- Vitest/test compile caches are restore-only in CI and use immutable Actions
+  caches; the daily/dispatch warmer is their sole writer. Build compile cache
+  writes rotate at most once per UTC day. PRs create no runtime-cache archives.
 
 When changing one knob, update `docs/ci.md` and the guard test in the same PR.
 

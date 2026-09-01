@@ -70,6 +70,12 @@ export type ChannelStreamingProgressConfig = {
   commandText?: ChannelStreamingCommandTextMode;
   /** Include assistant commentary/preamble text in the progress draft. Default: false. */
   commentary?: boolean;
+  /**
+   * Replace tool lines with a short utility-model narration of what the agent
+   * is doing. Runs when a utility model resolves (explicit `utilityModel` or
+   * the primary provider's declared default). Default: true.
+   */
+  narration?: boolean;
 };
 
 export type ChannelStreamingPreviewConfig = {
@@ -164,7 +170,7 @@ export type SessionSendPolicyConfig = {
   rules?: SessionSendPolicyRule[];
 };
 
-export type SessionResetMode = "daily" | "idle";
+export type SessionResetMode = "none" | "daily" | "idle";
 export type SessionResetConfig = {
   mode?: SessionResetMode;
   /** Local hour (0-23) for the daily reset boundary. */
@@ -174,8 +180,6 @@ export type SessionResetConfig = {
 };
 export type SessionResetByTypeConfig = {
   direct?: SessionResetConfig;
-  /** @deprecated Use `direct` instead. Kept for backward compatibility. */
-  dm?: SessionResetConfig;
   group?: SessionResetConfig;
   thread?: SessionResetConfig;
 };
@@ -251,26 +255,24 @@ export type SessionMaintenanceMode = "enforce" | "warn";
 
 /** Session-store cleanup policy for transcript count, age, archives, and disk budget. */
 export type SessionMaintenanceConfig = {
-  /** Whether to enforce maintenance or warn only. Default: "warn". */
+  /** Whether to enforce maintenance or warn only. Default: "enforce". */
   mode?: SessionMaintenanceMode;
   /** Remove session entries older than this duration (e.g. "30d", "12h"). Default: "30d". */
   pruneAfter?: string | number;
-  /** @deprecated Use pruneAfter instead. */
-  pruneDays?: number;
   /** Maximum number of session entries to keep. Default: 500. */
   maxEntries?: number;
-  /** @deprecated Ignored. Run `openclaw doctor --fix` to remove. */
-  rotateBytes?: number | string;
   /**
-   * Retention for archived reset transcripts (`*.reset.<timestamp>`).
-   * Set `false` to disable reset-archive cleanup. Default: same as `pruneAfter` (30d).
+   * Age-based retention for archived transcripts (`*.reset.<timestamp>` and
+   * `*.deleted.<timestamp>`). Default and `false`: keep archives until the
+   * disk budget evicts them oldest-first; a duration opts into deletion.
    */
   resetArchiveRetention?: string | number | false;
   /**
-   * Optional per-agent sessions-directory disk budget (e.g. "500mb").
-   * When exceeded, warn (mode=warn) or enforce oldest-first cleanup (mode=enforce).
+   * Per-agent sessions-directory disk budget (e.g. "500mb"). Default: "10gb".
+   * When exceeded, warn (mode=warn) or enforce oldest-first cleanup
+   * (mode=enforce). Set `false` to disable the budget entirely.
    */
-  maxDiskBytes?: number | string;
+  maxDiskBytes?: number | string | false;
   /**
    * Target size after disk-budget cleanup (high-water mark), e.g. "400mb".
    * Default: 80% of maxDiskBytes.
@@ -338,6 +340,22 @@ export type DiagnosticsCacheTraceConfig = {
   includePrompt?: boolean;
   /** Include system-message content in cache trace output. */
   includeSystem?: boolean;
+};
+
+export type AuditConfig = {
+  /**
+   * Record metadata-only run, tool, and enabled message lifecycle events into
+   * the shared state database. Content is never stored. Default: true. This is
+   * startup-scoped; disabling stops new event inserts after restart while retained
+   * records stay readable until they expire.
+   */
+  enabled?: boolean;
+  /**
+   * Record content-free message lifecycle metadata. `direct` records only
+   * known direct conversations; `all` also records group, channel, and
+   * unknown conversation kinds. Default: `off`.
+   */
+  messages?: "off" | "direct" | "all";
 };
 
 export type DiagnosticsConfig = {

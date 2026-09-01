@@ -353,13 +353,19 @@ describe("skills cli commands", () => {
     );
   }
 
-  it("searches ClawHub skills from the native CLI", async () => {
+  it("distinguishes duplicate ClawHub skill slugs by owner", async () => {
     searchSkillsFromClawHubMock.mockResolvedValue([
       {
         slug: "calendar",
+        ownerHandle: "demo-owner",
         displayName: "Calendar",
         summary: "CalDAV helpers",
         version: "1.2.3",
+      },
+      {
+        slug: "calendar",
+        ownerHandle: "work-owner",
+        displayName: "Team Calendar",
       },
     ]);
 
@@ -369,10 +375,43 @@ describe("skills cli commands", () => {
       query: "calendar",
       limit: undefined,
     });
-    expect(
-      runtimeLogs.some((line) => line.includes("calendar v1.2.3  Calendar")),
-      "search result log",
-    ).toBe(true);
+    expect(runtimeLogs).toEqual([
+      "@demo-owner/calendar v1.2.3  Calendar  CalDAV helpers",
+      "@work-owner/calendar  Team Calendar",
+    ]);
+  });
+
+  it("keeps bare skill slugs when ClawHub omits the owner", async () => {
+    searchSkillsFromClawHubMock.mockResolvedValue([
+      {
+        slug: "legacy-calendar",
+        displayName: "Legacy Calendar",
+      },
+    ]);
+
+    await runCommand(["skills", "search", "calendar"]);
+
+    expect(runtimeLogs).toEqual(["legacy-calendar  Legacy Calendar"]);
+  });
+
+  it("keeps ClawHub skill search JSON output unchanged", async () => {
+    const results = [
+      {
+        score: 0.9,
+        slug: "calendar",
+        ownerHandle: "demo-owner",
+        displayName: "Calendar",
+        summary: "CalDAV helpers",
+        version: "1.2.3",
+        updatedAt: 1_700_000_000_000,
+      },
+    ];
+    searchSkillsFromClawHubMock.mockResolvedValue(results);
+
+    await runCommand(["skills", "search", "calendar", "--json"]);
+
+    expect(runtimeLogs).toEqual([]);
+    expect(runtimeStdout).toEqual([JSON.stringify({ results }, null, 2)]);
   });
 
   it("rejects partial numeric search limits", async () => {
@@ -659,6 +698,56 @@ describe("skills cli commands", () => {
     );
   });
 
+  it("passes --acknowledge-clawhub-risk through for ClawHub skill installs", async () => {
+    installSkillFromClawHubMock.mockResolvedValue({
+      ok: true,
+      slug: "calendar",
+      version: "1.2.3",
+      targetDir: "/tmp/workspace/skills/calendar",
+    });
+
+    await runCommand(["skills", "install", "calendar", "--acknowledge-clawhub-risk"]);
+
+    expect(installSkillFromClawHubMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceDir: "/tmp/workspace",
+        slug: "calendar",
+        acknowledgeClawHubRisk: true,
+      }),
+    );
+  });
+
+  it("prints acknowledgement guidance for unacknowledged ClawHub skill installs", async () => {
+    installSkillFromClawHubMock.mockResolvedValue({
+      ok: false,
+      code: "clawhub_risk_acknowledgement_required",
+      error:
+        "Install cancelled; rerun with --acknowledge-clawhub-risk to continue after reviewing the warning.",
+      warning: "WARNING - ClawHub found security risks in this release",
+    });
+
+    await expect(runCommand(["skills", "install", "calendar"])).rejects.toThrow("__exit__:1");
+
+    expect(runtimeErrors).toContain(
+      "Install cancelled; rerun with --acknowledge-clawhub-risk to continue after reviewing the warning.",
+    );
+  });
+
+  it("prints blocked ClawHub skill install failures when no trust warning was emitted", async () => {
+    installSkillFromClawHubMock.mockResolvedValue({
+      ok: false,
+      code: "clawhub_download_blocked",
+      error:
+        'ClawHub blocked artifact download for "calendar@1.2.3"; install was not started. ClawHub /api/v1/skills/calendar/versions/1.2.3/download failed (403): blocked.',
+    });
+
+    await expect(runCommand(["skills", "install", "calendar"])).rejects.toThrow("__exit__:1");
+
+    expect(runtimeErrors).toContain(
+      'ClawHub blocked artifact download for "calendar@1.2.3"; install was not started. ClawHub /api/v1/skills/calendar/versions/1.2.3/download failed (403): blocked.',
+    );
+  });
+
   it("rejects using --global and --agent together for installs", async () => {
     await expect(
       runCommand(["skills", "install", "calendar", "--global", "--agent", "main"]),
@@ -746,6 +835,48 @@ describe("skills cli commands", () => {
         slug: undefined,
         forceInstall: true,
       }),
+    );
+  });
+
+  it("passes --acknowledge-clawhub-risk through for ClawHub skill updates", async () => {
+    readTrackedClawHubSkillSlugsMock.mockResolvedValue(["calendar"]);
+    updateSkillsFromClawHubMock.mockResolvedValue([
+      {
+        ok: true,
+        slug: "calendar",
+        previousVersion: "1.2.2",
+        version: "1.2.3",
+        changed: true,
+        targetDir: "/tmp/workspace/skills/calendar",
+      },
+    ]);
+
+    await runCommand(["skills", "update", "--all", "--acknowledge-clawhub-risk"]);
+
+    expect(updateSkillsFromClawHubMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceDir: "/tmp/workspace",
+        acknowledgeClawHubRisk: true,
+      }),
+    );
+  });
+
+  it("prints acknowledgement guidance for unacknowledged ClawHub skill updates", async () => {
+    readTrackedClawHubSkillSlugsMock.mockResolvedValue(["calendar"]);
+    updateSkillsFromClawHubMock.mockResolvedValue([
+      {
+        ok: false,
+        code: "clawhub_risk_acknowledgement_required",
+        error:
+          "Update cancelled; rerun with --acknowledge-clawhub-risk to continue after reviewing the warning.",
+        warning: "WARNING - ClawHub found security risks in this release",
+      },
+    ]);
+
+    await expect(runCommand(["skills", "update", "calendar"])).rejects.toThrow("__exit__:1");
+
+    expect(runtimeErrors).toContain(
+      "Update cancelled; rerun with --acknowledge-clawhub-risk to continue after reviewing the warning.",
     );
   });
 
@@ -1375,3 +1506,4 @@ describe("skills cli commands", () => {
     expect(runtimeStdout.at(-1)).toContain("openclaw skills search");
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
