@@ -2,8 +2,11 @@
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { verifyStableMainCloseout } from "./lib/stable-release-closeout.mjs";
+import { basename, resolve } from "node:path";
+import {
+  verifyReleaseEvidenceChecksum,
+  verifyStableMainCloseout,
+} from "./lib/stable-release-closeout.mjs";
 
 function parseArgs(argv) {
   const values = new Map();
@@ -26,6 +29,7 @@ function parseArgs(argv) {
     "tag-dir",
     "release-json",
     "full-release-validation-run-id",
+    "full-release-validation-run-attempt",
     "release-publish-run-id",
     "rollback-drill-id",
     "rollback-drill-date",
@@ -50,6 +54,19 @@ function gitSha(dir) {
 }
 
 function main() {
+  if (process.argv[2] === "verify-checksum") {
+    if (process.argv.length !== 4) {
+      throw new Error("usage: verify-stable-main-closeout.mjs verify-checksum <evidence-file>");
+    }
+    const path = resolve(process.argv[3]);
+    verifyReleaseEvidenceChecksum({
+      assetName: basename(path),
+      assetBytes: readFileSync(path),
+      checksum: readFileSync(`${path}.sha256`, "utf8"),
+    });
+    console.log(`release evidence checksum verified: ${basename(path)}`);
+    return;
+  }
   const args = parseArgs(process.argv.slice(2));
   const mainDir = resolve(args["main-dir"]);
   const tagDir = resolve(args["tag-dir"]);
@@ -60,14 +77,25 @@ function main() {
     mainChangelog: readFileSync(resolve(mainDir, "CHANGELOG.md"), "utf8"),
     tagChangelog: readFileSync(resolve(tagDir, "CHANGELOG.md"), "utf8"),
     mainAppcast: readFileSync(resolve(mainDir, "appcast.xml"), "utf8"),
+    publishedAppcast: args["published-appcast"]
+      ? readFileSync(resolve(args["published-appcast"]), "utf8")
+      : undefined,
     release: readJson(resolve(args["release-json"])),
     releaseTagSha: gitSha(tagDir),
     mainSha: gitSha(mainDir),
     fullReleaseValidationRunId: args["full-release-validation-run-id"],
+    fullReleaseValidationRunAttempt: args["full-release-validation-run-attempt"],
     releasePublishRunId: args["release-publish-run-id"],
     rollbackDrillId: args["rollback-drill-id"],
     rollbackDrillDate: args["rollback-drill-date"],
     allowStaleRollbackDrill: args["allow-stale-rollback-drill"] === "true",
+    allowFailedPublishRecovery: args["allow-failed-publish-recovery"] === "true",
+    publishRecovery: args["publish-recovery"]
+      ? readJson(resolve(args["publish-recovery"]))
+      : undefined,
+    existingManifest: args["existing-manifest"]
+      ? readJson(resolve(args["existing-manifest"]))
+      : undefined,
     nowMs: Date.now(),
   });
   if (result.errors.length > 0 || !result.manifest) {

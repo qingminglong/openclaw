@@ -2,6 +2,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  appendMemoryHostEvent,
   readMemoryHostEventRecords,
   readMemoryHostEvents,
 } from "openclaw/plugin-sdk/memory-host-events";
@@ -167,6 +168,7 @@ describe("memory host event journal integration", () => {
       workspaceDir,
       phase: "light",
       bodyLines: ["- staged note", "- second note"],
+      hasContent: true,
       nowMs: Date.UTC(2026, 3, 5, 13, 0, 0),
       storage: { mode: "both", separateReports: true },
     });
@@ -185,7 +187,30 @@ describe("memory host event journal integration", () => {
       throw new Error("expected dream completion event");
     }
     expect(dreamEvent.phase).toBe("light");
+    expect(dreamEvent.outcome).toBe("completed");
     expect(dreamEvent.lineCount).toBe(2);
     expect(dreamEvent.storageMode).toBe("both");
+  });
+
+  it("keeps legacy dreaming completion events without outcome readable", async () => {
+    const workspaceDir = await createTempWorkspace("memory-core-legacy-dream-events-");
+    await appendMemoryHostEvent(workspaceDir, {
+      type: "memory.dream.completed",
+      timestamp: "2026-04-05T13:00:00.000Z",
+      phase: "deep",
+      inlinePath: path.join(workspaceDir, "DREAMS.md"),
+      lineCount: 2,
+      storageMode: "inline",
+    });
+
+    const events = await readMemoryHostEvents({ workspaceDir });
+
+    expect(events).toHaveLength(1);
+    const dreamEvent = events[0];
+    if (dreamEvent?.type !== "memory.dream.completed") {
+      throw new Error("expected dream completion event");
+    }
+    expect(dreamEvent.outcome).toBeUndefined();
+    expect(dreamEvent.phase).toBe("deep");
   });
 });

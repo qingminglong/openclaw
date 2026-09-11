@@ -35,6 +35,10 @@ function normalizeGroupLabel(raw?: string) {
   return normalizeHyphenSlug(raw);
 }
 
+function joinOpaqueTail(parts: string[], start: number): string | null {
+  return normalizeOptionalString(parts[start]) ? parts.slice(start).join(":") : null;
+}
+
 function resolveOriginatingGroupTargetId(params: {
   ctx: MsgContext;
   provider: string;
@@ -43,7 +47,7 @@ function resolveOriginatingGroupTargetId(params: {
   if (!target) {
     return null;
   }
-  const parts = target.split(":").filter(Boolean);
+  const parts = target.split(":");
   if (parts.length < 2) {
     return null;
   }
@@ -54,13 +58,13 @@ function resolveOriginatingGroupTargetId(params: {
   const second = normalizeOptionalLowercaseString(parts[1]);
   const secondIsKind = second === "group" || second === "channel";
   if (secondIsKind && (head === params.provider || getGroupSurfaces().has(head))) {
-    return parts.slice(2).join(":") || null;
+    return joinOpaqueTail(parts, 2);
   }
   if (head === params.provider || head === "chat" || head === "room" || head === "group") {
-    return parts.slice(1).join(":") || null;
+    return joinOpaqueTail(parts, 1);
   }
   if (head === "channel") {
-    return parts.slice(1).join(":") || null;
+    return joinOpaqueTail(parts, 1);
   }
   return null;
 }
@@ -76,10 +80,36 @@ function shortenGroupId(value?: string) {
   return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
 }
 
+/**
+ * Builds a human-readable group/channel title from stored chat metadata.
+ * Prefers the native channel name (#general) or the chat subject verbatim;
+ * returns undefined when only opaque route ids are available so callers can
+ * fall back to the compact token form below.
+ */
+export function buildGroupDisplayTitle(params: {
+  subject?: string;
+  topicName?: string;
+  groupChannel?: string;
+  space?: string;
+}): string | undefined {
+  const subject = normalizeOptionalString(params.subject);
+  const groupChannel = normalizeOptionalString(params.groupChannel);
+  const space = normalizeOptionalString(params.space);
+  if (groupChannel) {
+    const channelLabel = groupChannel.startsWith("#") ? groupChannel : `#${groupChannel}`;
+    return space ? `${space} ${channelLabel}` : channelLabel;
+  }
+  return (
+    [subject ?? space, normalizeOptionalString(params.topicName)].filter(Boolean).join(" / ") ||
+    undefined
+  );
+}
+
 /** Builds a compact display label for group sessions from channel metadata or ids. */
 export function buildGroupDisplayName(params: {
   provider?: string;
   subject?: string;
+  topicName?: string;
   groupChannel?: string;
   space?: string;
   id?: string;
@@ -88,7 +118,7 @@ export function buildGroupDisplayName(params: {
   const providerKey = normalizeOptionalLowercaseString(params.provider) ?? "group";
   const groupChannel = normalizeOptionalString(params.groupChannel);
   const space = normalizeOptionalString(params.space);
-  const subject = normalizeOptionalString(params.subject);
+  const subject = buildGroupDisplayTitle({ subject: params.subject, topicName: params.topicName });
   const detail =
     (groupChannel && space
       ? `${space}${groupChannel.startsWith("#") ? "" : "#"}${groupChannel}`
@@ -134,7 +164,7 @@ export function resolveGroupSessionKey(ctx: MsgContext): GroupKeyResolution | nu
 
   const providerHint = normalizeOptionalLowercaseString(ctx.Provider);
 
-  const parts = from.split(":").filter(Boolean);
+  const parts = from.split(":");
   const head = normalizeLowercaseStringOrEmpty(parts[0]);
   const headIsSurface = head ? getGroupSurfaces().has(head) : false;
 
@@ -164,9 +194,12 @@ export function resolveGroupSessionKey(ctx: MsgContext): GroupKeyResolution | nu
     ? originatingGroupTargetId
     : headIsSurface
       ? secondIsKind
-        ? parts.slice(2).join(":")
-        : parts.slice(1).join(":")
+        ? joinOpaqueTail(parts, 2)
+        : joinOpaqueTail(parts, 1)
       : from;
+  if (!id) {
+    return null;
+  }
   const finalId = normalizeSessionPeerId({ channel: provider, peerKind: kind, peerId: id });
   if (!finalId) {
     return null;

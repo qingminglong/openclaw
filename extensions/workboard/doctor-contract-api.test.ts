@@ -2,15 +2,18 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { createPluginStateKeyedStoreForTests as createPluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import type {
   OpenKeyedStoreOptions,
   PluginDoctorStateMigrationContext,
-} from "openclaw/plugin-sdk/runtime-doctor";
+} from "openclaw/plugin-sdk/runtime-doctor-migrations";
 import { describe, expect, it } from "vitest";
 import { stateMigrations } from "./doctor-contract-api.js";
+import type { PersistedWorkboardCard } from "./src/persistence-types.js";
 import { createWorkboardSqliteStores } from "./src/sqlite-store.js";
-import { WorkboardStore, type PersistedWorkboardCard } from "./src/store.js";
+import { WorkboardStore } from "./src/store.js";
+import { sqliteTestAuxStores } from "./src/test/sqlite-store.js";
 
 function createDoctorContext(env: NodeJS.ProcessEnv): PluginDoctorStateMigrationContext {
   return {
@@ -93,7 +96,7 @@ describe("workboard doctor contract", () => {
         contentBase64: Buffer.from("ok").toString("base64"),
       });
 
-      const migration = stateMigrations[0];
+      const migration = expectDefined(stateMigrations[0], "workboard state migration");
       await expect(
         migration.detectLegacyState({
           config: {},
@@ -202,7 +205,10 @@ describe("workboard doctor contract", () => {
       });
       sqlite.close();
 
-      const result = await stateMigrations[0].migrateLegacyState({
+      const result = await expectDefined(
+        stateMigrations[0],
+        "workboard state migration",
+      ).migrateLegacyState({
         config: {},
         env,
         stateDir,
@@ -275,7 +281,10 @@ describe("workboard doctor contract", () => {
       });
       sqlite.close();
 
-      const result = await stateMigrations[0].migrateLegacyState({
+      const result = await expectDefined(
+        stateMigrations[0],
+        "workboard state migration",
+      ).migrateLegacyState({
         config: {},
         env,
         stateDir,
@@ -340,7 +349,10 @@ describe("workboard doctor contract", () => {
         contentBase64: Buffer.from("ok").toString("base64"),
       });
 
-      const result = await stateMigrations[0].migrateLegacyState({
+      const result = await expectDefined(
+        stateMigrations[0],
+        "workboard state migration",
+      ).migrateLegacyState({
         config: {},
         env,
         stateDir,
@@ -420,7 +432,10 @@ describe("workboard doctor contract", () => {
       });
       sqlite.close();
 
-      const result = await stateMigrations[0].migrateLegacyState({
+      const result = await expectDefined(
+        stateMigrations[0],
+        "workboard state migration",
+      ).migrateLegacyState({
         config: {},
         env,
         stateDir,
@@ -437,7 +452,7 @@ describe("workboard doctor contract", () => {
       expect(await attachmentStore.entries()).toHaveLength(1);
 
       const reopenedStores = createWorkboardSqliteStores({ env });
-      const store = new WorkboardStore(reopenedStores.cards);
+      const store = new WorkboardStore(reopenedStores.cards, sqliteTestAuxStores(reopenedStores));
       expect(await store.get("card-1")).toMatchObject({ title: "Current card" });
       expect(await reopenedStores.attachments.lookup("attachment-1")).toBeUndefined();
       reopenedStores.close();

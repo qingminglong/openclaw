@@ -5,15 +5,18 @@
  */
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { coerceSecretRef, normalizeSecretInputString } from "../../config/types.secrets.js";
+import { isOAuthRefreshFence } from "./oauth-refresh-marker.js";
 import type { AuthProfileCredential, OAuthCredential } from "./types.js";
 
 /** Reason code for why a stored auth credential can or cannot be used. */
 export type AuthCredentialReasonCode =
   | "ok"
+  | "setup_inactive"
   | "missing_credential"
   | "invalid_expires"
   | "expired"
-  | "unresolved_ref";
+  | "unresolved_ref"
+  | "malformed_api_key";
 
 /** Default OAuth access-token refresh margin before expiry. */
 export const DEFAULT_OAUTH_REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -57,7 +60,7 @@ export function hasUsableOAuthCredential(
     refreshMarginMs?: number;
   },
 ): boolean {
-  if (!credential || credential.type !== "oauth") {
+  if (!credential || credential.type !== "oauth" || isOAuthRefreshFence(credential)) {
     return false;
   }
   if (typeof credential.access !== "string" || credential.access.trim().length === 0) {
@@ -82,6 +85,14 @@ function hasConfiguredSecretString(value: unknown): boolean {
   return normalizeSecretInputString(value) !== undefined;
 }
 
+export function isMalformedApiKeyInput(value: unknown): boolean {
+  const normalized = normalizeSecretInputString(value);
+  return (
+    normalized !== undefined &&
+    /^openclaw\s+onboard(?:\s+.*)?\s+--auth-choice(?:\s|=|$)/i.test(normalized)
+  );
+}
+
 /** Classifies whether a stored credential is eligible for auth selection. */
 export function evaluateStoredCredentialEligibility(params: {
   credential: AuthProfileCredential;
@@ -93,6 +104,9 @@ export function evaluateStoredCredentialEligibility(params: {
   if (credential.type === "api_key") {
     const hasKey = hasConfiguredSecretString(credential.key);
     const hasKeyRef = hasConfiguredSecretRef(credential.keyRef);
+    if (isMalformedApiKeyInput(credential.key)) {
+      return { eligible: false, reasonCode: "malformed_api_key" };
+    }
     if (!hasKey && !hasKeyRef) {
       return { eligible: false, reasonCode: "missing_credential" };
     }
@@ -116,6 +130,9 @@ export function evaluateStoredCredentialEligibility(params: {
     return { eligible: true, reasonCode: "ok" };
   }
 
+  if (isOAuthRefreshFence(credential)) {
+    return { eligible: false, reasonCode: "expired" };
+  }
   if (
     normalizeSecretInputString(credential.access) === undefined &&
     normalizeSecretInputString(credential.refresh) === undefined

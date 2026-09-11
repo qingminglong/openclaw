@@ -16,13 +16,13 @@ import {
   type ParsedThreadSessionSuffix,
   type RawSessionConversationRef,
 } from "../../sessions/session-key-utils.js";
-import { normalizeChannelId as normalizeChatChannelId } from "../registry.js";
+import { normalizeChatChannelId } from "../registry.js";
 import { getLoadedChannelPlugin, normalizeChannelId as normalizeAnyChannelId } from "./registry.js";
 
 /**
  * Normalized conversation id details for one channel raw id.
  */
-export type ResolvedSessionConversation = {
+type ResolvedSessionConversation = {
   id: string;
   threadId: string | undefined;
   baseConversationId: string;
@@ -32,7 +32,7 @@ export type ResolvedSessionConversation = {
 /**
  * Parsed session-key conversation reference with parent/thread metadata.
  */
-export type ResolvedSessionConversationRef = {
+type ResolvedSessionConversationRef = {
   channel: string;
   kind: "group" | "channel";
   rawId: string;
@@ -79,17 +79,13 @@ function normalizeResolvedChannel(channel: string): string {
   );
 }
 
-function getMessagingAdapter(channel: string) {
+function getLoadedSessionChannelPlugin(channel: string) {
   const normalizedChannel = normalizeResolvedChannel(channel);
   try {
-    return getLoadedChannelPlugin(normalizedChannel)?.messaging;
+    return getLoadedChannelPlugin(normalizedChannel);
   } catch {
     return undefined;
   }
-}
-
-function dedupeConversationIds(values: Array<string | undefined | null>): string[] {
-  return normalizeUniqueSingleOrTrimmedStringList(values);
 }
 
 function buildGenericConversationResolution(rawId: string): ResolvedSessionConversation | null {
@@ -110,7 +106,7 @@ function buildGenericConversationResolution(rawId: string): ResolvedSessionConve
     id,
     threadId: parsed.threadId,
     baseConversationId: id,
-    parentConversationCandidates: dedupeConversationIds(
+    parentConversationCandidates: normalizeUniqueSingleOrTrimmedStringList(
       parsed.threadId ? [parsed.baseSessionKey] : [],
     ),
   };
@@ -130,9 +126,11 @@ function normalizeSessionConversationResolution(
     // candidate so nested topic/thread routes still collapse to their parent.
     baseConversationId:
       normalizeOptionalString(resolved.baseConversationId) ??
-      dedupeConversationIds(resolved.parentConversationCandidates ?? []).at(-1) ??
+      normalizeUniqueSingleOrTrimmedStringList(resolved.parentConversationCandidates ?? []).at(
+        -1,
+      ) ??
       resolved.id.trim(),
-    parentConversationCandidates: dedupeConversationIds(
+    parentConversationCandidates: normalizeUniqueSingleOrTrimmedStringList(
       resolved.parentConversationCandidates ?? [],
     ),
     hasExplicitParentConversationCandidates: Object.hasOwn(
@@ -202,7 +200,8 @@ function resolveSessionConversationResolution(params: {
     return null;
   }
 
-  const messaging = getMessagingAdapter(params.channel);
+  const channelPlugin = getLoadedSessionChannelPlugin(params.channel);
+  const messaging = channelPlugin?.messaging;
   const pluginResolved = normalizeSessionConversationResolution(
     messaging?.resolveSessionConversation?.({
       kind: params.kind,
@@ -211,10 +210,10 @@ function resolveSessionConversationResolution(params: {
   );
   const shouldTryBundledFallback =
     params.bundledFallback !== false &&
-    !messaging &&
+    !channelPlugin &&
     shouldProbeBundledSessionConversationFallback(rawId);
-  // Prefer loaded plugin messaging hooks. Bundled public artifacts are only a
-  // lightweight fallback before registry bootstrap; generic parsing is last.
+  // Loaded plugins own their grammar even when they omit messaging. Only absent
+  // registrations may borrow a pre-bootstrap artifact before generic parsing.
   const resolved =
     pluginResolved ??
     (shouldTryBundledFallback
@@ -229,7 +228,7 @@ function resolveSessionConversationResolution(params: {
     return null;
   }
 
-  const parentConversationCandidates = dedupeConversationIds(
+  const parentConversationCandidates = normalizeUniqueSingleOrTrimmedStringList(
     pluginResolved?.hasExplicitParentConversationCandidates
       ? resolved.parentConversationCandidates
       : (messaging?.resolveParentConversationCandidates?.({
