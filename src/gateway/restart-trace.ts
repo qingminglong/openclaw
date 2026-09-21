@@ -16,7 +16,7 @@ type RestartTraceMetricValue = boolean | number | string | null | undefined;
 type RestartTraceMetrics =
   | Readonly<Record<string, RestartTraceMetricValue>>
   | ReadonlyArray<readonly [string, RestartTraceMetricValue]>;
-export type GatewayRestartTraceHandoff = {
+type GatewayRestartTraceHandoff = {
   startedAt: number;
   lastAt: number;
 };
@@ -226,7 +226,7 @@ function collectGatewayProcessResourceCounts(): ReadonlyArray<readonly [string, 
   const metrics: Array<readonly [string, number]> = [
     ["processSigintListenersCount", process.listenerCount("SIGINT")],
     ["processSigtermListenersCount", process.listenerCount("SIGTERM")],
-    ["processSigusr1ListenersCount", process.listenerCount("SIGUSR1")],
+    ["processRestartListenersCount", process.listenerCount("SIGUSR2")],
   ];
   if (activeHandles) {
     metrics.push(["activeHandlesCount", activeHandles.length]);
@@ -349,11 +349,4 @@ export function resumeGatewayRestartTraceFromEnv(
     },
     metrics,
   );
-}
-
-/** Resets restart trace globals for tests. */
-export function resetGatewayRestartTraceForTest(): void {
-  startedAt = 0;
-  lastAt = 0;
-  active = false;
 }

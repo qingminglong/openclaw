@@ -26,16 +26,9 @@ function parseEnvFlags(raw?: string): ParsedEnvFlags {
     return { flags: ["*"], disablesAll: false };
   }
   return {
-    flags: trimmed
-      .split(/[,\s]+/)
-      .map((value) => normalizeLowercaseStringOrEmpty(value))
-      .filter(Boolean),
+    flags: trimmed.split(/[,\s]+/),
     disablesAll: false,
   };
-}
-
-function uniqueFlags(flags: string[]): string[] {
-  return normalizeUniqueStringEntriesLower(flags);
 }
 
 /** Resolves enabled diagnostic flags from config plus `OPENCLAW_DIAGNOSTICS` overrides. */
@@ -48,7 +41,7 @@ export function resolveDiagnosticFlags(
   if (envFlags.disablesAll) {
     return [];
   }
-  return uniqueFlags([...configFlags, ...envFlags.flags]);
+  return normalizeUniqueStringEntriesLower([...configFlags, ...envFlags.flags]);
 }
 
 /** Matches one diagnostic flag against exact, wildcard, and namespace-enabled flags. */

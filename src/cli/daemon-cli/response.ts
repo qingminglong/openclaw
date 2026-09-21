@@ -1,5 +1,7 @@
 // JSON/text response helpers for Gateway service lifecycle commands.
 import { Writable } from "node:stream";
+import { currentGatewayServiceRebindReceipt } from "../../daemon/service-rebind.js";
+import type { GatewayServiceDefinitionBackupReceipt } from "../../daemon/service-stage.js";
 import type { GatewayService } from "../../daemon/service.js";
 import {
   isSystemdUnavailableDetail,
@@ -10,10 +12,10 @@ import { isWSL } from "../../infra/wsl.js";
 import { defaultRuntime } from "../../runtime.js";
 
 /** Gateway service action emitted by lifecycle commands. */
-export type DaemonAction = "install" | "uninstall" | "start" | "stop" | "restart";
+type DaemonAction = "install" | "uninstall" | "start" | "stop" | "restart";
 
 /** Stable hint category for machine-readable daemon command output. */
-export type DaemonHintKind =
+type DaemonHintKind =
   | "install"
   | "container-restart"
   | "container-foreground"
@@ -23,13 +25,13 @@ export type DaemonHintKind =
   | "generic";
 
 /** Classified daemon recovery hint item. */
-export type DaemonHintItem = {
+type DaemonHintItem = {
   kind: DaemonHintKind;
   text: string;
 };
 
 /** Machine-readable response shape for service lifecycle commands. */
-export type DaemonActionResponse = {
+type DaemonActionResponse = {
   ok: boolean;
   action: DaemonAction;
   result?: string;
@@ -38,6 +40,7 @@ export type DaemonActionResponse = {
   hints?: string[];
   hintItems?: DaemonHintItem[];
   warnings?: string[];
+  definitionBackup?: GatewayServiceDefinitionBackupReceipt;
   service?: {
     label: string;
     loaded: boolean;
@@ -47,11 +50,12 @@ export type DaemonActionResponse = {
 };
 
 function emitDaemonActionJson(payload: DaemonActionResponse) {
-  defaultRuntime.writeJson(payload);
+  const rebind = currentGatewayServiceRebindReceipt();
+  defaultRuntime.writeJson({ ...payload, ...(rebind ? { rebind } : {}) });
 }
 
 function classifyDaemonHintText(text: string): DaemonHintKind {
-  if (text.includes("openclaw gateway install") || text.startsWith("Service not installed. Run:")) {
+  if (/\b(gateway|node) install\b/u.test(text) || text.startsWith("Service not installed. Run:")) {
     return "install";
   }
   if (text.startsWith("Restart the container or the service that manages it for ")) {
@@ -80,7 +84,7 @@ function classifyDaemonHintText(text: string): DaemonHintKind {
 }
 
 /** Classify plain-text hints for JSON daemon responses. */
-export function buildDaemonHintItems(hints: string[] | undefined): DaemonHintItem[] | undefined {
+function buildDaemonHintItems(hints: string[] | undefined): DaemonHintItem[] | undefined {
   if (!hints?.length) {
     return undefined;
   }
@@ -97,6 +101,70 @@ export function buildDaemonServiceSnapshot(service: GatewayService, loaded: bool
   };
 }
 
+type DaemonEmit = (payload: Omit<DaemonActionResponse, "action">) => void;
+
+/** Emit a lifecycle result and mirror its message to text output. */
+function emitDaemonActionMessage(params: {
+  json: boolean;
+  emit: DaemonEmit;
+  payload: Omit<DaemonActionResponse, "action">;
+}): void {
+  params.emit(params.payload);
+  if (!params.json && params.payload.message) {
+    defaultRuntime.log(params.payload.message);
+  }
+}
+
+/** Emit the no-op success returned when a service is already running. */
+export function emitDaemonAlreadyRunning(params: {
+  serviceNoun: string;
+  service: GatewayService;
+  pid?: number;
+  json: boolean;
+  warnings: string[];
+  emit: DaemonEmit;
+}): void {
+  const message =
+    params.pid === undefined
+      ? `${params.serviceNoun} service already running.`
+      : `${params.serviceNoun} service already running (pid ${params.pid}).`;
+  emitDaemonActionMessage({
+    json: params.json,
+    emit: params.emit,
+    payload: {
+      ok: true,
+      result: "already-running",
+      message,
+      service: buildDaemonServiceSnapshot(params.service, true),
+      warnings: params.warnings.length ? params.warnings : undefined,
+    },
+  });
+}
+
+/** Emit a service-manager restart that has been accepted but not completed. */
+export function emitDaemonScheduledRestart(params: {
+  json: boolean;
+  emit: DaemonEmit;
+  result: string;
+  message: string;
+  service: GatewayService;
+  loaded: boolean;
+  warnings: string[];
+}): true {
+  emitDaemonActionMessage({
+    json: params.json,
+    emit: params.emit,
+    payload: {
+      ok: true,
+      result: params.result,
+      message: params.message,
+      service: buildDaemonServiceSnapshot(params.service, params.loaded),
+      warnings: params.warnings.length ? params.warnings : undefined,
+    },
+  });
+  return true;
+}
+
 /** Writable sink used when JSON output should suppress service command stdout. */
 export function createNullWriter(): Writable {
   return new Writable({
@@ -107,11 +175,19 @@ export function createNullWriter(): Writable {
 }
 
 /** Create stdout/warning/emit/fail helpers for one daemon lifecycle action. */
-export function createDaemonActionContext(params: { action: DaemonAction; json: boolean }): {
+export function createDaemonActionContext(params: {
+  action: DaemonAction;
+  json: boolean;
+  definitionBackup?: () => GatewayServiceDefinitionBackupReceipt | undefined;
+}): {
   stdout: Writable;
   warnings: string[];
   emit: (payload: Omit<DaemonActionResponse, "action">) => void;
-  fail: (message: string, hints?: string[]) => void;
+  fail: (
+    message: string,
+    hints?: string[],
+    result?: "restart-health-failed" | "still-starting",
+  ) => void;
 } {
   const warnings: string[] = [];
   const stdout = params.json ? createNullWriter() : process.stdout;
@@ -119,19 +195,26 @@ export function createDaemonActionContext(params: { action: DaemonAction; json: 
     if (!params.json) {
       return;
     }
+    const definitionBackup = params.definitionBackup?.();
     emitDaemonActionJson({
       action: params.action,
+      ...(definitionBackup ? { definitionBackup } : {}),
       ...payload,
       hintItems: payload.hintItems ?? buildDaemonHintItems(payload.hints),
       warnings: payload.warnings ?? (warnings.length ? warnings : undefined),
     });
   };
-  const fail = (message: string, hints?: string[]) => {
+  const fail = (
+    message: string,
+    hints?: string[],
+    result?: "restart-health-failed" | "still-starting",
+  ) => {
     if (params.json) {
       emit({
         ok: false,
         error: message,
         hints,
+        ...(result ? { result } : {}),
       });
     } else {
       defaultRuntime.error(message);
@@ -141,7 +224,7 @@ export function createDaemonActionContext(params: { action: DaemonAction; json: 
         }
       }
     }
-    defaultRuntime.exit(1);
+    defaultRuntime.exit(result === "still-starting" ? 2 : 1);
   };
 
   return { stdout, warnings, emit, fail };
@@ -166,6 +249,15 @@ export async function installDaemonServiceAndEmit(params: {
   emit: (payload: Omit<DaemonActionResponse, "action">) => void;
   fail: (message: string, hints?: string[]) => void;
   install: () => Promise<void>;
+  /** Distinguishes successful registration from application readiness. */
+  successMessage?: string;
+  /**
+   * Runs only after the service has been written AND verified as loaded, but
+   * before the success payload is emitted. Use this for post-success
+   * diagnostics (e.g. linger warnings) so they never accompany a failed
+   * install or a verification failure. Throwing here surfaces as a failure.
+   */
+  onVerified?: () => Promise<void>;
 }) {
   try {
     await params.install();
@@ -177,15 +269,36 @@ export async function installDaemonServiceAndEmit(params: {
     return;
   }
 
-  let installed;
+  let installed: boolean;
   try {
     installed = await params.service.isLoaded({ env: process.env });
-  } catch {
-    installed = true;
+  } catch (err) {
+    params.fail(
+      `${params.serviceNoun} install verification failed: ${String(err)}`,
+      await buildInstallFailureHints(err),
+    );
+    return;
+  }
+  if (!installed) {
+    params.fail(
+      `${params.serviceNoun} install verification failed: service is not ${params.service.loadedText}.`,
+    );
+    return;
+  }
+  // Post-success diagnostics run only on the verified-success path, so a
+  // failed install or verification never carries their warnings.
+  if (params.onVerified) {
+    try {
+      await params.onVerified();
+    } catch (err) {
+      params.fail(`${params.serviceNoun} post-install check failed: ${String(err)}`);
+      return;
+    }
   }
   params.emit({
     ok: true,
     result: "installed",
+    ...(params.successMessage ? { message: params.successMessage } : {}),
     service: buildDaemonServiceSnapshot(params.service, installed),
     warnings: params.warnings.length ? params.warnings : undefined,
   });

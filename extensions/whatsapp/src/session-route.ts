@@ -1,8 +1,8 @@
-// Whatsapp plugin module implements session route behavior.
 import {
   buildChannelOutboundSessionRoute,
   type ChannelOutboundSessionRouteParams,
 } from "openclaw/plugin-sdk/core";
+import { resolveWhatsAppGroupSessionKey } from "./group-session-key.js";
 import {
   isWhatsAppGroupJid,
   isWhatsAppNewsletterJid,
@@ -17,11 +17,12 @@ export function resolveWhatsAppOutboundSessionRoute(params: ChannelOutboundSessi
   const isGroup = isWhatsAppGroupJid(normalized);
   const isNewsletter = isWhatsAppNewsletterJid(normalized);
   const chatType = isGroup ? "group" : isNewsletter ? "channel" : "direct";
-  return buildChannelOutboundSessionRoute({
+  const route = buildChannelOutboundSessionRoute({
     cfg: params.cfg,
     agentId: params.agentId,
     channel: "whatsapp",
     accountId: params.accountId,
+    recipientSessionExact: true,
     peer: {
       kind: chatType,
       id: normalized,
@@ -30,4 +31,13 @@ export function resolveWhatsAppOutboundSessionRoute(params: ChannelOutboundSessi
     from: normalized,
     to: normalized,
   });
+  return isGroup
+    ? {
+        ...route,
+        sessionKey: resolveWhatsAppGroupSessionKey({
+          sessionKey: route.sessionKey,
+          accountId: params.accountId,
+        }),
+      }
+    : route;
 }

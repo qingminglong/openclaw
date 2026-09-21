@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { readPluginPackageVersion } from "openclaw/plugin-sdk/extension-shared";
-import { readResponseTextLimited } from "openclaw/plugin-sdk/provider-http";
+import {
+  ProviderHttpError,
+  readProviderTextResponse,
+  readResponseTextLimited,
+} from "openclaw/plugin-sdk/provider-http";
 import { withTrustedWebSearchEndpoint } from "openclaw/plugin-sdk/provider-web-search";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 
 // Free hosted Search MCP. This keyless transport is used only after the user
 // explicitly selects the `parallel-free` web_search provider. Docs:
@@ -26,17 +32,13 @@ type JsonRpcMessage = Record<string, unknown>;
 type McpToolPayload = Record<string, unknown>;
 
 /** ParallelSearchResponse-compatible shape consumed by the runtime normalizer. */
-export type ParallelMcpSearchResponse = {
+type ParallelMcpSearchResponse = {
   search_id?: unknown;
   session_id?: unknown;
   results: unknown[];
   warnings?: unknown;
   usage?: unknown;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function mcpHeaders(params: {
   sessionId?: string;
@@ -63,86 +65,57 @@ function mcpHeaders(params: {
 }
 
 /**
- * Yield JSON-RPC message objects from a plain-JSON or SSE response body.
- *
- * Handles `application/json` (a single object) and `text/event-stream` (SSE:
- * events separated by blank lines; an event's one-or-more `data:` lines
- * concatenate into a single JSON payload). Streamable HTTP also allows batching
- * responses into a JSON array, so arrays are flattened. Unparseable chunks and
- * non-`data` SSE fields (`event:`/`id:`/comments) are skipped.
+ * Select the first result/error matching requestId from a fully read JSON or SSE body,
+ * falling back to the last result/error when no id matches. JSON batches are flattened
+ * one level; multiline SSE data fields are joined and malformed events are skipped.
  */
-export function iterMcpMessages(text: string): JsonRpcMessage[] {
-  const out: JsonRpcMessage[] = [];
-  const emit = (payload: unknown): void => {
-    if (Array.isArray(payload)) {
-      for (const entry of payload) {
-        if (isRecord(entry)) {
-          out.push(entry);
-        }
-      }
-    } else if (isRecord(payload)) {
-      out.push(payload);
+function selectMcpEnvelope(text: string, requestId: string): JsonRpcMessage {
+  let envelope: JsonRpcMessage = {};
+  const selectMessage = (message: unknown): boolean => {
+    if (!isRecord(message) || !("result" in message || "error" in message)) {
+      return false;
+    }
+    envelope = message;
+    return message.id === requestId;
+  };
+  const selectPayload = (json: string): boolean => {
+    try {
+      const payload: unknown = JSON.parse(json);
+      return Array.isArray(payload) ? payload.some(selectMessage) : selectMessage(payload);
+    } catch {
+      return false;
     }
   };
 
   const body = (text ?? "").trim();
   if (!body) {
-    return out;
+    return envelope;
   }
   if (body.startsWith("{") || body.startsWith("[")) {
-    try {
-      emit(JSON.parse(body));
-    } catch {
-      // Non-JSON body: nothing to emit.
-    }
-    return out;
+    selectPayload(body);
+    return envelope;
   }
 
   let dataLines: string[] = [];
-  const flush = (): void => {
+  const flush = (): boolean => {
     if (dataLines.length === 0) {
-      return;
+      return false;
     }
-    try {
-      emit(JSON.parse(dataLines.join("\n")));
-    } catch {
-      // Skip an unparseable SSE event rather than failing the whole stream.
-    }
+    const matched = selectPayload(dataLines.join("\n"));
     dataLines = [];
+    return matched;
   };
 
   for (const raw of body.split("\n")) {
     const line = raw.replace(/\r$/, "");
     if (line.startsWith("data:")) {
       dataLines.push(line.slice("data:".length).replace(/^ /, ""));
-    } else if (line.trim() === "") {
-      flush();
+    } else if (line.trim() === "" && flush()) {
+      return envelope;
     }
   }
   flush();
-  return out;
-}
-
-/**
- * Select the JSON-RPC response for `requestId` from an MCP response body.
- *
- * Streamable-HTTP servers may emit progress/log notifications before the final
- * result, so scan the whole stream and return the result/error message whose
- * `id` matches. Falls back to the last result/error-bearing message if no id
- * matches; `{}` if none is present.
- */
-export function selectMcpEnvelope(text: string, requestId: string): JsonRpcMessage {
-  let fallback: JsonRpcMessage = {};
-  for (const msg of iterMcpMessages(text)) {
-    if (!("result" in msg || "error" in msg)) {
-      continue;
-    }
-    if (msg.id === requestId) {
-      return msg;
-    }
-    fallback = msg;
-  }
-  return fallback;
+  return envelope;
 }
 
 /**
@@ -152,13 +125,15 @@ export function selectMcpEnvelope(text: string, requestId: string): JsonRpcMessa
  * scans text blocks for the first JSON-parseable one. Throws on a JSON-RPC
  * error or a tool-level `isError`.
  */
-export function extractMcpToolPayload(envelope: JsonRpcMessage): McpToolPayload {
+function extractMcpToolPayload(envelope: JsonRpcMessage): McpToolPayload {
   if ("error" in envelope) {
-    throw new Error(`Parallel MCP error: ${JSON.stringify(envelope.error).slice(0, 500)}`);
+    throw new Error(
+      `Parallel MCP error: ${truncateUtf16Safe(JSON.stringify(envelope.error), 500)}`,
+    );
   }
   const result = isRecord(envelope.result) ? envelope.result : {};
   if (result.isError) {
-    throw new Error(`Parallel MCP tool error: ${JSON.stringify(result).slice(0, 500)}`);
+    throw new Error(`Parallel MCP tool error: ${truncateUtf16Safe(JSON.stringify(result), 500)}`);
   }
   if (isRecord(result.structuredContent)) {
     return result.structuredContent;
@@ -177,7 +152,7 @@ export function extractMcpToolPayload(envelope: JsonRpcMessage): McpToolPayload 
     }
   }
   throw new Error(
-    `Parallel MCP returned no parseable content: ${JSON.stringify(result).slice(0, 500)}`,
+    `Parallel MCP returned no parseable content: ${truncateUtf16Safe(JSON.stringify(result), 500)}`,
   );
 }
 
@@ -218,7 +193,7 @@ async function postMcp(params: {
       status: response.status,
       statusText: response.statusText,
       text: response.ok
-        ? await response.text()
+        ? await readProviderTextResponse(response, "Parallel MCP")
         : await readResponseTextLimited(response, PARALLEL_MCP_ERROR_BODY_LIMIT_BYTES),
       sessionIdHeader: response.headers.get("mcp-session-id"),
     }),
@@ -254,8 +229,9 @@ async function mcpCall(
     },
   });
   if (!init.ok) {
-    throw new Error(
+    throw new ProviderHttpError(
       `Parallel MCP initialize failed (${init.status}): ${init.text || init.statusText}`,
+      { status: init.status },
     );
   }
   // Only echo a server-assigned session id. Stateless Streamable HTTP servers
@@ -268,13 +244,21 @@ async function mcpCall(
       : undefined) ?? MCP_PROTOCOL_VERSION;
 
   // 2. notifications/initialized — required handshake ack (no response body).
-  await postMcp({
+  const initialized = await postMcp({
     body: { jsonrpc: "2.0", method: "notifications/initialized" },
     sessionId,
     protocolVersion: negotiatedVersion,
     timeoutSeconds,
     signal,
   });
+  if (!initialized.ok) {
+    throw new ProviderHttpError(
+      `Parallel MCP notifications/initialized failed (${initialized.status}): ${
+        initialized.text || initialized.statusText
+      }`,
+      { status: initialized.status },
+    );
+  }
 
   // 3. tools/call.
   const callId = randomUUID();
@@ -291,8 +275,9 @@ async function mcpCall(
     signal,
   });
   if (!call.ok) {
-    throw new Error(
+    throw new ProviderHttpError(
       `Parallel MCP tools/call failed (${call.status}): ${call.text || call.statusText}`,
+      { status: call.status },
     );
   }
   return extractMcpToolPayload(selectMcpEnvelope(call.text, callId));

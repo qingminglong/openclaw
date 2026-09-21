@@ -3,13 +3,18 @@ import "./fs-safe-defaults.js";
 
 // Advanced fs-safe helpers for symlink, hardlink, and sibling-temp protections.
 export {
-  assertNoHardlinkedFinalPath,
+  assertDirectoryIdentitySync,
   assertNoSymlinkParents,
   assertNoSymlinkParentsSync,
+  buildRandomTempFilePath,
+  probePathCaseInsensitiveSync,
+  probePathSuffixAliasesSync,
+  readFileHandleBounded,
+  resolvePathPrefixSync,
+  type FileIdentityStat,
+  sameFileContentsSync,
   sameFileIdentity,
   sanitizeUntrustedFileName,
-  writeSiblingTempFile,
-  writeViaSiblingTempPath,
-  type AssertNoSymlinkParentsOptions,
-  type FileIdentityStat,
+  tempFile,
 } from "@openclaw/fs-safe/advanced";
+export { readSecretFile } from "@openclaw/fs-safe/secret";

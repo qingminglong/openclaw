@@ -1,4 +1,3 @@
-// Msteams plugin module implements bot framework service url behavior.
 import {
   isHttpsUrlAllowedByHostnameSuffixAllowlist,
   normalizeHostnameSuffixAllowlist,
@@ -16,7 +15,7 @@ const DEFAULT_BOT_FRAMEWORK_SERVICE_URL_HOST_ALLOWLIST = [
   "botframework.azure.cn",
 ] as const;
 
-export const BOT_FRAMEWORK_SERVICE_URL_HOST_ALLOWLIST = normalizeHostnameSuffixAllowlist(
+const BOT_FRAMEWORK_SERVICE_URL_HOST_ALLOWLIST = normalizeHostnameSuffixAllowlist(
   DEFAULT_BOT_FRAMEWORK_SERVICE_URL_HOST_ALLOWLIST,
 );
 

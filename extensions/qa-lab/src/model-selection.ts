@@ -1,4 +1,3 @@
-// Qa Lab plugin module implements model selection behavior.
 import {
   DEFAULT_QA_LIVE_PROVIDER_MODE,
   getQaProvider,
@@ -7,7 +6,7 @@ import {
 
 export type { QaProviderMode, QaProviderModeInput } from "./providers/index.js";
 
-export type QaModelSelection = {
+type QaModelSelection = {
   primaryModel: string;
   alternateModel: string;
 };

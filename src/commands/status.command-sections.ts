@@ -9,12 +9,16 @@ import {
 } from "../../packages/gateway-protocol/src/connect-error-details.js";
 import type { TableColumn } from "../../packages/terminal-core/src/table.js";
 import { areRuntimeModelRefsEquivalent } from "../agents/model-runtime-aliases.js";
+import { formatDurationCompact } from "../infra/format-time/format-duration.js";
 import type { HeartbeatEventPayload } from "../infra/heartbeat-events.js";
 import type { Tone } from "../memory-host-sdk/status.js";
+import type { MemoryPluginStatus } from "../status/memory-plugin.js";
+import type { StatusSummary } from "../status/summary.js";
+import { formatDeliveryQueueHealthLine } from "./health-format.js";
 import type { HealthSummary } from "./health.js";
+import { formatSqliteWalHealthWarning } from "./sqlite-wal-health.js";
 import type { AgentLocalStatus } from "./status.agent-local.js";
-import type { MemoryStatusSnapshot, MemoryPluginStatus } from "./status.scan.shared.js";
-import type { SessionStatus, StatusSummary } from "./status.types.js";
+import type { MemoryStatusSnapshot } from "./status.scan.shared.js";
 
 type AgentStatusLike = {
   defaultId?: string | null;
@@ -25,8 +29,7 @@ type AgentStatusLike = {
 
 type SummaryLike = Pick<StatusSummary, "tasks" | "taskAudit" | "heartbeat" | "sessions">;
 type MemoryLike = MemoryStatusSnapshot | null;
-type MemoryPluginLike = MemoryPluginStatus;
-type SessionsRecentLike = SessionStatus;
+type SessionsRecentLike = StatusSummary["sessions"]["recent"][number];
 type EventLoopHealthLike = NonNullable<HealthSummary["eventLoop"]>;
 
 export type StatusMemoryStateResolvers = {
@@ -112,6 +115,9 @@ export function buildStatusHeartbeatValue(params: { summary: Pick<SummaryLike, "
       if (!agent.enabled || !agent.everyMs) {
         return `disabled (${agent.agentId})`;
       }
+      if (agent.waitingForRoute) {
+        return `${agent.every} (${agent.agentId}; waiting for delivery route — set commands.ownerAllowFrom=["telegram:123456789"] or channel allowFrom; explicit delivery: heartbeat.target="telegram" with heartbeat.to="123456789")`;
+      }
       return `${agent.every} (${agent.agentId})`;
     })
     .filter(Boolean);
@@ -122,6 +128,7 @@ export function buildStatusHeartbeatValue(params: { summary: Pick<SummaryLike, "
 export function buildStatusLastHeartbeatValue(params: {
   deep?: boolean;
   gatewayReachable: boolean;
+  gatewayStartupPhase?: string;
   lastHeartbeat: HeartbeatEventPayload | null;
   warn: (value: string) => string;
   muted: (value: string) => string;
@@ -131,6 +138,11 @@ export function buildStatusLastHeartbeatValue(params: {
     // Fast status omits the row entirely instead of implying heartbeat is missing.
     return null;
   }
+  if (params.gatewayStartupPhase) {
+    return params.muted(
+      `not checked (gateway still starting; phase ${params.gatewayStartupPhase})`,
+    );
+  }
   if (!params.gatewayReachable) {
     return params.warn("unavailable");
   }
@@ -138,11 +150,10 @@ export function buildStatusLastHeartbeatValue(params: {
     return params.muted("none");
   }
   const age = params.formatTimeAgo(Date.now() - params.lastHeartbeat.ts);
-  const channel = params.lastHeartbeat.channel ?? "unknown";
   const accountLabel = params.lastHeartbeat.accountId
     ? `account ${params.lastHeartbeat.accountId}`
     : null;
-  return [params.lastHeartbeat.status, `${age} ago`, channel, accountLabel]
+  return [params.lastHeartbeat.status, age, params.lastHeartbeat.channel, accountLabel]
     .filter(Boolean)
     .join(" · ");
 }
@@ -151,7 +162,7 @@ export function buildStatusLastHeartbeatValue(params: {
 export function buildStatusMemoryValue(
   params: {
     memory: MemoryLike;
-    memoryPlugin: MemoryPluginLike;
+    memoryPlugin: MemoryPluginStatus;
     ok: (value: string) => string;
     warn: (value: string) => string;
     muted: (value: string) => string;
@@ -265,21 +276,26 @@ export function buildStatusSecurityAuditLines(params: {
   return lines;
 }
 
-/** Builds health table rows from gateway health and channel health text. */
+/** Builds gateway, channel, and delivery queue health table rows. */
 export function buildStatusHealthRows(params: {
   health: HealthSummary;
+  sqliteWal?: StatusSummary["sqliteWal"];
   formatHealthChannelLines: (summary: HealthSummary, opts: { accountMode: "all" }) => string[];
   ok: (value: string) => string;
   warn: (value: string) => string;
   muted: (value: string) => string;
 }) {
-  const rows: Array<Record<string, string>> = [
+  const rows: Array<{ Item: string; Status: string; Detail: string }> = [
     {
       Item: "Gateway",
       Status: params.ok("reachable"),
       Detail: `${params.health.durationMs}ms`,
     },
   ];
+  const sqliteWalWarning = formatSqliteWalHealthWarning(params.sqliteWal);
+  if (sqliteWalWarning) {
+    rows.push({ Item: "SQLite WAL", Status: params.warn("WARN"), Detail: sqliteWalWarning });
+  }
   if (params.health.eventLoop) {
     rows.push({
       Item: "Event loop",
@@ -287,16 +303,12 @@ export function buildStatusHealthRows(params: {
       Detail: formatEventLoopHealthDetail(params.health.eventLoop),
     });
   }
-  if (params.health.modelPricing?.state === "degraded") {
-    rows.push({
-      Item: "Model pricing",
-      Status: params.warn("WARN"),
-      Detail: `optional pricing refresh degraded${
-        params.health.modelPricing.detail ? `: ${params.health.modelPricing.detail}` : ""
-      }`,
-    });
+  const healthLines = params.formatHealthChannelLines(params.health, { accountMode: "all" });
+  const deliveryQueueLine = formatDeliveryQueueHealthLine(params.health);
+  if (deliveryQueueLine) {
+    healthLines.push(deliveryQueueLine);
   }
-  for (const line of params.formatHealthChannelLines(params.health, { accountMode: "all" })) {
+  for (const line of healthLines) {
     const colon = line.indexOf(":");
     if (colon === -1) {
       continue;
@@ -304,35 +316,35 @@ export function buildStatusHealthRows(params: {
     const item = line.slice(0, colon).trim();
     const detail = line.slice(colon + 1).trim();
     const normalized = normalizeLowercaseStringOrEmpty(detail);
-    // Channel health format is string-based; classify known prefixes into table status chips.
-    const status = normalized.startsWith("ok")
-      ? params.ok("OK")
-      : normalized.startsWith("failed")
-        ? params.warn("WARN")
-        : normalized.startsWith("not configured")
+    // Shared health text uses known prefixes to classify table status chips.
+    const status =
+      normalized === "healthy" || normalized.startsWith("ok") || normalized.startsWith("configured")
+        ? params.ok("OK")
+        : normalized.startsWith("not configured") || normalized.startsWith("disabled")
           ? params.muted("OFF")
-          : normalized.startsWith("configured")
-            ? params.ok("OK")
-            : normalized.startsWith("linked")
-              ? params.ok("LINKED")
-              : normalized.startsWith("not linked")
-                ? params.warn("UNLINKED")
-                : params.warn("WARN");
+          : normalized.startsWith("linked")
+            ? params.ok("LINKED")
+            : normalized.startsWith("not linked")
+              ? params.warn("UNLINKED")
+              : params.warn("WARN");
     rows.push({ Item: item, Status: status, Detail: detail });
   }
   return rows;
 }
 
 /** Formats event-loop latency/utilization health into one table detail string. */
-export function formatEventLoopHealthDetail(eventLoop: EventLoopHealthLike): string {
+function formatEventLoopHealthDetail(eventLoop: EventLoopHealthLike): string {
   const parts = [
+    eventLoop.degraded && eventLoop.degradedSinceMs != null
+      ? `degraded for ${formatDurationCompact(eventLoop.degradedSinceMs) ?? "0s"}`
+      : null,
     eventLoop.reasons.length > 0 ? `reasons ${eventLoop.reasons.join(",")}` : "healthy",
     `max ${Math.round(eventLoop.delayMaxMs)}ms`,
     `p99 ${Math.round(eventLoop.delayP99Ms)}ms`,
     `util ${eventLoop.utilization}`,
     `cpu ${eventLoop.cpuCoreRatio}`,
   ];
-  return parts.join(" · ");
+  return parts.filter((part): part is string => part !== null).join(" · ");
 }
 
 /** Builds recent session table rows, optionally including prompt-cache data. */
@@ -389,15 +401,21 @@ export function buildStatusModelSelectionLines(params: {
     const key = params.shortenText(sess.key, 48);
     const configured = sess.configuredModel ?? "unknown";
     const selected = sess.selectedModel ?? "unknown";
+    const isFallback = sess.modelSelectionReason === "fallback selected";
+    const intro = isFallback
+      ? `Session ${key} is running ${selected} (auto fallback); config primary is ${configured}.`
+      : `Session ${key} is pinned to ${selected}; config primary ${configured} will apply to new/unpinned sessions.`;
+    const reasonLine = `  Reason: ${sess.modelSelectionReason ?? "session override"}`;
+    const clearLine = isFallback
+      ? "  Action: check provider availability or retry with /model"
+      : "  Clear with: /model default";
     lines.push(
-      params.warn(
-        `Session ${key} is pinned to ${selected}; config primary ${configured} will apply to new/unpinned sessions.`,
-      ),
+      params.warn(intro),
       `  Configured default: ${configured}`,
       `  Session selected: ${selected}`,
-      `  Reason: ${sess.modelSelectionReason ?? "session override"}`,
-      "  Clear with: /model default",
-      "  Docs: https://docs.openclaw.ai/concepts/models#selection-source-and-fallback-behavior",
+      reasonLine,
+      clearLine,
+      "  Docs: https://docs.openclaw.ai/concepts/models#selection-source-and-fallback-strictness",
     );
   }
   if (mismatches.length > limit) {
@@ -413,6 +431,7 @@ export function buildStatusFooterLines(params: {
   formatCliCommand: (value: string) => string;
   nodeOnlyGateway: unknown;
   gatewayReachable: boolean;
+  gatewayStartupPhase?: string;
 }) {
   return [
     "FAQ: https://docs.openclaw.ai/faq",
@@ -423,9 +442,11 @@ export function buildStatusFooterLines(params: {
     `  Need to debug live? ${params.formatCliCommand("openclaw logs --follow")}`,
     params.nodeOnlyGateway
       ? `  Need node service?  ${params.formatCliCommand("openclaw node status")}`
-      : params.gatewayReachable
-        ? `  Need to test channels? ${params.formatCliCommand("openclaw status --deep")}`
-        : `  Fix reachability first: ${params.formatCliCommand("openclaw gateway probe")}`,
+      : params.gatewayStartupPhase
+        ? `  Retry after startup: ${params.formatCliCommand("openclaw status --deep")}`
+        : params.gatewayReachable
+          ? `  Need to test channels? ${params.formatCliCommand("openclaw status --deep")}`
+          : `  Fix reachability first: ${params.formatCliCommand("openclaw gateway probe")}`,
   ];
 }
 

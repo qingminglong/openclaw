@@ -7,7 +7,7 @@ import type { TypingPolicy } from "../types.js";
 import type { TypingController } from "./typing.js";
 
 /** Inputs that decide when a channel typing indicator should be shown. */
-export type TypingModeContext = {
+type TypingModeContext = {
   configured?: TypingMode;
   isGroupChat: boolean;
   wasMentioned: boolean;
@@ -63,6 +63,7 @@ export type TypingSignaler = {
   signalTextDelta: (text?: string) => Promise<void>;
   signalReasoningDelta: () => Promise<void>;
   signalToolStart: () => Promise<void>;
+  signalExecutionActivity?: () => Promise<void>;
 };
 
 /** Creates a typing signaler that starts or refreshes typing from stream events. */
@@ -108,14 +109,10 @@ export function createTypingSignaler(params: {
     if (disabled) {
       return;
     }
-    const renderable = isRenderableText(text);
-    if (renderable) {
-      hasRenderableText = true;
-    } else if (normalizeOptionalString(text)) {
-      return;
-    } else {
+    if (!isRenderableText(text)) {
       return;
     }
+    hasRenderableText = true;
     if (shouldStartOnText) {
       await typing.startTypingOnText(text);
       return;
@@ -156,6 +153,16 @@ export function createTypingSignaler(params: {
     typing.refreshTypingTtl();
   };
 
+  const signalExecutionActivity = async () => {
+    if (disabled) {
+      return;
+    }
+    if (!typing.isActive()) {
+      await typing.startTypingLoop();
+    }
+    typing.refreshTypingTtl();
+  };
+
   return {
     mode,
     shouldStartImmediately,
@@ -167,5 +174,6 @@ export function createTypingSignaler(params: {
     signalTextDelta,
     signalReasoningDelta,
     signalToolStart,
+    signalExecutionActivity,
   };
 }

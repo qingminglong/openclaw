@@ -1,4 +1,3 @@
-// Telegram plugin module implements dm access behavior.
 import type { Bot } from "grammy";
 import type { Message } from "grammy/types";
 import { createChannelPairingChallengeIssuer } from "openclaw/plugin-sdk/channel-pairing";
@@ -127,6 +126,7 @@ export async function enforceTelegramDmAccess(params: {
       const telegramUserId = sender.userId ?? sender.candidateId;
       await createChannelPairingChallengeIssuer({
         channel: "telegram",
+        accountId,
         upsertPairingRequest: async ({ id, meta }) =>
           await (upsertPairingRequest ?? upsertChannelPairingRequest)({
             channel: "telegram",

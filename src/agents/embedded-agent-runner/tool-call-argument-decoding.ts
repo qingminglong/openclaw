@@ -1,10 +1,11 @@
 /**
  * Decodes HTML-entity escaped tool-call arguments in stream wrappers.
  */
-import { streamSimple } from "../../llm/stream.js";
+import { decodeHtmlEntities } from "../../shared/html-entities.js";
 import { visitObjectContentBlocks } from "../../shared/message-content-blocks.js";
 import type { StreamFn } from "../runtime/index.js";
 import type { MutableAssistantMessageEventStream } from "../stream-compat.js";
+import { mapAssistantMessageStream } from "./run/stream-wrapper.js";
 
 /**
  * Decodes HTML entities inside streamed tool-call arguments before downstream execution.
@@ -12,31 +13,10 @@ import type { MutableAssistantMessageEventStream } from "../stream-compat.js";
  * Some providers HTML-escape JSON-ish argument strings in tool-call content blocks; this wrapper
  * repairs only arguments, preserving user-facing assistant text exactly as emitted.
  */
-const HTML_ENTITY_RE = /&(?:amp|lt|gt|quot|apos|#39|#x[0-9a-f]+|#\d+);/i;
-
-function decodeHtmlEntities(value: string): string {
-  const decodeNumericEntity = (raw: string, radix: 10 | 16): string => {
-    const codePoint = Number.parseInt(raw, radix);
-    return Number.isFinite(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
-      ? String.fromCodePoint(codePoint)
-      : `&#${radix === 16 ? "x" : ""}${raw};`;
-  };
-
-  return value
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => decodeNumericEntity(hex, 16))
-    .replace(/&#(\d+);/gi, (_, dec: string) => decodeNumericEntity(dec, 10));
-}
-
-/** Recursively decodes common HTML entities in string leaves of an object graph. */
-export function decodeHtmlEntitiesInObject(value: unknown): unknown {
+/** Recursively decodes HTML entities in string leaves of an object graph. */
+function decodeHtmlEntitiesInObject(value: unknown): unknown {
   if (typeof value === "string") {
-    return HTML_ENTITY_RE.test(value) ? decodeHtmlEntities(value) : value;
+    return decodeHtmlEntities(value);
   }
   if (Array.isArray(value)) {
     return value.map(decodeHtmlEntitiesInObject);
@@ -111,17 +91,9 @@ function wrapStreamMessageObjects(
 }
 
 /** Wraps a stream function so tool-call arguments are decoded before consumers inspect them. */
-export function createHtmlEntityToolCallArgumentDecodingWrapper(
-  baseStreamFn: StreamFn | undefined,
-): StreamFn {
-  const underlying = baseStreamFn ?? streamSimple;
-  return (model, context, options) => {
-    const maybeStream = underlying(model, context, options);
-    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
-      return Promise.resolve(maybeStream).then((stream) =>
-        wrapStreamMessageObjects(stream, decodeToolCallArgumentsHtmlEntitiesInMessage),
-      );
-    }
-    return wrapStreamMessageObjects(maybeStream, decodeToolCallArgumentsHtmlEntitiesInMessage);
-  };
+export function createHtmlEntityToolCallArgumentDecodingWrapper(baseStreamFn: StreamFn): StreamFn {
+  return (model, context, options) =>
+    mapAssistantMessageStream(baseStreamFn(model, context, options), (stream) =>
+      wrapStreamMessageObjects(stream, decodeToolCallArgumentsHtmlEntitiesInMessage),
+    );
 }

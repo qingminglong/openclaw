@@ -1,10 +1,9 @@
-// Qa Lab plugin module implements gateway log sentinel behavior.
 import {
   isRecord,
   normalizeOptionalString as readNonEmptyString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 
-export type GatewayLogSentinelKind =
+type GatewayLogSentinelKind =
   | "plugin-hook-failure"
   | "plugin-contract-error"
   | "direct-reply-self-message"
@@ -13,13 +12,13 @@ export type GatewayLogSentinelKind =
   | "cron-model-allowlist"
   | "live-quota-or-subscription";
 
-export type GatewayLogSentinelVerdict =
+type GatewayLogSentinelVerdict =
   | "product-bug"
   | "qa-harness-bug"
   | "fixture-bug"
   | "environment-blocked";
 
-export type GatewayLogSentinelOwner =
+type GatewayLogSentinelOwner =
   | "plugin"
   | "openclaw-routing"
   | "codex-runtime"
@@ -36,13 +35,13 @@ export type GatewayLogSentinelFinding = {
   text: string;
 };
 
-export type GatewayLogSentinelScanOptions = {
+type GatewayLogSentinelScanOptions = {
   since?: number;
   kinds?: readonly GatewayLogSentinelKind[];
   ignoreKinds?: readonly GatewayLogSentinelKind[];
 };
 
-export type GatewayLogSentinelAssertOptions = GatewayLogSentinelScanOptions & {
+type GatewayLogSentinelAssertOptions = GatewayLogSentinelScanOptions & {
   allowEnvironmentBlocked?: boolean;
 };
 
@@ -169,9 +168,13 @@ export function extractGatewayMessageText(message: Record<string, unknown>) {
       continue;
     }
     const nestedText = readNonEmptyString(block.content);
+    const normalizedType = readNonEmptyString(block.type)?.toLowerCase().replace(/_/g, "");
     if (
       nestedText &&
-      (block.type === "output_text" || block.type === "text" || block.type === "message")
+      (normalizedType === "outputtext" ||
+        normalizedType === "text" ||
+        normalizedType === "message" ||
+        normalizedType === "toolresult")
     ) {
       parts.push(nestedText);
     }

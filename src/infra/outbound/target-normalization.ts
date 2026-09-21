@@ -5,11 +5,12 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
-import { getLoadedChannelPluginForRead } from "../../channels/plugins/registry-loaded-read.js";
+import { getLoadedChannelPluginForRead } from "../../channels/plugins/registry-loaded.js";
 import type { ChannelPlugin } from "../../channels/plugins/types.plugin.js";
 import type { ChannelDirectoryEntryKind, ChannelId } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { getActivePluginChannelRegistryVersion } from "../../plugins/runtime.js";
+import { captureChannelReadAuthority } from "../../shared/channel-read-authority.js";
 
 /**
  * Normalizes raw user/channel target input before provider-specific parsing.
@@ -32,13 +33,51 @@ function resolveChannelPluginForTargetRead(channelId: ChannelId): ChannelPlugin 
   return getLoadedChannelPluginForRead(channelId) ?? getChannelPlugin(channelId);
 }
 
-function resetTargetNormalizerCacheForTests(): void {
-  targetNormalizerCacheByChannelId.clear();
+function normalizeTargetLiteral(value: string): string | undefined {
+  return normalizeOptionalLowercaseString(value);
 }
 
-export const testing = {
-  resetTargetNormalizerCacheForTests,
-} as const;
+function stripPluginTargetPrefix(raw: string, plugin: ChannelPlugin): string {
+  let target = raw.trim();
+  const prefixes = [plugin.id, ...(plugin.messaging?.targetPrefixes ?? [])]
+    .map((prefix) => normalizeTargetLiteral(String(prefix)))
+    .filter((prefix): prefix is string => Boolean(prefix));
+  while (target) {
+    const lowered = normalizeTargetLiteral(target) ?? "";
+    const prefix = prefixes.find((candidate) => lowered.startsWith(`${candidate}:`));
+    if (!prefix) {
+      return target;
+    }
+    target = target.slice(prefix.length + 1).trim();
+  }
+  return target;
+}
+
+export function resolveReservedTargetLiteral(params: {
+  raw?: string;
+  plugin?: ChannelPlugin;
+}): string | undefined {
+  const raw = normalizeOptionalString(params.raw);
+  const plugin = params.plugin;
+  const reservedLiterals = plugin?.messaging?.targetResolver?.reservedLiterals;
+  if (!raw || !plugin || !reservedLiterals?.length) {
+    return undefined;
+  }
+  const stripped = stripPluginTargetPrefix(raw, plugin);
+  if (!stripped || /^[@#]/.test(stripped) || /^(channel|group|user):/i.test(stripped)) {
+    return undefined;
+  }
+  const normalized = normalizeTargetLiteral(stripped);
+  if (!normalized) {
+    return undefined;
+  }
+  const reserved = new Set(
+    reservedLiterals
+      .map(normalizeTargetLiteral)
+      .filter((literal): literal is string => Boolean(literal)),
+  );
+  return reserved.has(normalized) ? normalized : undefined;
+}
 
 function resolveTargetNormalizer(
   channelId: ChannelId,
@@ -96,12 +135,12 @@ export function normalizeTargetForProvider(
 /**
  * Directory target kinds accepted by plugin-backed target resolution.
  */
-export type TargetResolveKindLike = ChannelDirectoryEntryKind | "channel";
+type TargetResolveKindLike = ChannelDirectoryEntryKind | "channel";
 
 /**
  * Resolved outbound target returned by a channel plugin target resolver.
  */
-export type ResolvedPluginMessagingTarget = {
+type ResolvedPluginMessagingTarget = {
   to: string;
   kind: TargetResolveKindLike;
   display?: string;
@@ -192,6 +231,7 @@ export async function maybeResolvePluginMessagingTarget(params: {
   ) {
     return undefined;
   }
+  captureChannelReadAuthority()?.();
   const resolved = await resolver.resolveTarget({
     cfg: params.cfg,
     accountId: params.accountId,
@@ -224,10 +264,15 @@ export function buildTargetResolverSignature(
     : "pinned";
   const resolver = plugin?.messaging?.targetResolver;
   const hint = resolver?.hint ?? "";
+  const reserved = (resolver?.reservedLiterals ?? [])
+    .map(normalizeTargetLiteral)
+    .filter((literal): literal is string => Boolean(literal))
+    .toSorted()
+    .join(",");
   const looksLike = resolver?.looksLikeId;
   // Function source is only a cheap invalidation hint; resolver behavior still belongs to the plugin.
   const source = looksLike ? looksLike.toString() : "";
-  return hashSignature(`${registryScope}|${hint}|${source}`);
+  return hashSignature(`${registryScope}|${hint}|${reserved}|${source}`);
 }
 
 function hashSignature(value: string): string {
@@ -237,4 +282,3 @@ function hashSignature(value: string): string {
   }
   return (hash >>> 0).toString(36);
 }
-export { testing as __testing };

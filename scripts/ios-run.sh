@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -110,6 +110,7 @@ fi
 
 "${ROOT_DIR}/scripts/ios-configure-signing.sh"
 "${ROOT_DIR}/scripts/ios-write-version-xcconfig.sh"
+node "${ROOT_DIR}/scripts/ios-write-swift-filelist.mjs"
 
 cd "${IOS_DIR}"
 "${XCODEGEN_BIN}" generate

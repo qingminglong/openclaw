@@ -1,4 +1,3 @@
-// Telegram plugin module implements topic name cache behavior.
 import { createHash } from "node:crypto";
 import { readJsonFileWithFallback } from "openclaw/plugin-sdk/json-store";
 import { getTelegramRuntime } from "./runtime.js";
@@ -36,8 +35,6 @@ type TopicNamePersistentStore = {
   delete(key: string): Promise<boolean>;
   clear(): Promise<void>;
 };
-
-let topicNameStoreFactoryForTest: ((namespace: string) => TopicNamePersistentStore) | undefined;
 
 function createTopicNameStore(): TopicNameStore {
   return new Map<string, TopicEntry>();
@@ -85,13 +82,10 @@ export function resolveTopicNameCacheNamespace(scope: string): string {
 }
 
 function openTopicNamePersistentStore(namespace: string): TopicNamePersistentStore {
-  return (
-    topicNameStoreFactoryForTest?.(namespace) ??
-    getTelegramRuntime().state.openKeyedStore<TopicEntry>({
-      namespace,
-      maxEntries: TELEGRAM_TOPIC_NAME_CACHE_MAX_ENTRIES,
-    })
-  );
+  return getTelegramRuntime().state.openKeyedStore<TopicEntry>({
+    namespace,
+    maxEntries: TELEGRAM_TOPIC_NAME_CACHE_MAX_ENTRIES,
+  });
 }
 
 function evictOldest(store: TopicNameStore): string | undefined {
@@ -230,14 +224,4 @@ export async function listTelegramLegacyTopicNameCacheEntries(params: {
     .toSorted(([, left], [, right]) => right.updatedAt - left.updatedAt)
     .slice(0, params.maxEntries ?? TELEGRAM_TOPIC_NAME_CACHE_MAX_ENTRIES)
     .map(([key, entry]) => ({ key, value: entry }));
-}
-
-export function resetTopicNameCacheForTest(): void {
-  getTopicNameCacheState().stores.clear();
-}
-
-export function setTelegramTopicNameStoreFactoryForTest(
-  factory: ((namespace: string) => TopicNamePersistentStore) | undefined,
-): void {
-  topicNameStoreFactoryForTest = factory;
 }

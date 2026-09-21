@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,14 +17,41 @@ import { describe, expect, it } from "vitest";
 const ASSERTIONS_SCRIPT = "scripts/e2e/lib/kitchen-sink-plugin/assertions.mjs";
 const BASH_BIN = process.platform === "win32" ? "bash" : "/bin/bash";
 const SWEEP_SCRIPT = "scripts/e2e/lib/kitchen-sink-plugin/sweep.sh";
+// The shim waits for an explicit log-ready marker; this only bounds a broken fixture process.
+const FIXTURE_READY_WAIT_ATTEMPTS = process.env.CI ? 2_000 : 1_000;
 const REQUIRED_FULL_DIAGNOSTIC_CANARIES = [
   "agent tool result middleware must be a function",
   "trusted tool policy registration requires id, description, and evaluate()",
   "plugin must declare contracts.tools for: kitchen-sink-tool",
-  'channel "kitchen-sink-channel-probe" registration missing required config helpers',
+  'channel "kitchen-sink-channel-probe" registration missing or invalid required capabilities.chatTypes',
   'agent harness "kitchen-sink-agent-harness" registration missing required runtime methods',
   "session scheduler job registration requires unique id, sessionKey, and kind",
 ];
+const WIDGET_PROBE_DIAGNOSTIC = "invalid widget presenter registration";
+const WORKER_PROBE_DIAGNOSTIC = "worker provider registration missing method: resolveAllocation";
+// A concrete synchronized probe report, not an inventory parsed from the checker.
+const SYNCHRONIZED_FULL_DIAGNOSTICS = [
+  ...REQUIRED_FULL_DIAGNOSTIC_CANARIES,
+  "cli registration missing explicit commands metadata",
+  "only bundled plugins can register Codex app-server extension factories",
+  'compaction provider "kitchen-sink-compaction-provider" registration missing summarize',
+  "context engine registration missing id",
+  "control UI descriptor registration requires id, surface, label, and valid optional fields",
+  "hosted media resolver registration missing resolver",
+  "http route registration missing or invalid auth: /kitchen-sink/http-route",
+  WIDGET_PROBE_DIAGNOSTIC,
+  "node invoke policy registration missing commands",
+  "plugin must declare contracts.embeddingProviders for adapter: kitchen-sink-embedding-provider",
+  "memory prompt preparation registration missing prepare function",
+  "memory prompt supplement registration missing builder",
+  "MCP server connection resolver registration missing serverName or resolve",
+  "model catalog provider registration missing provider",
+  "session extension registration requires namespace and description",
+  "tool metadata registration missing toolName",
+  WORKER_PROBE_DIAGNOSTIC,
+];
+const FROZEN_MEMORY_EMBEDDING_DIAGNOSTIC =
+  "plugin must own memory slot or declare contracts.memoryEmbeddingProviders for adapter: kitchen-sink-memory-embedding-provider";
 
 function writeJson(filePath: string, value: unknown) {
   mkdirSync(path.dirname(filePath), { recursive: true });
@@ -31,9 +59,10 @@ function writeJson(filePath: string, value: unknown) {
 }
 
 function fullSurfaceInspectPayload(pluginId: string) {
+  const diagnostics: Array<{ level: string; message: string }> = [];
   return {
     commands: ["kitchen"],
-    diagnostics: [],
+    diagnostics,
     plugin: {
       id: pluginId,
       enabled: true,
@@ -69,11 +98,13 @@ function runAssertInstalled({
   diagnostics = [],
   env = {},
   inspectPayload,
+  surfaceMode = "full",
 }: {
   allInspectPayload?: unknown;
   diagnostics?: Array<{ level: string; message: string }>;
   env?: NodeJS.ProcessEnv;
   inspectPayload?: ReturnType<typeof fullSurfaceInspectPayload>;
+  surfaceMode?: string;
 } = {}) {
   const label = `diagnostics-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const pluginId = "openclaw-kitchen-sink-fixture";
@@ -119,7 +150,7 @@ function runAssertInstalled({
         KITCHEN_SINK_LABEL: label,
         KITCHEN_SINK_SOURCE: "npm",
         KITCHEN_SINK_SPEC: "npm:@openclaw/kitchen-sink@latest",
-        KITCHEN_SINK_SURFACE_MODE: "full",
+        KITCHEN_SINK_SURFACE_MODE: surfaceMode,
         KITCHEN_SINK_TMP_DIR: scratchRoot,
       },
     });
@@ -136,9 +167,11 @@ function runAssertInstalled({
 function runAssertClawhubInstalled({
   contextEngineIds = [],
   installPathRelative,
+  recordOverrides = {},
 }: {
   contextEngineIds?: string[];
   installPathRelative?: string;
+  recordOverrides?: Record<string, unknown>;
 } = {}) {
   const label = `clawhub-context-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const pluginId = "openclaw-kitchen-sink-fixture";
@@ -152,9 +185,32 @@ function runAssertClawhubInstalled({
   const inspectAllJsonPath = path.join(scratchRoot, `kitchen-sink-${label}-inspect-all.json`);
   const installPathMarker = path.join(scratchRoot, `kitchen-sink-${label}-install-path.txt`);
   const installsPath = path.join(home, ".openclaw", "plugins", "installs.json");
+  const record = {
+    artifactFormat: "zip",
+    artifactKind: "legacy-zip",
+    clawhubFamily: "code-plugin",
+    clawhubPackage: "@openclaw/kitchen-sink",
+    integrity: "sha256-test",
+    installPath,
+    resolvedSpec: "clawhub:@openclaw/kitchen-sink@latest",
+    resolvedVersion: "1.0.0",
+    resolvedAt: 1,
+    source: "clawhub",
+    spec: "clawhub:@openclaw/kitchen-sink@latest",
+    version: "1.0.0",
+    ...recordOverrides,
+  };
   try {
     mkdirSync(path.join(home, ".openclaw", "extensions"), { recursive: true });
     mkdirSync(installPath, { recursive: true });
+    if (record.artifactKind === "npm-pack") {
+      mkdirSync(path.join(installPath, "node_modules"), { recursive: true });
+      symlinkSync(
+        process.cwd(),
+        path.join(installPath, "node_modules", "openclaw"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    }
     const inspectPayload = fullSurfaceInspectPayload(pluginId);
     inspectPayload.plugin.contextEngineIds = contextEngineIds;
     writeJson(pluginsJsonPath, {
@@ -164,38 +220,27 @@ function runAssertClawhubInstalled({
     writeJson(inspectJsonPath, inspectPayload);
     writeJson(inspectAllJsonPath, [inspectPayload]);
     writeJson(installsPath, {
-      installRecords: {
-        [pluginId]: {
-          artifactFormat: "zip",
-          artifactKind: "legacy-zip",
-          clawhubFamily: "code-plugin",
-          clawhubPackage: "@openclaw/kitchen-sink",
-          integrity: "sha256-test",
-          installPath,
-          resolvedSpec: "clawhub:@openclaw/kitchen-sink@latest",
-          resolvedVersion: "1.0.0",
-          resolvedAt: 1,
-          source: "clawhub",
-          spec: "clawhub:@openclaw/kitchen-sink@latest",
-          version: "1.0.0",
-        },
-      },
+      installRecords: { [pluginId]: record },
     });
 
-    return spawnSync(process.execPath, [ASSERTIONS_SCRIPT, "assert-installed"], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        HOME: home,
-        OPENCLAW_STATE_DIR: path.join(home, ".openclaw"),
-        KITCHEN_SINK_ID: pluginId,
-        KITCHEN_SINK_LABEL: label,
-        KITCHEN_SINK_SOURCE: "clawhub",
-        KITCHEN_SINK_SPEC: "clawhub:@openclaw/kitchen-sink@latest",
-        KITCHEN_SINK_SURFACE_MODE: "basic",
-        KITCHEN_SINK_TMP_DIR: scratchRoot,
-      },
-    });
+    return {
+      ...spawnSync(process.execPath, [ASSERTIONS_SCRIPT, "assert-installed"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: home,
+          OPENCLAW_STATE_DIR: path.join(home, ".openclaw"),
+          OPENCLAW_CONFIG_PATH: path.join(home, ".openclaw", "openclaw.json"),
+          KITCHEN_SINK_ID: pluginId,
+          KITCHEN_SINK_LABEL: label,
+          KITCHEN_SINK_SOURCE: "clawhub",
+          KITCHEN_SINK_SPEC: "clawhub:@openclaw/kitchen-sink@latest",
+          KITCHEN_SINK_SURFACE_MODE: "basic",
+          KITCHEN_SINK_TMP_DIR: scratchRoot,
+        },
+      }),
+      record,
+    };
   } finally {
     rmSync(home, { force: true, recursive: true });
     rmSync(pluginsJsonPath, { force: true });
@@ -258,8 +303,12 @@ function toGitBashPath(value: string) {
   if (!match) {
     return value;
   }
-
-  return `/${match[1].toLowerCase()}/${match[2].replaceAll("\\", "/")}`;
+  const drive = match[1];
+  const suffix = match[2];
+  if (drive === undefined || suffix === undefined) {
+    return value;
+  }
+  return `/${drive.toLowerCase()}/${suffix.replaceAll("\\", "/")}`;
 }
 
 describe("kitchen-sink plugin assertions", () => {
@@ -301,10 +350,128 @@ describe("kitchen-sink plugin assertions", () => {
 
   it("accepts published full-surface installs with stable diagnostic canaries", () => {
     const result = runAssertInstalled({
-      diagnostics: diagnosticErrors(REQUIRED_FULL_DIAGNOSTIC_CANARIES),
+      diagnostics: diagnosticErrors([
+        ...REQUIRED_FULL_DIAGNOSTIC_CANARIES,
+        "memory prompt preparation registration missing prepare function",
+      ]),
     });
 
     expect(result.status).toBe(0);
+  });
+
+  describe.each([
+    ["widget", WIDGET_PROBE_DIAGNOSTIC],
+    ["worker", WORKER_PROBE_DIAGNOSTIC],
+  ])("%s probe diagnostics", (_probe, diagnostic) => {
+    it.each(["full", "adversarial"])("accepts the declared rejection in %s mode", (surfaceMode) => {
+      const result = runAssertInstalled({
+        diagnostics: diagnosticErrors([...REQUIRED_FULL_DIAGNOSTIC_CANARIES, diagnostic]),
+        surfaceMode,
+      });
+      expect(result.status, result.stderr).toBe(0);
+    });
+
+    it.each(["basic", "conformance"])("rejects the diagnostic in %s mode", (surfaceMode) => {
+      const result = runAssertInstalled({
+        diagnostics: diagnosticErrors([diagnostic]),
+        surfaceMode,
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(`unexpected kitchen-sink diagnostic errors: ${diagnostic}`);
+    });
+
+    it.each(["full", "adversarial"])(
+      "does not turn the rejection into a broad error waiver in %s mode",
+      (surfaceMode) => {
+        const unexpected = `${diagnostic}: unexpected mutation`;
+        const result = runAssertInstalled({
+          diagnostics: diagnosticErrors([
+            ...REQUIRED_FULL_DIAGNOSTIC_CANARIES,
+            diagnostic,
+            unexpected,
+          ]),
+          surfaceMode,
+        });
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain(`unexpected kitchen-sink diagnostic error: ${unexpected}`);
+      },
+    );
+
+    it("requires the rejection in a synchronized exhaustive report", () => {
+      const complete = runAssertInstalled({
+        diagnostics: diagnosticErrors(SYNCHRONIZED_FULL_DIAGNOSTICS),
+        env: { KITCHEN_SINK_REQUIRE_ALL_DIAGNOSTICS: "1" },
+      });
+      expect(complete.status, complete.stderr).toBe(0);
+      const missing = runAssertInstalled({
+        diagnostics: diagnosticErrors(
+          SYNCHRONIZED_FULL_DIAGNOSTICS.filter((message) => message !== diagnostic),
+        ),
+        env: { KITCHEN_SINK_REQUIRE_ALL_DIAGNOSTICS: "1" },
+      });
+      expect(missing.status).not.toBe(0);
+      expect(missing.stderr).toContain(
+        `missing expected kitchen-sink diagnostic error: ${diagnostic}`,
+      );
+    });
+  });
+
+  it("rejects diagnostics in conformance mode", () => {
+    const result = runAssertInstalled({
+      diagnostics: diagnosticErrors(["plugin must declare contracts.tools for: kitchen-sink-tool"]),
+      surfaceMode: "conformance",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "unexpected kitchen-sink diagnostic errors: plugin must declare contracts.tools for: kitchen-sink-tool",
+    );
+  });
+
+  it("accepts only the candidate memory diagnostic for an authorized frozen target", () => {
+    const result = runAssertInstalled({
+      diagnostics: diagnosticErrors([FROZEN_MEMORY_EMBEDDING_DIAGNOSTIC]),
+      env: { OPENCLAW_FROZEN_PLUGIN_PRERELEASE_FIXTURE_DIALECT: "legacy" },
+      surfaceMode: "conformance",
+    });
+
+    expect(result.status).toBe(0);
+  });
+
+  it("rejects the candidate memory diagnostic for an ordinary target", () => {
+    const result = runAssertInstalled({
+      diagnostics: diagnosticErrors([FROZEN_MEMORY_EMBEDDING_DIAGNOSTIC]),
+      surfaceMode: "conformance",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(FROZEN_MEMORY_EMBEDDING_DIAGNOSTIC);
+  });
+
+  it("persists the scenario personality in plugin config", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "openclaw-kitchen-sink-config-"));
+    try {
+      const result = spawnSync(process.execPath, [ASSERTIONS_SCRIPT, "configure-runtime"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: home,
+          KITCHEN_SINK_ID: "openclaw-kitchen-sink-fixture",
+          KITCHEN_SINK_PERSONALITY: "conformance",
+        },
+      });
+
+      expect(result.status).toBe(0);
+      const config = JSON.parse(
+        readFileSync(path.join(home, ".openclaw", "openclaw.json"), "utf8"),
+      );
+      expect(config.plugins.entries["openclaw-kitchen-sink-fixture"]).toMatchObject({
+        config: { personality: "conformance" },
+        hooks: { allowConversationAccess: true },
+      });
+    } finally {
+      rmSync(home, { force: true, recursive: true });
+    }
   });
 
   it("requires kitchen-sink plugins to appear in inspect-all output", () => {
@@ -347,6 +514,85 @@ describe("kitchen-sink plugin assertions", () => {
     expect(`${result.stdout}\n${result.stderr}`).toContain("tools missing kitchen_sink_search");
   });
 
+  it.each(["all", "single"])(
+    "retains bounded redacted %s inspection failure details without dumping config",
+    (inspection) => {
+      const root = mkdtempSync(path.join(tmpdir(), "openclaw-inspection-redactor-"));
+      const redactor = path.join(root, "redactor.mjs");
+      const secret = `FIXTURE_SECRET_${"x".repeat(5000)}_END`;
+      try {
+        writeFileSync(
+          redactor,
+          `export function redactSensitiveText(value, options) {
+  if (options.mode !== "tools") throw new Error("wrong redaction mode");
+  return value.replace(/FIXTURE_SECRET_.*?_END/gs, "[REDACTED]");
+}\n`,
+        );
+        const healthy = fullSurfaceInspectPayload("openclaw-kitchen-sink-fixture");
+        const failed = {
+          ...healthy,
+          plugin: {
+            ...healthy.plugin,
+            status: "error",
+            error: `loader refused ${secret}; retained cause`,
+            source: "/fixture/plugin/index.js",
+            config: { privateValue: "DO_NOT_DUMP_CONFIG" },
+          },
+          diagnostics: [
+            { level: "error", message: `registration failed ${secret}; retained diagnostic` },
+            ...Array.from({ length: 25 }, (_, index) => ({
+              level: "error",
+              message: `extra-diagnostic-${index} ${"z".repeat(4096)}`,
+            })),
+          ],
+        };
+        const result = runAssertInstalled({
+          inspectPayload: inspection === "single" ? failed : healthy,
+          allInspectPayload: [inspection === "all" ? failed : healthy],
+          env: { OPENCLAW_E2E_REDACTOR_MODULE: redactor },
+        });
+        const output = `${result.stdout}\n${result.stderr}`;
+        expect(result.status).toBe(1);
+        expect(output).toContain("expected enabled loaded kitchen-sink plugin");
+        expect(output).toContain("loader refused [REDACTED]; retained cause");
+        expect(output).toContain("registration failed [REDACTED]; retained diagnostic");
+        expect(output).toContain("/fixture/plugin/index.js");
+        expect(output).not.toContain("FIXTURE_SECRET_");
+        expect(output).not.toContain("DO_NOT_DUMP_CONFIG");
+        expect(output).not.toContain("extra-diagnostic-24");
+        expect(output.length).toBeLessThan(16 * 1024);
+      } finally {
+        rmSync(root, { force: true, recursive: true });
+      }
+    },
+  );
+
+  it("keeps inspection failure details private when the canonical redactor fails", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "openclaw-inspection-redactor-"));
+    const redactor = path.join(root, "redactor.mjs");
+    try {
+      writeFileSync(redactor, 'throw new Error("DO_NOT_DUMP_REDACTOR_ERROR");\n');
+      const healthy = fullSurfaceInspectPayload("openclaw-kitchen-sink-fixture");
+      const result = runAssertInstalled({
+        allInspectPayload: [
+          {
+            ...healthy,
+            plugin: { ...healthy.plugin, status: "error", error: "DO_NOT_DUMP_RAW_ERROR" },
+          },
+        ],
+        env: { OPENCLAW_E2E_REDACTOR_MODULE: redactor },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        "inspection details omitted: canonical redaction unavailable",
+      );
+      expect(result.stderr).not.toContain("DO_NOT_DUMP_RAW_ERROR");
+      expect(result.stderr).not.toContain("DO_NOT_DUMP_REDACTOR_ERROR");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
   it("requires ClawHub kitchen-sink fixtures to expose context engines", () => {
     const result = runAssertClawhubInstalled({ contextEngineIds: [] });
 
@@ -359,7 +605,81 @@ describe("kitchen-sink plugin assertions", () => {
       contextEngineIds: ["openclaw-kitchen-sink-fixture"],
     });
 
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  it.each([
+    {
+      name: "rejects a legacy artifact with the wrong format before later metadata",
+      recordOverrides: { artifactFormat: "tgz" },
+      errorPrefix: "missing kitchen-sink legacy ZIP artifact metadata",
+    },
+    {
+      name: "rejects a non-legacy artifact kind before ClawPack metadata",
+      recordOverrides: { artifactKind: "other" },
+      errorPrefix: "missing kitchen-sink ClawHub artifact metadata",
+    },
+    {
+      name: "rejects missing ClawPack metadata before npm metadata",
+      recordOverrides: { artifactKind: "npm-pack", artifactFormat: "tgz" },
+      errorPrefix: "missing kitchen-sink ClawPack metadata",
+    },
+    {
+      name: "rejects a string ClawPack size",
+      recordOverrides: {
+        artifactKind: "npm-pack",
+        artifactFormat: "tgz",
+        clawpackSha256: "digest",
+        clawpackSize: "0",
+      },
+      errorPrefix: "missing kitchen-sink ClawPack metadata",
+    },
+    {
+      name: "accepts zero size before rejecting missing npm metadata",
+      recordOverrides: {
+        artifactKind: "npm-pack",
+        artifactFormat: "tgz",
+        clawpackSha256: "digest",
+        clawpackSize: 0,
+      },
+      errorPrefix: "missing kitchen-sink npm artifact metadata",
+    },
+    {
+      name: "accepts zero size and truthy non-string metadata with a real npm peer",
+      recordOverrides: {
+        artifactKind: "npm-pack",
+        artifactFormat: "tgz",
+        clawpackSha256: { digest: 1 },
+        clawpackSize: 0,
+        npmIntegrity: 1,
+        npmShasum: true,
+        npmTarballName: ["package.tgz"],
+      },
+      errorPrefix: null,
+    },
+    {
+      name: "rejects metadata before an empty install path",
+      recordOverrides: { artifactFormat: "tgz", installPath: "" },
+      errorPrefix: "missing kitchen-sink legacy ZIP artifact metadata",
+    },
+    {
+      name: "rejects metadata before a non-string install path",
+      recordOverrides: { artifactFormat: "tgz", installPath: 42 },
+      errorPrefix: "missing kitchen-sink legacy ZIP artifact metadata",
+    },
+  ])("ClawHub kitchen-sink metadata: $name", ({ recordOverrides, errorPrefix }) => {
+    const result = runAssertClawhubInstalled({
+      contextEngineIds: ["openclaw-kitchen-sink-fixture"],
+      recordOverrides,
+    });
+    if (errorPrefix === null) {
+      expect(result.status, result.stderr).toBe(0);
+    } else {
+      expect(result.status).toBe(1);
+      expect(result.stderr.match(/^(?:Error|error): (.*)$/m)?.[1]).toBe(
+        `${errorPrefix}: ${JSON.stringify(result.record)}`,
+      );
+    }
   });
 
   it("rejects ClawHub kitchen-sink install paths that resolve outside managed extensions", () => {
@@ -552,7 +872,7 @@ describe("kitchen-sink plugin assertions", () => {
   it("rejects kitchen-sink log scans without an isolated scratch root", () => {
     const parent = mkdtempSync(path.join(tmpdir(), "openclaw-kitchen-sink-scan-"));
     try {
-      const spawnEnv = { ...process.env, HOME: parent };
+      const spawnEnv: NodeJS.ProcessEnv = { ...process.env, HOME: parent };
       delete spawnEnv.KITCHEN_SINK_TMP_DIR;
       const result = spawnSync(process.execPath, [ASSERTIONS_SCRIPT, "scan-logs"], {
         encoding: "utf8",
@@ -842,6 +1162,8 @@ exit "$status"
     const scratchRoot = path.join(parent, "scratch");
     const fixtureDir = path.join(scratchRoot, "clawhub-fixture");
     const nodeShim = path.join(fakeBin, "node");
+    const sleepShim = path.join(fakeBin, "sleep");
+    const fixtureReadyPath = path.join(parent, "fixture-log-ready");
     try {
       mkdirSync(fakeBin, { recursive: true });
       mkdirSync(fixtureDir, { recursive: true });
@@ -852,11 +1174,25 @@ exit "$status"
           "printf 'DO_NOT_DUMP_CLAWHUB_PREFIX\\n'",
           "head -c 2048 /dev/zero | tr '\\0' x",
           "printf '\\nFIXTURE_TAIL_MARKER\\n'",
-          "sleep 30",
+          ': >"$FIXTURE_READY_PATH"',
+          "/bin/sleep 30",
           "",
         ].join("\n"),
       );
       chmodSync(nodeShim, 0o755);
+      writeFileSync(
+        sleepShim,
+        [
+          "#!/usr/bin/env bash",
+          'for _ in $(seq 1 "$FIXTURE_READY_WAIT_ATTEMPTS"); do',
+          '  [[ -f "$FIXTURE_READY_PATH" ]] && exit 0',
+          "  /bin/sleep 0.01",
+          "done",
+          "exit 1",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(sleepShim, 0o755);
 
       const result = runSweepShell(
         `
@@ -864,7 +1200,7 @@ set -euo pipefail
 export PATH="$FAKE_BIN:$PATH"
 export KITCHEN_SINK_SWEEP_SOURCE_ONLY=1
 export KITCHEN_SINK_TMP_DIR="$SCRATCH_ROOT"
-export OPENCLAW_CLAWHUB_FIXTURE_WAIT_ATTEMPTS=25
+export OPENCLAW_CLAWHUB_FIXTURE_WAIT_ATTEMPTS=1
 export OPENCLAW_DOCKER_E2E_LOG_PRINT_BYTES=64
 source scripts/e2e/lib/kitchen-sink-plugin/sweep.sh
 set +e
@@ -877,6 +1213,8 @@ exit "$status"
         {
           FAKE_BIN: fakeBin,
           FIXTURE_DIR: fixtureDir,
+          FIXTURE_READY_PATH: fixtureReadyPath,
+          FIXTURE_READY_WAIT_ATTEMPTS: String(FIXTURE_READY_WAIT_ATTEMPTS),
           SCRATCH_ROOT: scratchRoot,
         },
       );

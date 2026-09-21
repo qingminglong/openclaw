@@ -25,6 +25,16 @@ export type PluginAutoEnableCandidate =
     }
   | {
       pluginId: string;
+      kind: "worker-provider-selected";
+      providerId: string;
+    }
+  | {
+      pluginId: string;
+      kind: "decision-provider-selected";
+      providerId: string;
+    }
+  | {
+      pluginId: string;
       kind: "agent-harness-runtime-configured";
       runtime: string;
     }

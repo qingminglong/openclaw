@@ -1,38 +1,16 @@
 // Public channel registry facade for channel ids, metadata, and setup copy.
-import {
-  normalizeOptionalLowercaseString,
-  normalizeOptionalString,
-} from "@openclaw/normalization-core/string-coerce";
-import { normalizeChatChannelId, type ChatChannelId } from "./ids.js";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import "./ids.js";
 import type { ChannelId } from "./plugins/channel-id.types.js";
 import type { ChannelMeta } from "./plugins/types.core.js";
 import {
-  findRegisteredChannelPluginEntry,
   findRegisteredChannelPluginEntryById,
   listRegisteredChannelPluginEntries,
 } from "./registry-lookup.js";
-export { getChatChannelMeta } from "./chat-meta.js";
-export { CHAT_CHANNEL_ORDER } from "./ids.js";
+export { findChatChannelMeta } from "./chat-meta.js";
+export { CHAT_CHANNEL_ORDER, normalizeChatChannelId } from "./ids.js";
 export type { ChatChannelId } from "./ids.js";
-export { normalizeChatChannelId };
-
-/**
- * Normalizes built-in chat channel ids without loading channel plugin implementations.
- */
-export function normalizeChannelId(raw?: string | null): ChatChannelId | null {
-  return normalizeChatChannelId(raw);
-}
-
-/**
- * Normalizes any registered channel plugin id or alias after registry initialization.
- */
-export function normalizeAnyChannelId(raw?: string | null): ChannelId | null {
-  const key = normalizeOptionalLowercaseString(raw);
-  if (!key) {
-    return null;
-  }
-  return findRegisteredChannelPluginEntry(key)?.plugin.id ?? null;
-}
+export { normalizeAnyChannelId } from "./registry-normalize.js";
 
 /**
  * Lists registered channel plugin ids without importing their runtime implementations.

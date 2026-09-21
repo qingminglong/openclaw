@@ -1,4 +1,3 @@
-// Matrix plugin module implements direct management behavior.
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { inspectMatrixDirectRoomEvidence } from "./direct-room.js";
@@ -14,7 +13,7 @@ export type MatrixDirectRoomCandidate = {
   source: "account-data" | "joined";
 };
 
-export type MatrixDirectRoomInspection = {
+type MatrixDirectRoomInspection = {
   selfUserId: string | null;
   remoteUserId: string;
   mappedRoomIds: string[];
@@ -23,14 +22,14 @@ export type MatrixDirectRoomInspection = {
   activeRoomId: string | null;
 };
 
-export type MatrixDirectRoomRepairResult = MatrixDirectRoomInspection & {
+type MatrixDirectRoomRepairResult = MatrixDirectRoomInspection & {
   createdRoomId: string | null;
   changed: boolean;
   directContentBefore: MatrixDirectAccountData;
   directContentAfter: MatrixDirectAccountData;
 };
 
-export type MatrixDirectRoomPromotionResult =
+type MatrixDirectRoomPromotionResult =
   | {
       classifyAsDirect: true;
       repaired: boolean;
