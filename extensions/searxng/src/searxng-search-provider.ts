@@ -1,31 +1,19 @@
-// Searxng provider module implements model/runtime integration.
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { readPositiveIntegerParam, readStringParam } from "openclaw/plugin-sdk/param-readers";
 import {
   createWebSearchProviderContractFields,
+  WEB_SEARCH_QUERY_COUNT_PROPERTIES,
   type WebSearchProviderPlugin,
 } from "openclaw/plugin-sdk/provider-web-search-contract";
 
 const SEARXNG_CREDENTIAL_PATH = "plugins.entries.searxng.config.webSearch.baseUrl";
 
-type SearxngClientModule = typeof import("./searxng-client.js");
-
-let searxngClientModulePromise: Promise<SearxngClientModule> | undefined;
-
-function loadSearxngClientModule(): Promise<SearxngClientModule> {
-  searxngClientModulePromise ??= import("./searxng-client.js");
-  return searxngClientModulePromise;
-}
+const loadSearxngClientModule = createLazyRuntimeModule(() => import("./searxng-client.js"));
 
 const SearxngSearchSchema = {
   type: "object",
   properties: {
-    query: { type: "string", description: "Search query string." },
-    count: {
-      type: "integer",
-      description: "Number of results to return (1-10).",
-      minimum: 1,
-      maximum: 10,
-    },
+    ...WEB_SEARCH_QUERY_COUNT_PROPERTIES,
     categories: {
       type: "string",
       description: "Optional comma-separated search categories such as general, news, or science.",
@@ -65,7 +53,7 @@ export function createSearxngWebSearchProvider(): WebSearchProviderPlugin {
       description:
         "Search the web using a self-hosted SearXNG instance. Returns titles, URLs, and snippets.",
       parameters: SearxngSearchSchema,
-      execute: async (args) => {
+      execute: async (args, context) => {
         const { runSearxngSearch } = await loadSearxngClientModule();
         return await runSearxngSearch({
           config: ctx.config,
@@ -76,6 +64,7 @@ export function createSearxngWebSearchProvider(): WebSearchProviderPlugin {
           }),
           categories: readStringParam(args, "categories"),
           language: readStringParam(args, "language"),
+          signal: context?.signal,
         });
       },
     }),

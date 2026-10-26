@@ -1,283 +1,121 @@
-// Whatsapp tests cover extract plugin behavior.
-import type { proto } from "baileys";
-import { describe, expect, it } from "vitest";
-import { extractMentionedJids, hasInboundUserContent } from "./extract.js";
+import { generateWAMessageFromContent, type proto } from "baileys";
+import { expect, it } from "vitest";
+import {
+  describeReplyContext,
+  extractMediaKind,
+  extractMentionedJids,
+  extractText,
+  hasInboundUserContent,
+} from "./extract.js";
 
-describe("extractMentionedJids", () => {
-  const botJid = "5511999999999@s.whatsapp.net";
-  const otherJid = "5511888888888@s.whatsapp.net";
-
-  it("returns direct mentions from the current message", () => {
-    const message: proto.IMessage = {
-      extendedTextMessage: {
-        text: "Hey @bot",
-        contextInfo: {
-          mentionedJid: [botJid],
-        },
-      },
-    };
-    expect(extractMentionedJids(message)).toEqual([botJid]);
-  });
-
-  it("ignores mentionedJids from quoted messages", () => {
-    const message: proto.IMessage = {
-      extendedTextMessage: {
-        text: "I agree",
-        contextInfo: {
-          // The quoted message originally @mentioned the bot, but the
-          // current message does not — this should NOT leak through.
-          quotedMessage: {
-            extendedTextMessage: {
-              text: "Hey @bot what do you think?",
-              contextInfo: {
-                mentionedJid: [botJid],
-              },
-            },
-          },
-        },
-      },
-    };
-    expect(extractMentionedJids(message)).toBeUndefined();
-  });
-
-  it("returns direct mentions even when quoted message also has mentions", () => {
-    const message: proto.IMessage = {
-      extendedTextMessage: {
-        text: "Hey @other",
-        contextInfo: {
-          mentionedJid: [otherJid],
-          quotedMessage: {
-            extendedTextMessage: {
-              text: "Hey @bot",
-              contextInfo: {
-                mentionedJid: [botJid],
-              },
-            },
-          },
-        },
-      },
-    };
-    // Should return only the direct mention, not the quoted one.
-    expect(extractMentionedJids(message)).toEqual([otherJid]);
-  });
-
-  it("returns mentions from media message types", () => {
-    const message: proto.IMessage = {
-      imageMessage: {
-        contextInfo: {
-          mentionedJid: [botJid],
-        },
-      },
-    };
-    expect(extractMentionedJids(message)).toEqual([botJid]);
-  });
-
-  it("returns undefined for messages with no mentions", () => {
-    const message: proto.IMessage = {
-      extendedTextMessage: {
-        text: "Just a regular message",
-      },
-    };
-    expect(extractMentionedJids(message)).toBeUndefined();
-  });
-
-  it("returns undefined for undefined input", () => {
-    expect(extractMentionedJids(undefined)).toBeUndefined();
-  });
-
-  it("deduplicates mentions across message types", () => {
-    const message: proto.IMessage = {
-      extendedTextMessage: {
-        text: "Hey @bot",
-        contextInfo: {
-          mentionedJid: [botJid],
-        },
-      },
-      imageMessage: {
-        contextInfo: {
-          mentionedJid: [botJid],
-        },
-      },
-    };
-    expect(extractMentionedJids(message)).toEqual([botJid]);
+const SENDER = "15555550123@s.whatsapp.net";
+const GROUP = "120363000000000000@g.us";
+const BOT = "5511999999999@s.whatsapp.net";
+const OTHER = "5511888888888@s.whatsapp.net";
+const poll: proto.IMessage = {
+  pollCreationMessageV3: {
+    name: "Lunch?",
+    options: [{ optionName: "Pizza" }, { optionName: "Sushi" }],
+  },
+};
+function extended(contextInfo: proto.IContextInfo, text = "hello"): proto.IMessage {
+  return { extendedTextMessage: { text, contextInfo } };
+}
+function nativeFlow(paramsJson: string): proto.IMessage {
+  return {
+    interactiveResponseMessage: {
+      nativeFlowResponseMessage: { name: "single_select", paramsJson },
+    },
+  };
+}
+const quotedMessage = extended({ mentionedJid: [BOT] }, "Hey @bot");
+it.each<[proto.IMessage | undefined, string[] | undefined]>([
+  [extended({ quotedMessage }, "I agree"), undefined],
+  [extended({ mentionedJid: [OTHER, OTHER], quotedMessage }, "Hey @other"), [OTHER]],
+  [undefined, undefined],
+])("extracts only direct, unique mentions: %j", (message, expected) => {
+  expect(extractMentionedJids(message)).toEqual(expected);
+});
+it("preserves unavailable reply references without inventing a sender", () => {
+  expect(describeReplyContext(extended({ stanzaId: "original-message" }, "yes"))).toMatchObject({
+    id: "original-message",
+    body: "[quoted message unavailable]",
+    sender: { label: "unknown sender" },
   });
 });
-
-describe("hasInboundUserContent", () => {
-  it("returns true for plain text conversation", () => {
-    expect(hasInboundUserContent({ conversation: "hello" })).toBe(true);
+it("does not invent replies from unrelated context metadata", () => {
+  expect(describeReplyContext(extended({ participant: SENDER }))).toBeNull();
+});
+it("reads quoted polls encoded by Baileys", () => {
+  const generated = generateWAMessageFromContent(GROUP, extended({}, "Choose pizza"), {
+    userJid: SENDER,
+    quoted: {
+      key: { id: "original-poll", remoteJid: GROUP, participant: SENDER, fromMe: false },
+      message: poll,
+    },
   });
-
-  it("returns true for extendedTextMessage", () => {
-    expect(
-      hasInboundUserContent({ extendedTextMessage: { text: "hello" } } as proto.IMessage),
-    ).toBe(true);
+  expect(describeReplyContext(generated.message ?? undefined)).toMatchObject({
+    id: "original-poll",
+    body: "Lunch?\n- Pizza\n- Sushi",
+    sender: { jid: SENDER },
   });
-
-  it("returns true for image message", () => {
-    expect(
-      hasInboundUserContent({ imageMessage: { mimetype: "image/png" } } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for video message", () => {
-    expect(
-      hasInboundUserContent({ videoMessage: { mimetype: "video/mp4" } } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for audio message", () => {
-    expect(
-      hasInboundUserContent({ audioMessage: { mimetype: "audio/ogg" } } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for document message", () => {
-    expect(
-      hasInboundUserContent({
-        documentMessage: { fileName: "x.pdf" },
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for sticker message", () => {
-    expect(
-      hasInboundUserContent({ stickerMessage: { mimetype: "image/webp" } } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for location message with valid coords", () => {
-    expect(
-      hasInboundUserContent({
-        locationMessage: { degreesLatitude: 1, degreesLongitude: 2 },
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for live location message with valid coords", () => {
-    expect(
-      hasInboundUserContent({
-        liveLocationMessage: { degreesLatitude: 1, degreesLongitude: 2 },
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for contact message", () => {
-    expect(
-      hasInboundUserContent({
-        contactMessage: { displayName: "Alice", vcard: "BEGIN:VCARD\nEND:VCARD" },
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for contactsArrayMessage via contact placeholder extraction", () => {
-    expect(
-      hasInboundUserContent({
-        contactsArrayMessage: {
-          contacts: [{ displayName: "Alice", vcard: "BEGIN:VCARD\nEND:VCARD" }],
+});
+it.each<[proto.IMessage, string]>([
+  [
+    { listResponseMessage: { title: "Option A", singleSelectReply: { selectedRowId: "a" } } },
+    "Option A",
+  ],
+  [{ templateButtonReplyMessage: { selectedId: "button-1" } }, "button-1"],
+  [
+    {
+      interactiveResponseMessage: {
+        body: { text: "Continue" },
+        nativeFlowResponseMessage: { name: "single_select", paramsJson: "{}" },
+      },
+    },
+    "Continue",
+  ],
+  [nativeFlow('{"id":"shipping-express","title":"Express shipping"}'), "Express shipping"],
+  [{ pollCreationMessageV4: { message: poll } }, "Lunch?\n- Pizza\n- Sushi"],
+  [{ ptvMessage: { caption: "Watch this", mimetype: "video/mp4" } }, "Watch this"],
+])("extracts text from %j", (message, expected) => {
+  expect(extractText(message)).toBe(expected);
+});
+it.each(["{", "[]"])("ignores invalid native-flow objects: %s", (json) => {
+  expect(extractText(nativeFlow(json))).toBeUndefined();
+});
+it("classifies captionless video notes as user content", () => {
+  const message = { ptvMessage: { mimetype: "video/mp4" } };
+  expect(extractMediaKind(message)).toBe("video");
+  expect(hasInboundUserContent(message)).toBe(true);
+});
+it.each<[string, proto.IMessage | undefined, boolean]>([
+  ["plain text", { conversation: "hello" }, true],
+  ["image", { imageMessage: { mimetype: "image/png" } }, true],
+  ["sticker", { stickerMessage: { mimetype: "image/webp" } }, true],
+  ["location", { locationMessage: { degreesLatitude: 1, degreesLongitude: 2 } }, true],
+  [
+    "wrapped button (#73797)",
+    {
+      ephemeralMessage: {
+        message: {
+          buttonsResponseMessage: { selectedButtonId: "ok", selectedDisplayText: "OK" },
         },
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for buttons response (user button click)", () => {
-    expect(
-      hasInboundUserContent({
-        buttonsResponseMessage: {
-          selectedButtonId: "yes",
-          selectedDisplayText: "Yes",
-        },
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for list response (user list selection)", () => {
-    expect(
-      hasInboundUserContent({
-        listResponseMessage: {
-          title: "Option A",
-          singleSelectReply: { selectedRowId: "a" },
-        } as unknown as proto.Message.IListResponseMessage,
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for template button reply", () => {
-    expect(
-      hasInboundUserContent({
-        templateButtonReplyMessage: {
-          selectedId: "btn-1",
-          selectedDisplayText: "Click",
-        } as unknown as proto.Message.ITemplateButtonReplyMessage,
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for interactive response", () => {
-    expect(
-      hasInboundUserContent({
-        interactiveResponseMessage: {
-          body: { text: "x" },
-          nativeFlowResponseMessage: { name: "n", paramsJson: "{}" },
-        } as unknown as proto.Message.IInteractiveResponseMessage,
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns true for buttons response wrapped in ephemeralMessage (regression for #73797 + greptile review)", () => {
-    expect(
-      hasInboundUserContent({
-        ephemeralMessage: {
-          message: {
-            buttonsResponseMessage: {
-              selectedButtonId: "ok",
-              selectedDisplayText: "OK",
-            },
-          },
-        },
-      } as proto.IMessage),
-    ).toBe(true);
-  });
-
-  it("returns false for undefined message (regression for #73797)", () => {
-    expect(hasInboundUserContent(undefined)).toBe(false);
-  });
-
-  it("returns false for empty message object (no content keys)", () => {
-    expect(hasInboundUserContent({} as proto.IMessage)).toBe(false);
-  });
-
-  it("returns false for protocol message envelope without inner content (regression for #73797)", () => {
-    expect(
-      hasInboundUserContent({
-        protocolMessage: {
-          type: 0,
-        } as unknown as proto.Message.IProtocolMessage,
-      } as proto.IMessage),
-    ).toBe(false);
-  });
-
-  it("returns false for receipt-style senderKeyDistribution-only payload (regression for #73797)", () => {
-    expect(
-      hasInboundUserContent({
-        senderKeyDistributionMessage: {
-          groupId: "g@example",
-        } as unknown as proto.Message.ISenderKeyDistributionMessage,
-      } as proto.IMessage),
-    ).toBe(false);
-  });
-
-  it("returns false when location coords are missing (incomplete event, regression for #73797)", () => {
-    expect(
-      hasInboundUserContent({
-        locationMessage: { name: "no coords" },
-      } as proto.IMessage),
-    ).toBe(false);
-  });
-
-  it("returns false when extendedTextMessage has only empty text", () => {
-    expect(hasInboundUserContent({ extendedTextMessage: { text: "  " } } as proto.IMessage)).toBe(
-      false,
-    );
-  });
+      },
+    },
+    true,
+  ],
+  ["missing (#73797)", undefined, false],
+  [
+    "receipt (#73797)",
+    {
+      senderKeyDistributionMessage: {
+        groupId: "g@example",
+      } as unknown as proto.Message.ISenderKeyDistributionMessage,
+    },
+    false,
+  ],
+  ["empty text", { extendedTextMessage: { text: "  " } }, false],
+])("classifies %s user content", (_name, message, expected) => {
+  expect(hasInboundUserContent(message)).toBe(expected);
 });

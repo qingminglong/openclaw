@@ -1,98 +1,90 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { ExecApprovalsFile } from "../infra/exec-approvals-core.js";
+import {
+  saveExecApprovals,
+  testing as execApprovalsStoreTesting,
+} from "../infra/exec-approvals-store.test-support.js";
+import {
+  closeOpenClawStateDatabaseAsync,
+  closeOpenClawStateDatabaseForTest,
+} from "../state/openclaw-state-db.js";
+import { setTestEnvValue } from "../test-utils/env.js";
+import { createTempHomeEnv } from "../test-utils/temp-home.js";
 
-const envSnapshot = captureEnv(["HOME", "OPENCLAW_HOME"]);
+let home: Awaited<ReturnType<typeof createTempHomeEnv>>;
+let runtime: typeof import("./operator-approval-runtime-token.js");
+let stateDb: typeof import("../state/openclaw-state-db.js") | undefined;
 
-const tempHomes: string[] = [];
-
-function useTempHome(): string {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-approval-runtime-"));
-  tempHomes.push(home);
-  setTestEnvValue("HOME", home);
-  setTestEnvValue("OPENCLAW_HOME", home);
-  return home;
-}
-
-function execApprovalsPath(home: string): string {
-  return path.join(home, ".openclaw", "exec-approvals.json");
-}
-
-function writeExecApprovalsToken(home: string, token: string): void {
-  fs.mkdirSync(path.join(home, ".openclaw"), { recursive: true });
-  fs.writeFileSync(
-    execApprovalsPath(home),
-    `${JSON.stringify(
-      {
-        version: 1,
-        socket: {
-          path: "~/.openclaw/exec-approvals.sock",
-          token,
-        },
-        agents: {},
-      },
-      null,
-      2,
-    )}\n`,
-  );
-}
-
-async function importRuntimeTokenModule(): Promise<
-  typeof import("./operator-approval-runtime-token.js")
-> {
+beforeEach(async () => {
+  home = await createTempHomeEnv("openclaw-approval-runtime-");
+  setTestEnvValue("OPENCLAW_HOME", home.home);
+  closeOpenClawStateDatabaseForTest();
+  execApprovalsStoreTesting.reset();
   vi.resetModules();
-  return await import("./operator-approval-runtime-token.js");
-}
-
-afterEach(() => {
-  vi.resetModules();
-  envSnapshot.restore();
-  for (const home of tempHomes.splice(0)) {
-    fs.rmSync(home, { recursive: true, force: true });
-  }
+  runtime = await import("./operator-approval-runtime-token.js");
+  stateDb = await import("../state/openclaw-state-db.js");
 });
 
-describe("operator approval runtime token", () => {
-  it("derives the shared approval runtime token from the exec approvals socket token", async () => {
-    const home = useTempHome();
-    writeExecApprovalsToken(home, "shared-runtime-token");
+function writeExecApprovalsToken(token: string): void {
+  saveExecApprovals({
+    version: 1,
+    socket: { path: "~/.openclaw/exec-approvals.sock", token },
+    agents: {},
+  } satisfies ExecApprovalsFile);
+}
 
-    const runtimeToken = await importRuntimeTokenModule();
-    const sharedToken = runtimeToken.getOperatorApprovalRuntimeToken();
+afterEach(async () => {
+  await closeOpenClawStateDatabaseAsync();
+  closeOpenClawStateDatabaseForTest();
+  await stateDb?.closeOpenClawStateDatabaseAsync();
+  stateDb?.closeOpenClawStateDatabaseForTest();
+  stateDb = undefined;
+  execApprovalsStoreTesting.reset();
+  vi.resetModules();
+  await home.restore();
+});
 
-    expect(sharedToken).toEqual(expect.any(String));
-    expect(sharedToken).not.toBe("shared-runtime-token");
-    expect(runtimeToken.isOperatorApprovalRuntimeToken(` ${sharedToken} `)).toBe(true);
-    expect(runtimeToken.isOperatorApprovalRuntimeToken("shared-runtime-token")).toBe(false);
-    expect(runtimeToken.isOperatorApprovalRuntimeToken("different-token")).toBe(false);
-  });
+it("derives the shared approval runtime token from the exec approvals socket token", async () => {
+  writeExecApprovalsToken("shared-runtime-token");
+  const { getOperatorApprovalRuntimeToken: getToken, isOperatorApprovalRuntimeToken: isToken } =
+    runtime;
+  const sharedToken = await getToken();
 
-  it("does not pin the process fallback once a shared exec approvals token appears", async () => {
-    const home = useTempHome();
-    const runtimeToken = await importRuntimeTokenModule();
+  expect(sharedToken).toEqual(expect.any(String));
+  expect(sharedToken).not.toBe("shared-runtime-token");
+  expect(await isToken(` ${sharedToken} `)).toBe(true);
+  expect(await isToken(sharedToken.slice(0, -1))).toBe(false);
+  expect(await isToken("shared-runtime-token")).toBe(false);
+  expect(await isToken("different-token")).toBe(false);
+});
 
-    const fallback = runtimeToken.getOperatorApprovalRuntimeToken();
-    writeExecApprovalsToken(home, "late-shared-runtime-token");
-    const sharedToken = runtimeToken.getOperatorApprovalRuntimeToken();
+it("does not pin the process fallback once a shared exec approvals token appears", async () => {
+  const { getOperatorApprovalRuntimeToken: getToken, isOperatorApprovalRuntimeToken: isToken } =
+    runtime;
+  const fallback = await getToken();
+  writeExecApprovalsToken("late-shared-runtime-token");
+  const sharedToken = await getToken();
 
-    expect(sharedToken).not.toBe(fallback);
-    expect(sharedToken).not.toBe("late-shared-runtime-token");
-    expect(runtimeToken.isOperatorApprovalRuntimeToken(fallback)).toBe(true);
-    expect(runtimeToken.isOperatorApprovalRuntimeToken(sharedToken)).toBe(true);
-    expect(runtimeToken.isOperatorApprovalRuntimeToken("late-shared-runtime-token")).toBe(false);
-  });
+  expect(sharedToken).not.toBe(fallback);
+  expect(sharedToken).not.toBe("late-shared-runtime-token");
+  expect(await isToken(fallback)).toBe(true);
+  expect(await isToken(sharedToken)).toBe(true);
+  expect(await isToken("late-shared-runtime-token")).toBe(false);
 
-  it("keeps a stable process fallback without creating exec-approvals.json", async () => {
-    const home = useTempHome();
-    const runtimeToken = await importRuntimeTokenModule();
+  writeExecApprovalsToken("rotated-shared-runtime-token");
+  const rotatedToken = await getToken();
+  expect(rotatedToken).not.toBe(sharedToken);
+  expect(await isToken(sharedToken)).toBe(false);
+  expect(await isToken(rotatedToken)).toBe(true);
+});
 
-    const first = runtimeToken.getOperatorApprovalRuntimeToken();
-    const second = runtimeToken.getOperatorApprovalRuntimeToken();
+it("keeps a stable process fallback without creating exec-approvals.json", async () => {
+  const first = await runtime.getOperatorApprovalRuntimeToken();
+  const second = await runtime.getOperatorApprovalRuntimeToken();
 
-    expect(first).toEqual(expect.any(String));
-    expect(second).toBe(first);
-    expect(fs.existsSync(execApprovalsPath(home))).toBe(false);
-  });
+  expect(first).toEqual(expect.any(String));
+  expect(second).toBe(first);
+  expect(fs.existsSync(path.join(home.home, ".openclaw", "exec-approvals.json"))).toBe(false);
 });

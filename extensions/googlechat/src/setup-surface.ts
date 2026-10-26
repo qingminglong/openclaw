@@ -1,6 +1,5 @@
-// Googlechat plugin module implements setup surface behavior.
+import { createChannelDmPolicy } from "openclaw/plugin-sdk/channel-dm-policy";
 import {
-  addWildcardAllowFrom,
   applySetupAccountConfigPatch,
   createPromptParsedAllowFromForAccount,
   createStandardChannelSetupStatus,
@@ -10,7 +9,6 @@ import {
   migrateBaseNameToDefaultAccount,
   splitSetupEntries,
   createSetupTranslator,
-  type ChannelSetupDmPolicy,
   type ChannelSetupWizard,
 } from "openclaw/plugin-sdk/setup";
 import {
@@ -28,7 +26,6 @@ const USE_ENV_FLAG = "__googlechatUseEnv";
 const AUTH_METHOD_FLAG = "__googlechatAuthMethod";
 
 type GoogleChatTextInput = NonNullable<ChannelSetupWizard["textInputs"]>[number];
-type GoogleChatTextInputKey = GoogleChatTextInput["inputKey"];
 
 const promptAllowFrom = createPromptParsedAllowFromForAccount({
   defaultAccountId: resolveDefaultGoogleChatAccountId,
@@ -38,65 +35,36 @@ const promptAllowFrom = createPromptParsedAllowFromForAccount({
     entries: mergeAllowFromEntries(undefined, splitSetupEntries(raw)),
   }),
   getExistingAllowFrom: ({ cfg, accountId }) =>
-    resolveGoogleChatAccount({ cfg, accountId }).config.dm?.allowFrom ?? [],
+    resolveGoogleChatAccount({ cfg, accountId }).config.allowFrom ?? [],
   applyAllowFrom: ({ cfg, accountId, allowFrom }) =>
     applySetupAccountConfigPatch({
       cfg,
       channelKey: channel,
       accountId,
-      patch: {
-        dm: {
-          ...resolveGoogleChatAccount({ cfg, accountId }).config.dm,
-          allowFrom,
-        },
-      },
+      patch: { allowFrom },
     }),
 });
 
-const googlechatDmPolicy: ChannelSetupDmPolicy = {
+const googlechatDmPolicy = createChannelDmPolicy({
   label: "Google Chat",
   channel,
-  policyKey: "channels.googlechat.dm.policy",
-  allowFromKey: "channels.googlechat.dm.allowFrom",
-  resolveConfigKeys: (cfg, accountId) =>
-    (accountId ?? resolveDefaultGoogleChatAccountId(cfg)) !== DEFAULT_ACCOUNT_ID
-      ? {
-          policyKey: `channels.googlechat.accounts.${accountId ?? resolveDefaultGoogleChatAccountId(cfg)}.dm.policy`,
-          allowFromKey: `channels.googlechat.accounts.${accountId ?? resolveDefaultGoogleChatAccountId(cfg)}.dm.allowFrom`,
-        }
-      : {
-          policyKey: "channels.googlechat.dm.policy",
-          allowFromKey: "channels.googlechat.dm.allowFrom",
-        },
-  getCurrent: (cfg, accountId) =>
+  resolveAccount: (cfg, accountId) =>
     resolveGoogleChatAccount({
       cfg,
       accountId: accountId ?? resolveDefaultGoogleChatAccountId(cfg),
-    }).config.dm?.policy ?? "pairing",
-  setPolicy: (cfg, policy, accountId) => {
-    const resolvedAccountId = accountId ?? resolveDefaultGoogleChatAccountId(cfg);
-    const currentDm = resolveGoogleChatAccount({
-      cfg,
-      accountId: resolvedAccountId,
-    }).config.dm;
-    return applySetupAccountConfigPatch({
+    }),
+  applyPatch: ({ cfg, account, patch }) =>
+    applySetupAccountConfigPatch({
       cfg,
       channelKey: channel,
-      accountId: resolvedAccountId,
-      patch: {
-        dm: {
-          ...currentDm,
-          policy,
-          ...(policy === "open" ? { allowFrom: addWildcardAllowFrom(currentDm?.allowFrom) } : {}),
-        },
-      },
-    });
-  },
+      accountId: account.accountId,
+      patch,
+    }),
   promptAllowFrom,
-};
+});
 
 function createServiceAccountTextInput(params: {
-  inputKey: GoogleChatTextInputKey;
+  inputKey: GoogleChatTextInput["inputKey"];
   message: string;
   placeholder: string;
   authMethod: "file" | "inline";
@@ -145,7 +113,10 @@ export const googlechatSetupWizard: ChannelSetupWizard = {
   prepare: async ({ cfg, accountId, credentialValues, prompter }) => {
     const envReady =
       accountId === DEFAULT_ACCOUNT_ID &&
-      (Boolean(process.env[ENV_SERVICE_ACCOUNT]) || Boolean(process.env[ENV_SERVICE_ACCOUNT_FILE]));
+      Boolean(
+        normalizeOptionalString(process.env[ENV_SERVICE_ACCOUNT]) ||
+        normalizeOptionalString(process.env[ENV_SERVICE_ACCOUNT_FILE]),
+      );
     if (envReady) {
       const useEnv = await prompter.confirm({
         message: t("wizard.googlechat.useEnvPrompt"),

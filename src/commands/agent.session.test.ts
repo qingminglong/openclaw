@@ -1,28 +1,30 @@
-// Agent session command tests cover session resolution, agent scoping, and temp-home session stores.
-import fs from "node:fs";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { withTempHome as withTempHomeBase } from "openclaw/plugin-sdk/test-env";
-import { beforeEach, describe, expect, it } from "vitest";
-import { resolveAgentDir, resolveSessionAgentId } from "../agents/agent-scope.js";
-import { updateSessionStoreAfterAgentRun } from "../agents/command/session-store.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveSessionAgentId } from "../agents/agent-scope.js";
 import { resolveSession } from "../agents/command/session.js";
-import { loadSessionStore } from "../config/sessions/store-load.js";
-import { clearSessionStoreCacheForTest } from "../config/sessions/store.js";
-import { resolveSessionTranscriptFile } from "../config/sessions/transcript.js";
+import {
+  appendTranscriptEvent,
+  loadSessionEntry,
+  replaceSessionEntry,
+} from "../config/sessions/session-accessor.js";
+import { clearSessionStoreCacheForTest } from "../config/sessions/store-writer-state.js";
+import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { buildOutboundSessionContext } from "../infra/outbound/session-context.js";
+import { normalizeSessionDeliveryState } from "../utils/delivery-context.shared.js";
+import { writeSessionStoreSeed } from "./agent-session.test-support.js";
 
 async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
-  return withTempHomeBase(fn, {
-    prefix: "openclaw-agent-session-",
-    skipSessionCleanup: true,
-  });
+  return withTempHomeBase(fn, { prefix: "openclaw-agent-session-" });
 }
 
 function mockConfig(
   home: string,
   storePath: string,
-  agentsList?: Array<{ id: string; default?: boolean }>,
+  agentEntries?: NonNullable<OpenClawConfig["agents"]>["entries"],
+  systemAgentId?: string,
 ): OpenClawConfig {
   return {
     agents: {
@@ -30,43 +32,58 @@ function mockConfig(
         model: { primary: "anthropic/claude-opus-4-6" },
         models: { "anthropic/claude-opus-4-6": {} },
         workspace: path.join(home, "openclaw"),
+        ...(systemAgentId ? { systemAgent: { agentId: systemAgentId } } : {}),
       },
-      list: agentsList,
+      entries: agentEntries,
+      ...(systemAgentId ? { ownership: "explicit" as const } : {}),
     },
     session: { store: storePath, mainKey: "main" },
-  } as OpenClawConfig;
+  };
 }
 
-function writeSessionStoreSeed(
-  storePath: string,
-  sessions: Record<string, Record<string, unknown>>,
-) {
-  fs.mkdirSync(path.dirname(storePath), { recursive: true });
-  fs.writeFileSync(storePath, JSON.stringify(sessions));
-}
-
-async function withCrossAgentResumeFixture(
-  run: (params: { sessionId: string; sessionKey: string; cfg: OpenClawConfig }) => Promise<void>,
-): Promise<void> {
-  await withTempHome(async (home) => {
-    const storePattern = path.join(home, "sessions", "{agentId}", "sessions.json");
-    const execStore = path.join(home, "sessions", "exec", "sessions.json");
-    const sessionId = "session-exec-hook";
-    const sessionKey = "agent:exec:hook:gmail:thread-1";
-    writeSessionStoreSeed(execStore, {
-      [sessionKey]: {
-        sessionId,
-        updatedAt: Date.now(),
-        systemSent: true,
-      },
-    });
-    const cfg = mockConfig(home, storePattern, [{ id: "dev" }, { id: "exec", default: true }]);
-    await run({ sessionId, sessionKey, cfg });
-  });
+async function seedTerminalSession(home: string, mainKey: string, status?: SessionEntry["status"]) {
+  const storePath = path.join(home, "sessions.json");
+  const sessionKey = `agent:main:${mainKey}`;
+  const sessionId = "stale-terminal-main";
+  const updatedAt = Date.now() - 10_000;
+  const entry: SessionEntry = {
+    sessionId,
+    sessionFile: path.join(home, "terminal-main.jsonl"),
+    updatedAt,
+    ...(status ? { status } : {}),
+    sessionStartedAt: updatedAt - 60_000,
+    lastInteractionAt: updatedAt - 30_000,
+    startedAt: updatedAt - 1_000,
+    endedAt: updatedAt - 100,
+    runtimeMs: 900,
+    cliSessionBindings: {
+      "claude-cli": { sessionId: "old-claude-cli-session" },
+      "codex-cli": { sessionId: "old-codex-cli-session" },
+    },
+    cliSessionIds: { "claude-cli": "old-claude-cli-session", "codex-cli": "old-codex-cli-session" },
+    claudeCliSessionId: "old-claude-cli-session",
+  };
+  await replaceSessionEntry({ sessionKey, storePath }, entry);
+  await appendTranscriptEvent(
+    { agentId: "main", sessionId, sessionKey, storePath },
+    { type: "custom", timestamp: "1970-01-01T00:00:00.001Z" },
+  );
+  const cfg = mockConfig(home, storePath);
+  cfg.session = { ...cfg.session, mainKey };
+  return { cfg, sessionId, updatedAt };
 }
 
 beforeEach(() => {
   clearSessionStoreCacheForTest();
+  // Keep freshness fixtures away from the local 04:00 daily-reset boundary.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const localNoon = new Date();
+  localNoon.setHours(12, 0, 0, 0);
+  vi.setSystemTime(localNoon);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("agent session resolution", () => {
@@ -75,48 +92,65 @@ describe("agent session resolution", () => {
       const store = path.join(home, "sessions.json");
       const cfg = mockConfig(home, store);
 
-      const resolution = resolveSession({ cfg, sessionId: "explicit-session-123" });
+      const resolution = await resolveSession({ cfg, sessionId: "explicit-session-123" });
 
       expect(resolution.sessionKey).toBe("agent:main:explicit:explicit-session-123");
       expect(resolution.sessionId).toBe("explicit-session-123");
     });
   });
 
-  it("uses the resumed session agent scope when sessionId resolves to another agent store", async () => {
-    await withCrossAgentResumeFixture(async ({ sessionId, sessionKey, cfg }) => {
-      const resolution = resolveSession({ cfg, sessionId });
-      expect(resolution.sessionKey).toBe(sessionKey);
-      const agentId = resolveSessionAgentId({ sessionKey: resolution.sessionKey, config: cfg });
-      expect(agentId).toBe("exec");
-      expect(resolveAgentDir(cfg, agentId)).toContain(
-        `${path.sep}agents${path.sep}exec${path.sep}agent`,
-      );
-    });
-  });
+  it.each(["main", "global", "unknown"])(
+    "finds a session-id-only %s target in another explicit agent store",
+    async (sessionKey) => {
+      await withTempHome(async (home) => {
+        const storePattern = path.join(home, "agents", "{agentId}", "sessions", "sessions.json");
+        const researchStore = path.join(home, "agents", "research", "sessions", "sessions.json");
+        const base = mockConfig(home, storePattern);
+        const cfg = {
+          ...base,
+          agents: {
+            ...base.agents,
+            ownership: "explicit",
+            entries: { ops: {}, research: {} },
+          },
+        } satisfies OpenClawConfig;
+        await replaceSessionEntry(
+          { agentId: "research", sessionKey, storePath: researchStore },
+          { sessionId: "research-session", updatedAt: Date.now() },
+        );
+
+        const resolution = await resolveSession({ cfg, sessionId: "research-session" });
+
+        expect(resolution).toMatchObject({
+          sessionId: "research-session",
+          sessionAgentId: "research",
+          sessionKey: sessionKey === "main" ? "agent:research:main" : sessionKey,
+          storePath: researchStore,
+        });
+      });
+    },
+  );
 
   it("resolves duplicate cross-agent sessionIds deterministically", async () => {
     await withTempHome(async (home) => {
-      const storePattern = path.join(home, "sessions", "{agentId}", "sessions.json");
-      const otherStore = path.join(home, "sessions", "other", "sessions.json");
-      const retiredStore = path.join(home, "sessions", "retired", "sessions.json");
-      writeSessionStoreSeed(otherStore, {
+      const storePattern = path.join(home, "agents", "{agentId}", "sessions", "sessions.json");
+      const otherStore = path.join(home, "agents", "other", "sessions", "sessions.json");
+      const retiredStore = path.join(home, "agents", "retired", "sessions", "sessions.json");
+      await writeSessionStoreSeed(otherStore, {
         "agent:other:main": {
           sessionId: "run-dup",
           updatedAt: Date.now() + 1_000,
         },
       });
-      writeSessionStoreSeed(retiredStore, {
+      await writeSessionStoreSeed(retiredStore, {
         "agent:retired:acp:run-dup": {
           sessionId: "run-dup",
           updatedAt: Date.now(),
         },
       });
-      const cfg = mockConfig(home, storePattern, [
-        { id: "other" },
-        { id: "retired", default: true },
-      ]);
+      const cfg = mockConfig(home, storePattern, { other: {}, retired: {} }, "retired");
 
-      const resolution = resolveSession({ cfg, sessionId: "run-dup" });
+      const resolution = await resolveSession({ cfg, sessionId: "run-dup" });
 
       expect(resolution.sessionKey).toBe("agent:retired:acp:run-dup");
       expect(resolution.storePath).toBe(retiredStore);
@@ -126,13 +160,17 @@ describe("agent session resolution", () => {
   it("uses origin.provider for channel-specific session reset overrides", async () => {
     await withTempHome(async (home) => {
       const store = path.join(home, "sessions.json");
-      writeSessionStoreSeed(store, {
-        main: {
+      await replaceSessionEntry(
+        { storePath: store, sessionKey: "agent:main:main" },
+        {
           sessionId: "origin-provider-reset",
           updatedAt: Date.now() - 30 * 60_000,
-          origin: { provider: "quietchat" },
+          delivery: normalizeSessionDeliveryState({
+            context: { channel: "quietchat" },
+            origin: { provider: "quietchat" },
+          }),
         },
-      });
+      );
       const cfg = mockConfig(home, store);
       cfg.session = {
         ...cfg.session,
@@ -142,198 +180,98 @@ describe("agent session resolution", () => {
         },
       };
 
-      const resolution = resolveSession({ cfg, sessionKey: "main" });
+      const resolution = await resolveSession({ cfg, sessionKey: "main" });
 
-      expect(resolution.sessionId).toBe("origin-provider-reset");
-      expect(resolution.isNewSession).toBe(false);
+      expect(resolution).toMatchObject({ sessionId: "origin-provider-reset", isNewSession: false });
     });
   });
 
-  it("rotates stale terminal main sessions whose transcript is newer than the registry", async () => {
-    const scenarios = [
-      {
-        label: "canonical main",
-        mainKey: "main",
-        sessionKey: "agent:main:main",
-        status: "done" as const,
-      },
-      { label: "raw main alias", mainKey: "main", sessionKey: "main", status: "done" as const },
-      {
-        label: "custom main alias",
-        mainKey: "work",
-        sessionKey: "agent:main:main",
-        status: "done" as const,
-      },
-      { label: "endedAt-only main", mainKey: "main", sessionKey: "agent:main:main" },
-    ];
-    for (const scenario of scenarios) {
+  it.each<[string, SessionEntry["status"], string?, string?]>([
+    ["canonical done main", "done"],
+    ["raw done main alias", "done", "main", "main"],
+    ["custom done main alias", "done", "work"],
+    ["killed main", "killed"],
+    ["endedAt-only main", undefined],
+  ])(
+    "uses explicit outcomes for %s with a newer transcript",
+    async (label, status, mainKey = "main", requestedSessionKey = "agent:main:main") => {
+      const storedSessionKey = `agent:main:${mainKey}`;
+      const expectNewSession = status === "killed";
       await withTempHome(async (home) => {
-        const store = path.join(home, "sessions.json");
-        const sessionFile = path.join(home, `session-${scenario.label.replaceAll(" ", "-")}.jsonl`);
-        const sessionId = `stale-terminal-${scenario.label.replaceAll(" ", "-")}`;
-        const registryUpdatedAt = Date.now() - 10_000;
-        fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-        fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: sessionId }) + "\n");
-        fs.utimesSync(
-          sessionFile,
-          (registryUpdatedAt + 5_000) / 1000,
-          (registryUpdatedAt + 5_000) / 1000,
-        );
-        writeSessionStoreSeed(store, {
-          [scenario.sessionKey]: {
-            sessionId,
-            sessionFile,
-            updatedAt: registryUpdatedAt,
-            ...(scenario.status ? { status: scenario.status } : {}),
-            sessionStartedAt: registryUpdatedAt - 60_000,
-            lastInteractionAt: registryUpdatedAt - 30_000,
-            startedAt: registryUpdatedAt - 1_000,
-            endedAt: registryUpdatedAt - 100,
-            cliSessionBindings: {
-              "claude-cli": { sessionId: "old-claude-cli-session" },
-              "codex-cli": { sessionId: "old-codex-cli-session" },
-            },
-            cliSessionIds: {
-              "claude-cli": "old-claude-cli-session",
-              "codex-cli": "old-codex-cli-session",
-            },
-            claudeCliSessionId: "old-claude-cli-session",
-          },
+        const { cfg, sessionId, updatedAt } = await seedTerminalSession(home, mainKey, status);
+
+        const resolution = await resolveSession({ cfg, sessionKey: requestedSessionKey });
+
+        expect(resolution, label).toMatchObject({
+          sessionKey: storedSessionKey,
+          isNewSession: expectNewSession,
         });
-        const cfg = mockConfig(home, store);
-        cfg.session = { ...cfg.session, mainKey: scenario.mainKey };
-
-        const resolution = resolveSession({ cfg, sessionKey: scenario.sessionKey });
-
-        expect(resolution.isNewSession).toBe(true);
+        if (!expectNewSession) {
+          expect(resolution.sessionId).toBe(sessionId);
+          expect(resolution.sessionEntry?.status).toBe(status);
+          if (status === undefined) {
+            expect(resolution.sessionEntry?.endedAt).toBe(updatedAt - 100);
+          }
+          return;
+        }
         expect(resolution.sessionId).not.toBe(sessionId);
-        expect(resolution.sessionEntry?.sessionFile).toBeUndefined();
-        expect(resolution.sessionEntry?.status).toBeUndefined();
-        expect(resolution.sessionEntry?.startedAt).toBeUndefined();
-        expect(resolution.sessionEntry?.endedAt).toBeUndefined();
-        expect(resolution.sessionEntry?.runtimeMs).toBeUndefined();
-        expect(resolution.sessionEntry?.sessionStartedAt).toBeUndefined();
-        expect(resolution.sessionEntry?.lastInteractionAt).toBeUndefined();
-        expect(resolution.sessionEntry?.cliSessionBindings).toBeUndefined();
-        expect(resolution.sessionEntry?.cliSessionIds).toBeUndefined();
-        expect(resolution.sessionEntry?.claudeCliSessionId).toBeUndefined();
-
-        const sessionStore = {
-          [scenario.sessionKey]: resolution.sessionEntry!,
-        };
-        await resolveSessionTranscriptFile({
-          sessionId: resolution.sessionId,
-          sessionKey: scenario.sessionKey,
-          sessionEntry: resolution.sessionEntry,
-          sessionStore,
-          storePath: resolution.storePath,
-          agentId: "main",
-        });
-        await updateSessionStoreAfterAgentRun({
-          cfg,
-          sessionId: resolution.sessionId,
-          sessionKey: scenario.sessionKey,
-          storePath: resolution.storePath,
-          sessionStore,
-          defaultProvider: "openai",
-          defaultModel: "gpt-5.5",
-          result: {
-            payloads: [],
-            meta: {
-              aborted: false,
-              agentMeta: {
-                provider: "openai",
-                model: "gpt-5.5",
-              },
-            },
-          } as never,
-        });
-        const persisted = loadSessionStore(resolution.storePath, { skipCache: true })[
-          scenario.sessionKey
-        ];
-        expect(persisted?.sessionId).toBe(resolution.sessionId);
-        expect(persisted?.sessionFile).not.toBe(sessionFile);
-        expect(persisted?.status).toBeUndefined();
-        expect(persisted?.startedAt).toBeUndefined();
-        expect(persisted?.endedAt).toBeUndefined();
-        expect(persisted?.runtimeMs).toBeUndefined();
-        expect(persisted?.cliSessionBindings).toBeUndefined();
-        expect(persisted?.cliSessionIds).toBeUndefined();
-        expect(persisted?.claudeCliSessionId).toBeUndefined();
-        expect(persisted?.sessionStartedAt).toBeGreaterThan(registryUpdatedAt);
-        expect(persisted?.lastInteractionAt).toBeGreaterThan(registryUpdatedAt);
+        for (const key of [
+          "sessionFile",
+          "status",
+          "startedAt",
+          "endedAt",
+          "runtimeMs",
+          "sessionStartedAt",
+          "lastInteractionAt",
+          "cliSessionBindings",
+          "cliSessionIds",
+          "claudeCliSessionId",
+        ] as const) {
+          expect(resolution.sessionEntry?.[key], key).toBeUndefined();
+        }
       });
-    }
-  });
+    },
+  );
 
   it("preserves explicit session-id resumes for stale terminal main rows", async () => {
     await withTempHome(async (home) => {
-      const store = path.join(home, "sessions.json");
-      const sessionFile = path.join(home, "explicit-terminal-main.jsonl");
-      const sessionId = "explicit-terminal-main";
-      const registryUpdatedAt = Date.now() - 10_000;
-      fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: sessionId }) + "\n");
-      fs.utimesSync(
-        sessionFile,
-        (registryUpdatedAt + 5_000) / 1000,
-        (registryUpdatedAt + 5_000) / 1000,
-      );
-      writeSessionStoreSeed(store, {
-        "agent:main:main": {
-          sessionId,
-          sessionFile,
-          updatedAt: registryUpdatedAt,
-          status: "done",
-          startedAt: registryUpdatedAt - 1_000,
-          endedAt: registryUpdatedAt - 100,
-          runtimeMs: 900,
-        },
+      const { cfg, sessionId, updatedAt } = await seedTerminalSession(home, "main", "done");
+
+      const resolution = await resolveSession({ cfg, sessionId });
+
+      expect(resolution).toMatchObject({
+        sessionKey: "agent:main:main",
+        sessionId,
+        isNewSession: false,
       });
-      const cfg = mockConfig(home, store);
-
-      const resolution = resolveSession({ cfg, sessionId });
-
-      expect(resolution.sessionKey).toBe("agent:main:main");
-      expect(resolution.sessionId).toBe(sessionId);
-      expect(resolution.isNewSession).toBe(false);
-      expect(resolution.sessionEntry?.sessionFile).toBe(sessionFile);
-      expect(resolution.sessionEntry?.status).toBe("done");
-      expect(resolution.sessionEntry?.startedAt).toBe(registryUpdatedAt - 1_000);
-      expect(resolution.sessionEntry?.endedAt).toBe(registryUpdatedAt - 100);
-      expect(resolution.sessionEntry?.runtimeMs).toBe(900);
-
-      if (!resolution.sessionKey || !resolution.sessionStore) {
-        throw new Error("expected resolved explicit session store");
-      }
-      const resolvedTranscript = await resolveSessionTranscriptFile({
-        sessionId: resolution.sessionId,
-        sessionKey: resolution.sessionKey,
-        sessionEntry: resolution.sessionEntry,
-        sessionStore: resolution.sessionStore,
+      const persisted = loadSessionEntry({
+        sessionKey: expectDefined(resolution.sessionKey, "resolved session key"),
         storePath: resolution.storePath,
-        agentId: "main",
       });
-      expect(fs.realpathSync.native(resolvedTranscript.sessionFile)).toBe(
-        fs.realpathSync.native(sessionFile),
-      );
-
-      const persisted = loadSessionStore(resolution.storePath, { skipCache: true })[
-        resolution.sessionKey
-      ];
-      expect(persisted?.sessionId).toBe(sessionId);
-      expect(fs.realpathSync.native(persisted?.sessionFile ?? "")).toBe(
-        fs.realpathSync.native(sessionFile),
-      );
-      expect(persisted?.status).toBe("done");
-      expect(persisted?.startedAt).toBe(registryUpdatedAt - 1_000);
-      expect(persisted?.endedAt).toBe(registryUpdatedAt - 100);
-      expect(persisted?.runtimeMs).toBe(900);
+      for (const entry of [resolution.sessionEntry, persisted]) {
+        expect(entry).not.toHaveProperty("sessionFile");
+        expect(entry).toMatchObject({
+          sessionId,
+          status: "done",
+          startedAt: updatedAt - 1_000,
+          endedAt: updatedAt - 100,
+          runtimeMs: 900,
+        });
+      }
     });
   });
 
   it("forwards resolved outbound session context when resuming by sessionId", async () => {
-    await withCrossAgentResumeFixture(async ({ sessionId, sessionKey, cfg }) => {
-      const resolution = resolveSession({ cfg, sessionId });
+    await withTempHome(async (home) => {
+      const storePattern = path.join(home, "agents", "{agentId}", "sessions", "sessions.json");
+      const execStore = path.join(home, "agents", "exec", "sessions", "sessions.json");
+      const sessionId = "session-exec-hook";
+      const sessionKey = "agent:exec:hook:gmail:thread-1";
+      await writeSessionStoreSeed(execStore, {
+        [sessionKey]: { sessionId, updatedAt: Date.now(), systemSent: true },
+      });
+      const cfg = mockConfig(home, storePattern, { dev: {}, exec: {} }, "exec");
+      const resolution = await resolveSession({ cfg, sessionId });
       expect(resolution.sessionKey).toBe(sessionKey);
       const agentId = resolveSessionAgentId({ sessionKey: resolution.sessionKey, config: cfg });
       const outboundContext = buildOutboundSessionContext({
@@ -344,8 +282,7 @@ describe("agent session resolution", () => {
       if (!outboundContext) {
         throw new Error("expected outbound session context");
       }
-      expect(outboundContext.key).toBe(sessionKey);
-      expect(outboundContext.agentId).toBe("exec");
+      expect(outboundContext).toMatchObject({ key: sessionKey, agentId: "exec" });
     });
   });
 });

@@ -1,77 +1,27 @@
-// Gateway tool restart tests cover the sentinel handoff that lets an agent
-// resume private work after the gateway process restarts.
+import { asRecord, readStringField } from "@openclaw/normalization-core/record-coerce";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { RestartSentinelPayload } from "../../infra/restart-sentinel.js";
-import type { scheduleGatewaySigusr1Restart } from "../../infra/restart.js";
+import { prepareCronRunAdmission } from "../../cron/run-admission.js";
+import { TEST_SCHEDULED_EXECUTION } from "../../cron/scheduled-occurrence.test-support.js";
+import { restartHandlers } from "../../gateway/server-methods/restart.js";
+import type { GatewayRequestContext } from "../../gateway/server-methods/types.js";
+import {
+  resetGatewayRestartStateForInProcessRestart,
+  setPreRestartDeferralCheck,
+} from "../../infra/restart.js";
+import { bindGatewayContextResolver } from "../../plugins/runtime/gateway-request-scope.js";
+import { resetGatewayWorkAdmission } from "../../process/gateway-work-admission.js";
+import { prepareSystemAgentRunAdmission } from "../admitted-run-context.js";
+import {
+  createAdmittedGatewayToolCallerIdentity,
+  getGatewayToolCallerIdentity,
+  withGatewayToolCallerIdentity,
+} from "./gateway-caller-context.js";
 import { createGatewayTool } from "./gateway-tool.js";
 
-type ScheduleGatewayRestartArgs = Parameters<typeof scheduleGatewaySigusr1Restart>[0];
-
-const {
-  extractDeliveryInfoMock,
-  formatDoctorNonInteractiveHintMock,
-  isRestartEnabledMock,
-  callGatewayToolMock,
-  clearRestartSentinelMock,
-  scheduleGatewaySigusr1RestartMock,
-  writeRestartSentinelMock,
-} = vi.hoisted(() => ({
-  isRestartEnabledMock: vi.fn(() => true),
-  callGatewayToolMock: vi.fn(async () => ({ ok: true })),
-  extractDeliveryInfoMock: vi.fn(() => ({
-    deliveryContext: {
-      channel: "slack",
-      to: "slack:C123",
-      accountId: "workspace-1",
-    },
-    threadId: "thread-42",
-  })),
-  formatDoctorNonInteractiveHintMock: vi.fn(
-    () =>
-      "Recommended follow-up: run openclaw doctor --non-interactive in a terminal or approvals-capable OpenClaw surface.",
-  ),
-  writeRestartSentinelMock: vi.fn(async (_payload: RestartSentinelPayload) => undefined),
-  clearRestartSentinelMock: vi.fn(async () => undefined),
-  scheduleGatewaySigusr1RestartMock: vi.fn((_opts?: ScheduleGatewayRestartArgs) => ({
-    ok: true,
-    pid: 123,
-    signal: "SIGUSR1" as const,
-    delayMs: 250,
-    mode: "emit" as const,
-    coalesced: false,
-    cooldownMsApplied: 0,
-    emitHooksQueued: true,
-  })),
-}));
-
-vi.mock("../../config/commands.js", () => ({
-  isRestartEnabled: isRestartEnabledMock,
-}));
-
-vi.mock("../../config/sessions.js", () => ({
-  extractDeliveryInfo: extractDeliveryInfoMock,
-}));
-
-vi.mock("../../infra/restart-sentinel.js", async () => {
-  const actual = await vi.importActual<typeof import("../../infra/restart-sentinel.js")>(
-    "../../infra/restart-sentinel.js",
-  );
-  return {
-    ...actual,
-    formatDoctorNonInteractiveHint: formatDoctorNonInteractiveHintMock,
-    clearRestartSentinel: clearRestartSentinelMock,
-    writeRestartSentinel: writeRestartSentinelMock,
-  };
-});
-
-vi.mock("../../infra/restart.js", () => ({
-  scheduleGatewaySigusr1Restart: scheduleGatewaySigusr1RestartMock,
-}));
-
-vi.mock("../../logging/subsystem.js", () => ({
-  createSubsystemLogger: vi.fn(() => ({
-    info: vi.fn(),
-  })),
+const { callGatewayToolMock, dispatchMock, host } = vi.hoisted(() => ({
+  dispatchMock: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+  host: { context: {} as GatewayRequestContext | undefined },
+  callGatewayToolMock: vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({ ok: true })),
 }));
 
 vi.mock("./gateway.js", () => ({
@@ -79,307 +29,381 @@ vi.mock("./gateway.js", () => ({
   readGatewayCallOptions: vi.fn(() => ({})),
 }));
 
-function requireRestartSentinelPayload(): RestartSentinelPayload {
-  const calls = writeRestartSentinelMock.mock.calls;
-  const payload = calls[calls.length - 1]?.[0];
-  if (!payload) {
-    throw new Error("expected restart sentinel payload");
-  }
-  return payload;
-}
+vi.mock("../../gateway/server-plugin-in-process-dispatch.js", () => ({
+  dispatchGatewayMethodInProcess: dispatchMock,
+  getInProcessGatewayRequestContext: (resolve?: () => GatewayRequestContext | undefined) =>
+    resolve ? resolve() : host.context,
+}));
+const ownerTool = () => createGatewayTool({ senderIsOwner: true, allowConfigReads: false });
+const expectNoGatewayCall = () => {
+  expect(callGatewayToolMock).not.toHaveBeenCalled();
+  expect(dispatchMock).not.toHaveBeenCalled();
+};
 
-function requireScheduledRestartArgs(): NonNullable<ScheduleGatewayRestartArgs> {
-  const calls = scheduleGatewaySigusr1RestartMock.mock.calls;
-  const args = calls[calls.length - 1]?.[0];
-  if (!args) {
-    throw new Error("expected scheduled restart args");
-  }
-  return args;
-}
-
-describe("gateway tool restart continuation", () => {
+describe("gateway tool", () => {
   beforeEach(() => {
-    isRestartEnabledMock.mockReset();
-    isRestartEnabledMock.mockReturnValue(true);
-    extractDeliveryInfoMock.mockReset();
-    extractDeliveryInfoMock.mockReturnValue({
-      deliveryContext: {
-        channel: "slack",
-        to: "slack:C123",
-        accountId: "workspace-1",
-      },
-      threadId: "thread-42",
-    });
-    formatDoctorNonInteractiveHintMock.mockReset();
-    formatDoctorNonInteractiveHintMock.mockReturnValue(
-      "Recommended follow-up: run openclaw doctor --non-interactive in a terminal or approvals-capable OpenClaw surface.",
-    );
-    writeRestartSentinelMock.mockReset();
-    writeRestartSentinelMock.mockResolvedValue(undefined);
-    clearRestartSentinelMock.mockClear();
-    scheduleGatewaySigusr1RestartMock.mockReset();
-    scheduleGatewaySigusr1RestartMock.mockReturnValue({
-      ok: true,
-      pid: 123,
-      signal: "SIGUSR1",
-      delayMs: 250,
-      mode: "emit",
-      coalesced: false,
-      cooldownMsApplied: 0,
-      emitHooksQueued: true,
-    });
     callGatewayToolMock.mockReset();
+    dispatchMock.mockReset();
     callGatewayToolMock.mockResolvedValue({ ok: true });
   });
 
-  it("does not expose system-event continuations to the agent tool", async () => {
-    const tool = createGatewayTool();
+  it.each(["config.schema.lookup"])(
+    "rejects %s without config read authority before calling the Gateway",
+    async (action) => {
+      const tool = createGatewayTool({ allowConfigReads: false, senderIsOwner: true });
 
-    const parameters = tool.parameters as {
-      properties?: {
-        continuationKind?: unknown;
-      };
-    };
-    expect(parameters.properties?.continuationKind).toBeUndefined();
-  });
+      await expect(tool.execute("denied-config", { action, path: "channels" })).rejects.toThrow(
+        `Action not available: ${action}`,
+      );
+      expectNoGatewayCall();
+    },
+  );
 
-  it("advertises restart delays as non-negative integers", async () => {
-    const tool = createGatewayTool();
-
-    const parameters = tool.parameters as {
-      properties?: {
-        delayMs?: { minimum?: number; type?: string };
-        replacePaths?: { items?: { type?: string }; type?: string };
-        restartDelayMs?: { minimum?: number; type?: string };
-        timeoutMs?: { minimum?: number; type?: string };
-      };
-    };
-    expect(parameters.properties?.delayMs).toMatchObject({ type: "integer", minimum: 0 });
-    expect(parameters.properties?.replacePaths).toMatchObject({
-      type: "array",
-      items: { type: "string" },
+  it("hands an owner restart to the real runtime scheduler and waits for active work", async () => {
+    vi.useFakeTimers();
+    resetGatewayRestartStateForInProcessRestart();
+    resetGatewayWorkAdmission();
+    let pending = 1;
+    setPreRestartDeferralCheck(() => pending);
+    const restarted = vi.fn();
+    process.on("SIGUSR2", restarted);
+    dispatchMock.mockImplementation(async (method, params, options) => {
+      const handler = restartHandlers[String(method)];
+      if (!handler) {
+        throw new Error("Unexpected maintenance method");
+      }
+      let result: unknown;
+      await handler({
+        params,
+        sessionMutationCommitGuard: (options as { sessionMutationCommitGuard?: () => void })
+          .sessionMutationCommitGuard,
+        respond: (ok, payload, error) => {
+          if (!ok) {
+            throw new Error(error?.message);
+          }
+          result = payload;
+        },
+      } as Parameters<typeof handler>[0]);
+      return result;
     });
-    expect(parameters.properties?.restartDelayMs).toMatchObject({ type: "integer", minimum: 0 });
-    expect(parameters.properties?.timeoutMs).toMatchObject({ type: "integer", minimum: 1 });
-  });
-
-  it("instructs agents to use continuationMessage for internal post-restart work", async () => {
-    const tool = createGatewayTool();
-
-    expect(tool.description).toContain("replacePaths");
-    expect(tool.description).toContain("post-restart work must continue internally");
-    expect(tool.description).toContain(
-      "visible follow-up from that turn must use the message tool",
-    );
-    expect(tool.description).toContain("continuationMessage");
-    expect(tool.description).toContain("Do not write restart sentinel files directly");
-  });
-
-  it("writes an agentTurn continuation into the restart sentinel", async () => {
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
-
-    const result = await tool.execute?.("tool-call-1", {
-      action: "restart",
-      delayMs: 250,
-      reason: "continue after reboot",
-      note: "Gateway restarting now",
-      continuationMessage: "Reply with exactly: Yay! I did it!",
-    });
-
-    expect(writeRestartSentinelMock).not.toHaveBeenCalled();
-    // The sentinel is emitted by the restart scheduler hook, so failed restart
-    // delivery can still clean up a prepared file before the process exits.
-    await requireScheduledRestartArgs().emitHooks?.beforeEmit?.();
-
-    const payload = requireRestartSentinelPayload();
-    expect(payload.kind).toBe("restart");
-    expect(payload.status).toBe("ok");
-    expect(payload.sessionKey).toBe("agent:main:main");
-    expect(payload.deliveryContext).toEqual({
-      channel: "slack",
-      to: "slack:C123",
-      accountId: "workspace-1",
-    });
-    expect(payload.threadId).toBe("thread-42");
-    expect(payload.message).toBe("Gateway restarting now");
-    expect(payload.continuation).toEqual({
-      kind: "agentTurn",
-      message: "Reply with exactly: Yay! I did it!",
-    });
-    const restartArgs = requireScheduledRestartArgs();
-    expect(restartArgs.delayMs).toBe(250);
-    expect(restartArgs.reason).toBe("continue after reboot");
-    expect(restartArgs.sessionKey).toBe("agent:main:main");
-    expect(typeof restartArgs.emitHooks?.beforeEmit).toBe("function");
-    expect(typeof restartArgs.emitHooks?.afterEmitRejected).toBe("function");
-    expect(result?.details).toMatchObject({
-      ok: true,
-      delayMs: 250,
-      coalesced: false,
-      emitHooksQueued: true,
-      continuationQueued: true,
-    });
-  });
-
-  it("uses the runtime session, not model-supplied params, for scheduler ownership and sentinel routing (#86742)", async () => {
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:session-A",
-      config: {},
-    });
-
-    await tool.execute?.("tool-call-1", {
-      action: "restart",
-      sessionKey: "agent:main:session-B",
-      continuationMessage: "Reply after restart",
-    });
-
-    expect(requireScheduledRestartArgs().sessionKey).toBe("agent:main:session-A");
-    await requireScheduledRestartArgs().emitHooks?.beforeEmit?.();
-    expect(requireRestartSentinelPayload().sessionKey).toBe("agent:main:session-A");
-  });
-
-  it("reports continuationQueued=false when a coalesced restart belongs to another session (#86742)", async () => {
-    scheduleGatewaySigusr1RestartMock.mockReturnValue({
-      ok: true,
-      pid: 123,
-      signal: "SIGUSR1",
-      delayMs: 0,
-      mode: "emit",
-      coalesced: true,
-      cooldownMsApplied: 0,
-      emitHooksQueued: false,
-    });
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
-
-    const result = await tool.execute?.("tool-call-1", {
-      action: "restart",
-      continuationMessage: "Reply after restart",
-    });
-
-    expect(writeRestartSentinelMock).not.toHaveBeenCalled();
-    expect(result?.details).toMatchObject({
-      coalesced: true,
-      emitHooksQueued: false,
-      continuationQueued: false,
-    });
-  });
-
-  it.each([-1, 1.5, "soon"])("rejects invalid restart delayMs value %s", async (delayMs) => {
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
-
-    await expect(
-      tool.execute?.("tool-call-invalid-delay", {
+    try {
+      const result = await ownerTool().execute("maintenance", {
         action: "restart",
-        delayMs,
-      }),
-    ).rejects.toThrow("delayMs must be a non-negative integer");
-    expect(scheduleGatewaySigusr1RestartMock).not.toHaveBeenCalled();
+        note: "update.run",
+        skipDeferral: true,
+        target: { pid: 1 },
+        gatewayUrl: "wss://wrong.invalid",
+      });
+      expect(result.details).toMatchObject({
+        ok: true,
+        restart: { mode: "emit", reason: "gateway.restart.agent" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(restarted).not.toHaveBeenCalled();
+      pending = 0;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(restarted).toHaveBeenCalledOnce();
+      expect(callGatewayToolMock).not.toHaveBeenCalled();
+    } finally {
+      process.off("SIGUSR2", restarted);
+      resetGatewayRestartStateForInProcessRestart();
+      setPreRestartDeferralCheck(() => 0);
+      resetGatewayWorkAdmission();
+      vi.useRealTimers();
+    }
   });
 
-  it("accepts string restart delayMs values through the shared numeric reader", async () => {
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
+  it.each(["restart", "update.cleanup"])(
+    "refuses non-owner %s before any effect",
+    async (action) => {
+      const result = await createGatewayTool({ senderIsOwner: false }).execute("maintenance", {
+        action,
+        senderIsOwner: true,
+      });
+      expect(result.details).toMatchObject({ ok: false, code: "owner_required" });
+      expectNoGatewayCall();
+    },
+  );
+});
 
-    await tool.execute?.("tool-call-string-delay", {
-      action: "restart",
-      delayMs: "250",
-    });
+describe("gateway maintenance authority", () => {
+  it.each(["restart", "update.cleanup"])(
+    "does not redirect %s to a remote Gateway",
+    async (action) => {
+      host.context = undefined;
+      dispatchMock.mockReset();
+      callGatewayToolMock.mockClear();
+      await expect(
+        createGatewayTool({ senderIsOwner: true }).execute("maintenance", {
+          action,
+          gatewayUrl: "wss://other.invalid",
+          gatewayToken: "synthetic-token",
+        }),
+      ).rejects.toThrow("Gateway instance unavailable");
+      expectNoGatewayCall();
+    },
+  );
+});
 
-    expect(requireScheduledRestartArgs().delayMs).toBe(250);
+describe("gateway update action", () => {
+  beforeEach(() => {
+    callGatewayToolMock.mockReset();
+    dispatchMock.mockReset();
+    host.context = {} as GatewayRequestContext;
   });
 
-  it("coerces legacy continuationKind inputs to an agentTurn", async () => {
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
-
-    await tool.execute?.("tool-call-1", {
-      action: "restart",
-      continuationKind: "systemEvent",
-      continuationMessage: "Reply after restart",
-    });
-
-    await requireScheduledRestartArgs().emitHooks?.beforeEmit?.();
-
-    // Older model-facing arguments should not reintroduce system-event
-    // continuations; visible replies still go through the message tool.
-    expect(requireRestartSentinelPayload().continuation).toEqual({
-      kind: "agentTurn",
-      message: "Reply after restart",
-    });
+  it("refuses scheduler-source injection inside a live non-scheduler run", async () => {
+    const sessionKey = "agent:main:operator";
+    const admission = prepareSystemAgentRunAdmission({}, "operator-run", "main", "test");
+    try {
+      const context = await admission.admit("embedded");
+      bindGatewayContextResolver(context, () => host.context);
+      const caller = createAdmittedGatewayToolCallerIdentity({
+        admittedRunContext: context,
+        agentId: "main",
+        sessionKey,
+      });
+      const injectedIdentity = {
+        agentId: "main",
+        sessionKey,
+        admissionSource: "operator-schedule" as const,
+      };
+      dispatchMock.mockResolvedValue({ ok: true, result: { status: "ok" } });
+      const result = await withGatewayToolCallerIdentity(caller, () =>
+        withGatewayToolCallerIdentity(injectedIdentity, () => {
+          expect(getGatewayToolCallerIdentity()?.approvalAuthority).toBe(caller?.approvalAuthority);
+          return createGatewayTool().execute("injected-update", { action: "update.run" });
+        }),
+      );
+      expect(result.details).toMatchObject({
+        ok: false,
+        code: "owner_required",
+        reason: "owner_required",
+      });
+      expect(dispatchMock).not.toHaveBeenCalled();
+    } finally {
+      admission.close();
+    }
   });
 
-  it("does not infer a continuation for session-scoped restarts", async () => {
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
+  it.each(["operator-schedule", "requester-schedule"] as const)(
+    "uses recorded scheduler admission %s independently of audit and chat delivery",
+    async (admissionSource) => {
+      const sessionKey = "agent:main:synthetic-update";
+      const admission = prepareCronRunAdmission({
+        scheduledExecution: TEST_SCHEDULED_EXECUTION,
+        deliveryAttemptFence: { beforeAttempt: async () => {}, assertCurrent: () => {} },
+        cfg: {},
+        agentId: "main",
+        runId: "synthetic-run",
+        sessionId: "synthetic-session",
+        sessionKey,
+        jobId: "synthetic-job",
+        admissionSource,
+      });
+      try {
+        const context = await admission.preparedRunAdmission.admit("embedded");
+        expect(context.executionIdentityToken).toBeUndefined();
+        bindGatewayContextResolver(context, () => host.context);
+        const caller = createAdmittedGatewayToolCallerIdentity({
+          admittedRunContext: context,
+          agentId: "main",
+          sessionKey,
+          turnSourceChannel: "telegram",
+          turnSourceTo: "123",
+        });
+        dispatchMock.mockResolvedValue({ ok: true, runId: "update-run", result: { status: "ok" } });
+        const invoke = () =>
+          withGatewayToolCallerIdentity(caller, () =>
+            withGatewayToolCallerIdentity({ agentId: "main", sessionKey }, () =>
+              createGatewayTool().execute("scheduled-update", { action: "update.run" }),
+            ),
+          );
+        const result = await invoke();
+        if (admissionSource === "operator-schedule") {
+          expect(result.details).toMatchObject({ ok: true, runId: "update-run" });
+          expect(dispatchMock).toHaveBeenCalledOnce();
+          expect(dispatchMock.mock.calls[0]?.[1]).toMatchObject({
+            sessionKey,
+            requester: undefined,
+            deliveryContext: { channel: "telegram", to: "123" },
+          });
+          admission.close();
+          expect((await invoke()).details).toMatchObject({
+            ok: false,
+            code: "owner_required",
+            reason: "owner_required",
+          });
+          expect(dispatchMock).toHaveBeenCalledOnce();
+        } else {
+          expect(result.details).toMatchObject({
+            ok: false,
+            code: "owner_required",
+            reason: "owner_required",
+            message: expect.stringContaining(
+              "No authenticated owner chat principal or operator-scheduled admission",
+            ),
+          });
+          expect(dispatchMock).not.toHaveBeenCalled();
+        }
+      } finally {
+        admission.close();
+      }
+    },
+  );
 
-    await tool.execute?.("tool-call-1", {
-      action: "restart",
-      delayMs: 250,
-      reason: "restart requested",
-    });
-
-    await requireScheduledRestartArgs().emitHooks?.beforeEmit?.();
-
-    const payload = requireRestartSentinelPayload();
-    expect(payload.sessionKey).toBe("agent:main:main");
-    expect(payload.continuation).toBeNull();
-  });
-
-  it("removes the prepared sentinel when restart emission is rejected", async () => {
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
-
-    await tool.execute?.("tool-call-1", {
-      action: "restart",
-    });
-
-    const scheduledArgs = requireScheduledRestartArgs();
-    await scheduledArgs.emitHooks?.beforeEmit?.();
-    await scheduledArgs.emitHooks?.afterEmitRejected?.();
-
-    expect(clearRestartSentinelMock).toHaveBeenCalledOnce();
-  });
-
-  it("uses the runtime session for update.run continuation routing (#86742)", async () => {
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:session-A",
-      config: {},
-    });
-
-    await tool.execute?.("tool-call-update", {
-      action: "update.run",
-      sessionKey: "agent:main:session-B",
-      continuationMessage: "Reply after update restart",
-      note: "Updating now",
-      restartDelayMs: 0,
-    });
-
-    expect(callGatewayToolMock).toHaveBeenCalledWith(
-      "update.run",
-      expect.objectContaining({ timeoutMs: expect.any(Number) }),
-      expect.objectContaining({
-        sessionKey: "agent:main:session-A",
-        continuationMessage: "Reply after update restart",
-        note: "Updating now",
-        restartDelayMs: 0,
-      }),
+  it("requires an explicit owner identity", async () => {
+    const result = await withGatewayToolCallerIdentity(
+      {
+        agentId: "main",
+        sessionKey: "agent:main:telegram:direct:123456789",
+        turnSourceChannel: "telegram",
+      },
+      () =>
+        createGatewayTool({ requesterSenderId: "123456789" }).execute("update", {
+          action: "update.run",
+          requesterSenderId: "spoofed",
+          channel: "discord",
+        }),
     );
+    expect(result.details).toEqual({
+      ok: false,
+      code: "owner_required",
+      reason: "owner_required",
+      message:
+        "No authenticated owner chat principal or operator-scheduled admission authorizes this update. Ask the operator to add `telegram:123456789` to `commands.ownerAllowFrom`.",
+    });
+    expectNoGatewayCall();
+  });
+
+  it.each([0])(
+    "uses trusted chat routing without an update deadline (thread %s)",
+    async (threadId) => {
+      dispatchMock.mockResolvedValue({
+        ok: true,
+        result: {
+          status: "skipped",
+          mode: "npm",
+          reason: "managed-service-update-handoff",
+          before: { version: "2026.9.1" },
+        },
+        handoff: { status: "started", command: "openclaw update --timeout 1200", pid: 123 },
+        restart: { ok: true, delayMs: 2000, pid: 456 },
+        sentinel: { payload: "private-runtime-state" },
+        ackDelivered: true,
+      });
+      const signal = new AbortController().signal;
+      const result = await withGatewayToolCallerIdentity(
+        {
+          agentId: "main",
+          sessionKey: "agent:main:telegram:direct:123",
+          turnSourceChannel: "telegram",
+          turnSourceTo: "123",
+          turnSourceAccountId: "primary",
+          turnSourceThreadId: threadId,
+        },
+        () =>
+          createGatewayTool({ senderIsOwner: true, requesterSenderId: "owner" }).execute(
+            "update",
+            {
+              action: "update.run",
+              note: "Requested update",
+              sessionKey: "spoofed",
+              deliveryContext: { channel: "discord", to: "other" },
+              gatewayUrl: "wss://other.example",
+              gatewayToken: "model-token",
+              timeoutMs: 1,
+            },
+            signal,
+          ),
+      );
+      expect(dispatchMock).toHaveBeenCalledExactlyOnceWith(
+        "update.run",
+        {
+          requester: { channel: "telegram", accountId: "primary", senderId: "owner" },
+          sessionKey: "agent:main:telegram:direct:123",
+          deliveryContext: {
+            channel: "telegram",
+            to: "123",
+            accountId: "primary",
+            threadId,
+          },
+          note: "Requested update",
+        },
+        {
+          signal,
+          timeoutMs: 1_200_000,
+          forceSyntheticClient: true,
+          operatorRoleActor: { kind: "system" },
+          syntheticScopes: ["operator.admin"],
+          syntheticScopeMode: "minimum",
+          resolveGatewayContext: expect.any(Function),
+        },
+      );
+      expect(callGatewayToolMock).not.toHaveBeenCalled();
+      expect(result.details).toMatchObject({
+        ok: true,
+        status: "skipped",
+        before: { version: "2026.9.1" },
+        restart: { scheduled: true, delayMs: 2000 },
+        ackDelivered: true,
+        failedSteps: [],
+      });
+      const serialized = JSON.stringify(result.details);
+      expect(serialized).not.toContain("sentinel");
+      expect(serialized).not.toContain('"pid"');
+      expect(serialized).toContain("do not run shell commands or restart anything");
+    },
+  );
+
+  it("still calls without a caller session", async () => {
+    dispatchMock.mockResolvedValue({ ok: true, result: { status: "ok", steps: [] } });
+    const result = await ownerTool().execute("update", {
+      action: "update.run",
+    });
+    expect(dispatchMock).toHaveBeenCalledOnce();
+    expect(callGatewayToolMock).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({ ok: true });
+  });
+
+  it("refuses an update without a hosting gateway instead of using a remote client", async () => {
+    host.context = undefined;
+    await expect(
+      createGatewayTool({ senderIsOwner: true }).execute("update", { action: "update.run" }),
+    ).rejects.toThrow("Gateway instance unavailable for update.run");
+    expectNoGatewayCall();
+  });
+
+  it("preserves update diagnostic Unicode in tool results", async () => {
+    const reason = "r".repeat(239);
+    const name = "n".repeat(99);
+    const stderrTail = "s".repeat(499);
+    dispatchMock.mockResolvedValue({
+      ok: false,
+      result: {
+        status: "error",
+        reason: `${reason}🤖`,
+        before: { version: `${name}🤖` },
+        after: { version: `${name}🤖` },
+        steps: [{ name: `${name}🤖`, exitCode: 1, stderrTail: `🤖${stderrTail}` }],
+      },
+    });
+    const result = await createGatewayTool({ senderIsOwner: true }).execute("update", {
+      action: "update.run",
+    });
+    expect(dispatchMock).toHaveBeenCalledOnce();
+    expect(callGatewayToolMock).not.toHaveBeenCalled();
+    const reasonText = readStringField(asRecord(result.details), "reason");
+    expect(reasonText?.charCodeAt(reasonText.length - 1), "UPDATE_DIAGNOSTIC_UTF16_BOUNDARY").toBe(
+      reason.charCodeAt(reason.length - 1),
+    );
+    expect(result.details).toMatchObject({
+      reason,
+      before: { version: name },
+      after: { version: name },
+      failedSteps: [{ name, exitCode: 1, stderrTail }],
+    });
+    const text = result.content.find((block) => block.type === "text");
+    expect(text?.type === "text" && JSON.parse(text.text)).toEqual(result.details);
   });
 });

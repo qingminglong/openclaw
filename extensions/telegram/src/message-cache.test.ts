@@ -1,981 +1,297 @@
-// Telegram tests cover message cache plugin behavior.
-import { rm, writeFile } from "node:fs/promises";
 import type { Message } from "grammy/types";
-import { describe, expect, it } from "vitest";
+import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
-  buildTelegramConversationContext,
-  buildTelegramReplyChain,
-  createTelegramMessageCache,
-  listTelegramLegacyMessageCacheEntries,
-  resetTelegramMessageCacheBucketsForTest,
-  resolveTelegramMessageCachePath,
-  TELEGRAM_MESSAGE_CACHE_PERSISTENT_MAX_MESSAGES,
-  type TelegramMessageCachePersistentStore,
-} from "./message-cache.js";
-
-type PersistedCacheEntry = {
-  key: string;
-  node: {
-    sourceMessage: Message;
-  };
+  importPluginStateEntriesForDoctorForTests,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  resolveTelegramMessageCachePersistentScopeKey,
+  type PersistedTelegramMessageCacheValue,
+} from "./message-cache-persistence.js";
+import { buildTelegramReplyChain, createTelegramMessageCache } from "./message-cache.js";
+import { photo, useMessageCacheFixture } from "./message-cache.test-support.js";
+import { resetTelegramMessageCacheForTest as resetCache } from "./runtime.test-support.js";
+type Cache = ReturnType<typeof createTelegramMessageCache>;
+type PersistedValue = Omit<
+  PersistedTelegramMessageCacheValue,
+  "version" | "threadBinding" | "promptContextProjection"
+> & {
+  version?: number;
+  threadBinding?: unknown;
+  promptContextProjection?: unknown;
 };
 
-type PersistedCacheValue = {
-  sourceMessage: Message;
-  threadId?: string;
-};
+const sender = (id: number, first_name: string, is_bot = false) => ({ id, is_bot, first_name });
+const accountId = "default";
+const chatId = 7;
 
-let persistentStoreId = 0;
-
-function createMemoryPersistentStore(maxEntries = TELEGRAM_MESSAGE_CACHE_PERSISTENT_MAX_MESSAGES): {
-  bucketKey: string;
-  entries: Map<string, PersistedCacheValue>;
-  store: TelegramMessageCachePersistentStore;
-} {
-  const entries = new Map<string, PersistedCacheValue>();
+function message(message_id: number, firstName: string, overrides: Record<string, unknown> = {}) {
+  const { chat, date, from, ...rest } = overrides;
   return {
-    bucketKey: `test:${process.pid}:${Date.now()}:${persistentStoreId++}`,
-    entries,
-    store: {
-      async register(key, value) {
-        entries.delete(key);
-        entries.set(key, value);
-        while (entries.size > maxEntries) {
-          const oldest = entries.keys().next().value;
-          if (oldest === undefined) {
-            break;
-          }
-          entries.delete(oldest);
-        }
-      },
-      async entries() {
-        return Array.from(entries, ([key, value]) => ({ key, value }));
-      },
-    },
-  };
+    chat: chat ?? { id: 7, type: "private", first_name: firstName },
+    message_id,
+    date: date ?? 1_736_371_600 + message_id,
+    from: from ?? sender(1, firstName),
+    ...rest,
+  } as Message;
 }
 
-function persistedCacheEntry(messageId: number, text: string): PersistedCacheEntry {
-  return {
-    key: `default:7:${messageId}`,
-    node: {
-      sourceMessage: {
-        chat: { id: 7, type: "group", title: "Ops" },
-        message_id: messageId,
-        date: 1736380000 + messageId,
-        text,
-        from: { id: messageId, is_bot: false, first_name: `User ${messageId}` },
-      } as Message,
-    },
-  };
+const botMessage = (messageId: number, text: string, overrides: Record<string, unknown> = {}) =>
+  message(messageId, "OpenClaw", {
+    text,
+    from: sender(999, "OpenClaw", true),
+    ...overrides,
+  });
+
+function expectProjection(
+  node: Awaited<ReturnType<Cache["get"]>>,
+  marker: ReturnType<typeof projection>,
+  kind: "valid" | "invalid" = "valid",
+) {
+  expect(node?.promptContextProjectionMarker).toEqual(
+    kind === "valid"
+      ? { kind, projection: marker }
+      : { kind, transcriptMessageId: marker.transcriptMessageId },
+  );
 }
+
+const reply = (id: number, name: string, reply_to_message: Message, fields = {}) =>
+  message(id, name, { reply_to_message, ...fields });
+
+const projection = (transcriptMessageId: string) => ({
+  transcriptMessageId,
+  partIndex: 0,
+  finalPart: true,
+});
 
 describe("telegram message cache", () => {
-  it("hydrates reply chains from persisted cached messages", async () => {
-    const { bucketKey, store } = createMemoryPersistentStore();
-    const firstCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    await firstCache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "private", first_name: "Kesava" },
-        message_id: 9000,
-        date: 1736380700,
-        from: { id: 1, is_bot: false, first_name: "Kesava" },
-        photo: [{ file_id: "photo-1", file_unique_id: "photo-unique-1", width: 640, height: 480 }],
-      } as Message,
-    });
-    await firstCache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "private", first_name: "Ada" },
-        message_id: 9001,
-        date: 1736380750,
-        text: "The cache warmer is the piece I meant",
-        from: { id: 2, is_bot: false, first_name: "Ada" },
-        reply_to_message: {
-          chat: { id: 7, type: "private", first_name: "Kesava" },
-          message_id: 9000,
-          date: 1736380700,
-          from: { id: 1, is_bot: false, first_name: "Kesava" },
-          photo: [
-            { file_id: "photo-1", file_unique_id: "photo-unique-1", width: 640, height: 480 },
-          ],
-        } as Message["reply_to_message"],
-      } as Message,
-    });
+  const fixture = useMessageCacheFixture("telegram-cache-");
+  let store: PluginStateKeyedStore<PersistedValue>;
+  let cache: Cache;
+  const scopeKey = resolveTelegramMessageCachePersistentScopeKey("default");
+  const key = (messageId: string) => `${scopeKey}:default:7:${messageId}`;
+  const record = (msg: Message, overrides: Partial<Parameters<Cache["record"]>[0]> = {}) =>
+    cache.record({ accountId, chatId, msg, ...overrides });
+  const get = (messageId: string) => cache.get({ accountId, chatId, messageId });
+  const replyChain = (msg: Message, targetChat = chatId) =>
+    buildTelegramReplyChain({ cache, accountId, chatId: targetChat, msg });
+  function reopen(resetStore = false) {
+    resetCache();
+    if (resetStore) {
+      resetPluginStateStoreForTests();
+    }
+    cache = createTelegramMessageCache();
+  }
+  function reloadGet(id: string) {
+    reopen(true);
+    return get(id);
+  }
+  async function updateRow(id: string, fields: Partial<PersistedValue>) {
+    await store.register(key(id), { ...(await store.lookup(key(id)))!, ...fields });
+  }
 
-    resetTelegramMessageCacheBucketsForTest();
-    const secondCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    const chain = await buildTelegramReplyChain({
-      cache: secondCache,
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "private", first_name: "Grace" },
-        message_id: 9002,
-        text: "Please explain what this reply was about",
-        from: { id: 3, is_bot: false, first_name: "Grace" },
-        reply_to_message: {
-          chat: { id: 7, type: "private", first_name: "Ada" },
-          message_id: 9001,
-          date: 1736380750,
-          text: "The cache warmer is the piece I meant",
-          from: { id: 2, is_bot: false, first_name: "Ada" },
-        } as Message["reply_to_message"],
-      } as Message,
-    });
+  beforeEach(() => {
+    store = fixture.store<PersistedValue>();
+    cache = createTelegramMessageCache();
+  });
 
-    expect(chain).toEqual([
-      {
-        messageId: "9001",
-        sender: "Ada",
-        senderId: "2",
-        timestamp: 1736380750000,
-        body: "The cache warmer is the piece I meant",
-        replyToId: "9000",
-        sourceMessage: {
-          chat: { id: 7, type: "private", first_name: "Ada" },
-          message_id: 9001,
-          date: 1736380750,
-          text: "The cache warmer is the piece I meant",
-          from: { id: 2, is_bot: false, first_name: "Ada" },
-          reply_to_message: {
-            chat: { id: 7, type: "private", first_name: "Kesava" },
-            message_id: 9000,
-            date: 1736380700,
-            from: { id: 1, is_bot: false, first_name: "Kesava" },
-            photo: [
-              { file_id: "photo-1", file_unique_id: "photo-unique-1", width: 640, height: 480 },
-            ],
+  it("persists resolved media with its source message and drops it when the media changes", async () => {
+    await record(message(9000, "Kesava", { photo: photo("photo-1") }));
+    const media = {
+      id: "saved-photo.png",
+      fileUniqueId: "photo-1-unique",
+      size: 4,
+      savedAt: 1_736_380_700_000,
+      kind: "image" as const,
+      contentType: "image/png",
+    };
+    await cache.recordResolvedMedia({
+      accountId,
+      chatId,
+      messageId: "9000",
+      media,
+    });
+    expect((await reloadGet("9000"))?.resolvedMedia).toMatchObject(media);
+
+    await record(message(9000, "Kesava", { photo: photo("photo-2") }));
+    expect((await get("9000"))?.resolvedMedia).toBeUndefined();
+  });
+
+  it("resolves external reply references only from the same chat without inventing message bodies", async () => {
+    const chat = { id: -1001, type: "supergroup", title: "Local group" };
+    await record(message(9, "Ada", { chat, text: "Local body" }), { chatId: chat.id });
+    const reference = (peerId: number, messageId: number) =>
+      message(11, "Ada", {
+        chat,
+        external_reply: {
+          origin: {
+            type: "chat",
+            date: 1_736_371_609,
+            sender_chat: { ...chat, id: peerId },
           },
+          chat: { ...chat, id: peerId },
+          message_id: messageId,
         },
-      },
-      {
-        messageId: "9000",
-        sender: "Kesava",
-        senderId: "1",
-        timestamp: 1736380700000,
-        mediaRef: "telegram:file/photo-1",
-        mediaType: "image",
-        body: "<media:image>",
-        sourceMessage: {
-          chat: { id: 7, type: "private", first_name: "Kesava" },
-          message_id: 9000,
-          date: 1736380700,
-          from: { id: 1, is_bot: false, first_name: "Kesava" },
-          photo: [
-            { file_id: "photo-1", file_unique_id: "photo-unique-1", width: 640, height: 480 },
-          ],
-        },
-      },
+      });
+
+    expect(await replyChain(reference(-1002, 9), chat.id)).toEqual([]);
+    expect(await replyChain(reference(chat.id, 8), chat.id)).toEqual([]);
+    expect(await replyChain(reference(chat.id, 9), chat.id)).toMatchObject([
+      { messageId: "9", body: "Local body" },
     ]);
   });
 
-  it("records embedded reply targets as normal cached messages", async () => {
-    const { bucketKey, store } = createMemoryPersistentStore();
-    const chat = { id: 7, type: "group", title: "Ops" } as const;
-    const firstCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    await firstCache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat,
-        message_id: 102,
-        date: 1736380750,
-        text: "Why is there a 4th person?",
-        from: { id: 2, is_bot: false, first_name: "UserB" },
-        reply_to_message: {
-          chat,
-          message_id: 101,
-          date: 1736380700,
-          text: "Done, here is the image",
-          from: { id: 999, is_bot: true, first_name: "Bot" },
-          photo: [
-            {
-              file_id: "generated-photo-1",
-              file_unique_id: "generated-photo-unique-1",
-              width: 640,
-              height: 480,
-            },
-          ],
-        } as Message["reply_to_message"],
-      } as Message,
+  it("prefers exact stored ancestors over stale embedded content and topic metadata", async () => {
+    await record(
+      message(8, "Ada", {
+        caption: "Corrected photo",
+        photo: photo("photo-2"),
+        edit_date: 1_736_380_720,
+      }),
+      { providerObservedThread: { scope: "none" } },
+    );
+    const stale = reply(8, "Ada", message(7, "Lin", { text: "Stale ancestry" }), {
+      caption: "Stale photo",
+      photo: photo("photo-1"),
+      message_thread_id: 77,
     });
-
-    resetTelegramMessageCacheBucketsForTest();
-    const secondCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    const current = {
-      chat,
-      message_id: 103,
-      date: 1736380800,
-      text: "Explain what went wrong",
-      from: { id: 1, is_bot: false, first_name: "UserA" },
-      reply_to_message: {
-        chat,
-        message_id: 102,
-        date: 1736380750,
-        text: "Why is there a 4th person?",
-        from: { id: 2, is_bot: false, first_name: "UserB" },
-      } as Message["reply_to_message"],
-    } as Message;
-    const chain = await buildTelegramReplyChain({
-      cache: secondCache,
-      accountId: "default",
-      chatId: 7,
-      msg: current,
-    });
-    const context = await buildTelegramConversationContext({
-      cache: secondCache,
-      accountId: "default",
-      chatId: 7,
-      messageId: "103",
-      replyChainNodes: chain,
-      recentLimit: 10,
-      replyTargetWindowSize: 2,
-    });
-
-    expect(chain.map((entry) => entry.messageId)).toEqual(["102", "101"]);
+    const chain = await replyChain(
+      reply(10, "Grace", reply(9, "Lin", stale), { message_thread_id: 77 }),
+    );
+    expect(chain.map((node) => node.messageId)).toEqual(["9", "8"]);
     expect(chain[1]).toMatchObject({
-      sender: "Bot",
-      body: "Done, here is the image",
-      mediaRef: "telegram:file/generated-photo-1",
+      body: "Corrected photo",
+      mediaRef: "telegram:file/photo-2",
     });
-    expect(context.map((entry) => entry.node.messageId)).toEqual(["101", "102"]);
-    expect(context.find((entry) => entry.node.messageId === "101")?.isReplyTarget).toBe(true);
+    expect(chain[1]?.threadId).toBeUndefined();
+    expect(chain[1]?.replyToId).toBeUndefined();
   });
 
-  it("replaces authoritative edited message fields without stale caption carryover", async () => {
-    const cache = createTelegramMessageCache();
-    const chat = { id: 7, type: "group", title: "Ops" } as const;
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat,
-        message_id: 104,
-        date: 1736380900,
-        caption: "old caption",
-        from: { id: 999, is_bot: true, first_name: "Bot" },
-        photo: [
-          {
-            file_id: "generated-photo-2",
-            file_unique_id: "generated-photo-unique-2",
-            width: 640,
-            height: 480,
-          },
-        ],
-      } as Message,
+  it("does not borrow local message identities from cross-chat embedded replies", async () => {
+    await record(message(8, "Ada", { text: "Unrelated local message" }));
+    const foreign = message(8, "Ada", {
+      chat: { id: -1002, type: "supergroup", title: "Other chat" },
+      text: "Foreign snapshot",
     });
-
-    const updated = await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat,
-        message_id: 104,
-        date: 1736380900,
-        edit_date: 1736380910,
-        from: { id: 999, is_bot: true, first_name: "Bot" },
-        photo: [
-          {
-            file_id: "generated-photo-2",
-            file_unique_id: "generated-photo-unique-2",
-            width: 640,
-            height: 480,
-          },
-        ],
-      } as Message,
-    });
-
-    expect(updated).toMatchObject({
-      messageId: "104",
-      body: "<media:image>",
-      mediaRef: "telegram:file/generated-photo-2",
-    });
-    expect(updated?.body).not.toBe("old caption");
+    const chain = await replyChain(reply(10, "Grace", reply(9, "Lin", foreign)));
+    expect(chain.map((node) => node.messageId)).toEqual(["9"]);
   });
 
-  it("shares one persisted bucket across live cache instances", async () => {
-    const { bucketKey, store } = createMemoryPersistentStore();
-    const firstCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    const secondCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    await firstCache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "private", first_name: "Nora" },
-        message_id: 9100,
-        date: 1736380700,
-        text: "Architecture sketch for the cache warmer",
-        from: { id: 1, is_bot: false, first_name: "Nora" },
-      } as Message,
+  it("persists prompt-context projection provenance across cache restart", async () => {
+    const marker = projection("assistant-projection-restart");
+    const text = "  indented\nnext  \n";
+    const live = await record(botMessage(9125, text), {
+      botUserId: 999,
+      promptContextProjection: marker,
     });
-    await secondCache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "private", first_name: "Ira" },
-        message_id: 9101,
-        date: 1736380750,
-        text: "The cache warmer is the piece I meant",
-        from: { id: 2, is_bot: false, first_name: "Ira" },
-        reply_to_message: {
-          chat: { id: 7, type: "private", first_name: "Nora" },
-          message_id: 9100,
-          date: 1736380700,
-          text: "Architecture sketch for the cache warmer",
-          from: { id: 1, is_bot: false, first_name: "Nora" },
-        } as Message["reply_to_message"],
-      } as Message,
+    expect(live.body).toBe(text);
+
+    reopen();
+    const reloaded = await get("9125");
+    expect(reloaded?.body).toBe(text);
+    expectProjection(reloaded, marker);
+
+    const editedText = "Edited projection";
+    const edited = await record(botMessage(9125, editedText, { edit_date: 1_736_380_730 }));
+    const expected = {
+      body: editedText,
+      promptContextProjectionMarker: { kind: "valid", projection: marker },
+    };
+    expect(edited).toMatchObject(expected);
+    expect(await reloadGet("9125")).toMatchObject(expected);
+    await updateRow("9125", { promptContextProjection: { ...marker, partIndex: -1 } });
+    reopen();
+    expectProjection(await get("9125"), marker, "invalid");
+
+    await record(botMessage(9125, "Edited malformed projection", { edit_date: 1_736_380_731 }));
+    expect((await store.lookup(key("9125")))?.promptContextProjection).toEqual({
+      transcriptMessageId: marker.transcriptMessageId,
     });
 
-    const reloadedCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    const chain = await buildTelegramReplyChain({
-      cache: reloadedCache,
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "private", first_name: "Mina" },
-        message_id: 9102,
-        text: "Please explain what this reply was about",
-        from: { id: 3, is_bot: false, first_name: "Mina" },
-        reply_to_message: {
-          chat: { id: 7, type: "private", first_name: "Ira" },
-          message_id: 9101,
-          date: 1736380750,
-          text: "The cache warmer is the piece I meant",
-          from: { id: 2, is_bot: false, first_name: "Ira" },
-        } as Message["reply_to_message"],
-      } as Message,
-    });
-
-    expect(chain.map((entry) => entry.messageId)).toEqual(["9101", "9100"]);
+    expectProjection(await reloadGet("9125"), marker, "invalid");
   });
 
-  it("persists cached records through the plugin state store", async () => {
-    const { bucketKey, store } = createMemoryPersistentStore(3);
-    const cache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    for (let index = 0; index < 5; index++) {
-      await cache.record({
-        accountId: "default",
-        chatId: 7,
-        msg: {
-          chat: { id: 7, type: "private", first_name: "Nora" },
-          message_id: 9120 + index,
-          date: 1736380700 + index,
-          text: `State message ${index}`,
-          from: { id: 1, is_bot: false, first_name: "Nora" },
-        } as Message,
-      });
-    }
+  it("recognizes projected messages sent on behalf of a Telegram Business account", async () => {
+    const marker = projection("assistant-business-projection");
+    const businessMessage = message(9128, "Business User", {
+      text: "Business reply",
+      from: sender(700, "Business User"),
+      sender_business_bot: sender(42, "OpenClaw", true),
+    });
+    expectProjection(
+      await record(businessMessage, { botUserId: 42, promptContextProjection: marker }),
+      marker,
+    );
+    expectProjection(await reloadGet("9128"), marker);
 
-    resetTelegramMessageCacheBucketsForTest();
-    const reloadedCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    const recent = await reloadedCache.recentBefore({
-      accountId: "default",
-      chatId: 7,
-      messageId: "9125",
-      limit: 10,
+    await updateRow("9128", { botUserId: 99 });
+    expect((await reloadGet("9128"))?.promptContextProjectionMarker).toBeUndefined();
+  });
+
+  it.each([
+    ["projected row first", ["projected", "parent"]],
+    ["embedding parent first", ["parent", "projected"]],
+  ])("keeps projected bot provenance when hydrating $0", async (_name, order) => {
+    const marker = projection("assistant-embedded-order");
+    const bot = botMessage(9130, "Projected answer");
+    const values: Record<string, PersistedValue> = {
+      projected: { version: 1, sourceMessage: bot, promptContextProjection: marker },
+      parent: { version: 1, sourceMessage: reply(9131, "Nora", bot) },
+    };
+    importPluginStateEntriesForDoctorForTests(
+      "telegram",
+      fixture.options(),
+      order.map((name, index) => {
+        const value = values[name]!;
+        return { key: key(String(value.sourceMessage.message_id)), value, createdAt: 1000 + index };
+      }),
+    );
+
+    expectProjection(await get("9130"), marker);
+  });
+
+  it("ignores persisted projection metadata on inbound messages", async () => {
+    await store.register(key("9140"), {
+      version: 1,
+      sourceMessage: message(9140, "Nora", { text: "Inbound text" }),
+      promptContextProjection: projection("must-not-be-trusted"),
     });
 
-    expect(recent.map((entry) => entry.messageId)).toEqual(["9122", "9123", "9124"]);
+    expect((await get("9140"))?.promptContextProjectionMarker).toBeUndefined();
+  });
+
+  it("ignores unversioned cache rows without rewriting them", async () => {
+    const persisted = {
+      sourceMessage: botMessage(9126, "Pre-projection state message"),
+      promptContextProjection: projection("must-not-be-inferred"),
+      threadBinding: { kind: "provider-observed-v1", threadId: "77" },
+      threadId: "77",
+    };
+    await store.register(key("9126"), persisted);
+
+    reopen();
+    await expect(get("9126")).resolves.toBeNull();
+    await expect(store.lookup(key("9126"))).resolves.toEqual(persisted);
   });
 
   it("does not partially parse malformed persisted thread ids", async () => {
-    const { bucketKey, entries, store } = createMemoryPersistentStore();
-    const cache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
+    await record(message(9126, "Nora", { date: 1_736_389_126, text: "State topic message" }), {
       threadId: 100,
-      msg: {
-        chat: { id: 7, type: "supergroup", title: "Ops" },
-        message_id: 9126,
-        date: 1736389126,
-        text: "State topic message",
-        from: { id: 1, is_bot: false, first_name: "Nora" },
-      } as Message,
     });
 
-    const persistedKey = entries.keys().next().value;
-    if (persistedKey === undefined) {
-      throw new Error("expected persisted Telegram message cache entry");
-    }
-    const persistedValue = entries.get(persistedKey);
-    if (persistedValue === undefined) {
-      throw new Error("expected persisted Telegram message cache value");
-    }
-    expect(persistedValue.threadId).toBe("100");
-    entries.set(persistedKey, { ...persistedValue, threadId: "0x64" });
+    await updateRow("9126", { threadId: "0x64" });
 
-    resetTelegramMessageCacheBucketsForTest();
-    const reloadedCache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    const recent = await reloadedCache.recentBefore({
-      accountId: "default",
-      chatId: 7,
-      threadId: 100,
-      messageId: "9127",
-      limit: 10,
-    });
-
-    expect(recent).toEqual([]);
-  });
-
-  it("drops unsafe Telegram thread ids from live messages", async () => {
-    const { bucketKey, entries, store } = createMemoryPersistentStore();
-    const cache = createTelegramMessageCache({ bucketKey, persistentStore: store });
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "supergroup", title: "Ops" },
-        message_id: 9127,
-        message_thread_id: Number.MAX_SAFE_INTEGER + 1,
-        date: 1736389127,
-        text: "Unsafe topic message",
-        from: { id: 1, is_bot: false, first_name: "Nora" },
-      } as Message,
-    });
-
-    const persistedValue = entries.values().next().value;
-    if (persistedValue === undefined) {
-      throw new Error("expected persisted Telegram message cache value");
-    }
-    expect(persistedValue.threadId).toBeUndefined();
-
-    const topicRecent = await cache.recentBefore({
-      accountId: "default",
-      chatId: 7,
-      threadId: Number.MAX_SAFE_INTEGER + 1,
-      messageId: "9128",
-      limit: 10,
-    });
-    const unscopedRecent = await cache.recentBefore({
-      accountId: "default",
-      chatId: 7,
-      messageId: "9128",
-      limit: 10,
-    });
-
-    expect(topicRecent).toEqual([]);
-    expect(unscopedRecent.map((entry) => entry.messageId)).toEqual(["9127"]);
+    reopen();
+    expect(
+      await cache.recentBefore({ accountId, chatId, messageId: "9127", threadId: 100, limit: 10 }),
+    ).toEqual([]);
   });
 
   it("does not use unsafe message ids as recent-before cutoffs", async () => {
-    const cache = createTelegramMessageCache();
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "private", first_name: "Nora" },
-        message_id: 9124,
-        date: 1736380700,
-        text: "State message",
-        from: { id: 1, is_bot: false, first_name: "Nora" },
-      } as Message,
-    });
-
-    const recent = await cache.recentBefore({
-      accountId: "default",
-      chatId: 7,
-      messageId: "9007199254740992",
-      limit: 10,
-    });
-
-    expect(recent).toEqual([]);
-  });
-
-  it("parses legacy sidecar records for doctor migration only", async () => {
-    const storePath = `/tmp/openclaw-telegram-message-cache-legacy-${process.pid}-${Date.now()}.json`;
-    const persistedPath = resolveTelegramMessageCachePath(storePath);
-    await rm(persistedPath, { force: true });
-    try {
-      const legacyEntries = [
-        persistedCacheEntry(35033, "ocdbg-5818 one"),
-        persistedCacheEntry(35034, "ocdbg-5818 two"),
-        persistedCacheEntry(35035, "ocdbg-5818 three"),
-      ];
-      const appendedEntries = [
-        persistedCacheEntry(35036, "ocdbg-5818 four"),
-        persistedCacheEntry(35037, "ocdbg-5818 five"),
-      ];
-      await writeFile(
-        persistedPath,
-        `${JSON.stringify(legacyEntries)}${appendedEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-      );
-
-      expect(
-        listTelegramLegacyMessageCacheEntries({ persistedPath }).map(
-          (entry) => entry.value.sourceMessage.message_id,
-        ),
-      ).toEqual([35033, 35034, 35035, 35036, 35037]);
-    } finally {
-      await rm(persistedPath, { force: true });
-    }
-  });
-
-  it("returns recent chat messages before the current message", async () => {
-    const cache = createTelegramMessageCache();
-    for (const id of [41, 42, 43, 44]) {
-      await cache.record({
-        accountId: "default",
-        chatId: 7,
-        threadId: 100,
-        msg: {
-          chat: { id: 7, type: "supergroup", title: "Ops" },
-          message_thread_id: 100,
-          message_id: id,
-          date: 1736380700 + id,
-          text: `live message ${id}`,
-          from: { id, is_bot: false, first_name: `User ${id}` },
-        } as Message,
-      });
-    }
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      threadId: 200,
-      msg: {
-        chat: { id: 7, type: "supergroup", title: "Ops" },
-        message_thread_id: 200,
-        message_id: 142,
-        date: 1736380743,
-        text: "different topic",
-        from: { id: 99, is_bot: false, first_name: "Other" },
-      } as Message,
-    });
-
-    const recent = await cache.recentBefore({
-      accountId: "default",
-      chatId: 7,
-      threadId: 100,
-      messageId: "44",
-      limit: 2,
-    });
-    expect(recent.map((entry) => entry.messageId)).toEqual(["42", "43"]);
-  });
-
-  it("preserves rich-message placeholders in subsequent conversation context", async () => {
-    const cache = createTelegramMessageCache();
-    const chat = { id: 7, type: "private", first_name: "Nora" } as const;
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat,
-        message_id: 45,
-        date: 1736380745,
-        rich_message: { blocks: [{ type: "paragraph" }] },
-        from: { id: 1, is_bot: false, first_name: "Nora" },
-      } as Message,
-    });
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat,
-        message_id: 46,
-        date: 1736380746,
-        text: "What did I just send?",
-        from: { id: 1, is_bot: false, first_name: "Nora" },
-      } as Message,
-    });
-
-    const context = await buildTelegramConversationContext({
-      cache,
-      accountId: "default",
-      chatId: 7,
-      messageId: "46",
-      replyChainNodes: [],
-      recentLimit: 10,
-      replyTargetWindowSize: 2,
-    });
-
-    expect(context).toHaveLength(1);
-    expect(context[0]?.node).toMatchObject({
-      messageId: "45",
-      body: "[unsupported Telegram rich_message received]",
-    });
-  });
-
-  it("returns nearby messages around a stale reply target", async () => {
-    const cache = createTelegramMessageCache();
-    for (const id of [100, 101, 102, 200, 201]) {
-      await cache.record({
-        accountId: "default",
-        chatId: 7,
-        msg: {
-          chat: { id: 7, type: "group", title: "Ops" },
-          message_id: id,
-          date: 1736380700 + id,
-          text: `message ${id}`,
-          from: { id, is_bot: false, first_name: `User ${id}` },
-        } as Message,
-      });
-    }
-
-    const nearby = await cache.around({
-      accountId: "default",
-      chatId: 7,
-      messageId: "101",
-      before: 1,
-      after: 1,
-    });
-    expect(nearby.map((entry) => entry.messageId)).toEqual(["100", "101", "102"]);
-  });
-
-  it("selects reply targets referenced by the current local window", async () => {
-    const cache = createTelegramMessageCache();
-    for (const id of [33867, 33868, 33869]) {
-      await cache.record({
-        accountId: "default",
-        chatId: 7,
-        msg: {
-          chat: { id: 7, type: "group", title: "Ops" },
-          message_id: id,
-          date: 1736380000 + id,
-          text: `old context ${id}`,
-          from: { id, is_bot: false, first_name: `Old ${id}` },
-        } as Message,
-      });
-    }
-    for (let id = 34460; id <= 34475; id++) {
-      await cache.record({
-        accountId: "default",
-        chatId: 7,
-        msg: {
-          chat: { id: 7, type: "group", title: "Ops" },
-          message_id: id,
-          date: 1736380000 + id,
-          text: `recent context ${id}`,
-          from: { id, is_bot: false, first_name: `Recent ${id}` },
-        } as Message,
-      });
-    }
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "group", title: "Ops" },
-        message_id: 34476,
-        date: 1736380000 + 34476,
-        text: "@HamVerBot what about now",
-        from: { id: 34476, is_bot: false, first_name: "Ayaan" },
-        reply_to_message: {
-          chat: { id: 7, type: "group", title: "Ops" },
-          message_id: 33868,
-          date: 1736380000 + 33868,
-          text: "old context 33868",
-          from: { id: 33868, is_bot: false, first_name: "Old 33868" },
-        } as Message["reply_to_message"],
-      } as Message,
-    });
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "group", title: "Ops" },
-        message_id: 34477,
-        date: 1736380000 + 34477,
-        text: "Show me raw input",
-        from: { id: 34477, is_bot: false, first_name: "Ayaan" },
-      } as Message,
-    });
-
-    const context = await buildTelegramConversationContext({
-      cache,
-      accountId: "default",
-      chatId: 7,
-      messageId: "34477",
-      replyChainNodes: [],
-      recentLimit: 10,
-      replyTargetWindowSize: 1,
-    });
-
-    expect(context.map((entry) => entry.node.messageId)).toEqual([
-      "33867",
-      "33868",
-      "33869",
-      "34467",
-      "34468",
-      "34469",
-      "34470",
-      "34471",
-      "34472",
-      "34473",
-      "34474",
-      "34475",
-      "34476",
-    ]);
-    expect(context.find((entry) => entry.node.messageId === "33868")?.isReplyTarget).toBe(true);
-    expect(context.find((entry) => entry.node.messageId === "34477")).toBeUndefined();
-  });
-
-  it("filters conversation context nodes when an include predicate is supplied", async () => {
-    const cache = createTelegramMessageCache();
-    const chat = { id: 7, type: "group", title: "Ops" } as const;
-    for (const msg of [
-      {
-        chat,
-        message_id: 600,
-        date: 1736380600,
-        text: "ambient setup chatter",
-        from: { id: 111, is_bot: false, first_name: "Requester" },
-      },
-      {
-        chat,
-        message_id: 601,
-        date: 1736380660,
-        text: "@openclaw_bot please check this",
-        from: { id: 222, is_bot: false, first_name: "Operator" },
-      },
-      {
-        chat,
-        message_id: 602,
-        date: 1736380720,
-        text: "@openclaw_bot Hello",
-        from: { id: 222, is_bot: false, first_name: "Operator" },
-      },
-    ] satisfies Message[]) {
-      await cache.record({ accountId: "default", chatId: 7, msg });
-    }
-
-    const context = await buildTelegramConversationContext({
-      cache,
-      accountId: "default",
-      chatId: 7,
-      messageId: "602",
-      replyChainNodes: [],
-      recentLimit: 10,
-      replyTargetWindowSize: 1,
-      includeNode: (node) => node.body?.includes("@openclaw_bot") === true,
-    });
-
-    expect(context.map((entry) => entry.node.messageId)).toEqual(["601"]);
-  });
-
-  it("does not select messages before the latest session reset command", async () => {
-    const cache = createTelegramMessageCache();
-    const beforeSession = Date.parse("2026-05-10T12:40:00.000Z");
-    const sessionStartedAt = Date.parse("2026-05-10T17:30:43.980Z");
-    const afterSession = Date.parse("2026-05-11T23:36:00.000Z");
-    const staleInstruction = "okay so we just flip in openclaw? if yes do it up";
-    const record = (params: {
-      id: number;
-      text: string;
-      timestampMs: number;
-      replyTo?: { id: number; text: string; timestampMs: number };
-    }) =>
-      cache.record({
-        accountId: "default",
-        chatId: 7,
-        threadId: 22534,
-        msg: {
-          chat: { id: 7, type: "supergroup", title: "Ops", is_forum: true },
-          message_thread_id: 22534,
-          message_id: params.id,
-          date: Math.floor(params.timestampMs / 1000),
-          text: params.text,
-          from: { id: params.id, is_bot: false, first_name: "Requester" },
-          ...(params.replyTo
-            ? {
-                reply_to_message: {
-                  chat: { id: 7, type: "supergroup", title: "Ops", is_forum: true },
-                  message_thread_id: 22534,
-                  message_id: params.replyTo.id,
-                  date: Math.floor(params.replyTo.timestampMs / 1000),
-                  text: params.replyTo.text,
-                  from: { id: params.replyTo.id, is_bot: false, first_name: "Requester" },
-                } as Message["reply_to_message"],
-              }
-            : {}),
-        } as Message,
-      });
-
-    await record({ id: 84669, text: "earlier topic setup", timestampMs: beforeSession - 1000 });
-    await record({ id: 84670, text: staleInstruction, timestampMs: beforeSession });
-    await record({ id: 84671, text: "old reply context", timestampMs: beforeSession + 1000 });
-    await record({ id: 85000, text: "/new", timestampMs: sessionStartedAt });
-    await record({
-      id: 87183,
-      text: "post-reset context",
-      timestampMs: afterSession - 60_000,
-      replyTo: { id: 84670, text: staleInstruction, timestampMs: beforeSession },
-    });
-    await record({
-      id: 87184,
-      text: "how does this determine stability?",
-      timestampMs: afterSession,
-    });
-
-    const replyChainNodes = await buildTelegramReplyChain({
-      cache,
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat: { id: 7, type: "supergroup", title: "Ops", is_forum: true },
-        message_thread_id: 22534,
-        message_id: 87185,
-        date: Math.floor(afterSession / 1000) + 30,
-        text: "follow up",
-        from: { id: 87185, is_bot: false, first_name: "Requester" },
-        reply_to_message: {
-          chat: { id: 7, type: "supergroup", title: "Ops", is_forum: true },
-          message_thread_id: 22534,
-          message_id: 84670,
-          date: Math.floor(beforeSession / 1000),
-          text: staleInstruction,
-          from: { id: 84670, is_bot: false, first_name: "Requester" },
-        } as Message["reply_to_message"],
-      } as Message,
-    });
-
-    const context = await buildTelegramConversationContext({
-      cache,
-      accountId: "default",
-      chatId: 7,
-      messageId: "87185",
-      threadId: 22534,
-      replyChainNodes,
-      recentLimit: 10,
-      replyTargetWindowSize: 1,
-    });
-
-    expect(context.map((entry) => entry.node.messageId)).toEqual(["87183", "87184"]);
-    expect(context.map((entry) => entry.node.body)).not.toContain(staleInstruction);
-  });
-
-  it("uses the current reset command as the session boundary", async () => {
-    const cache = createTelegramMessageCache();
-    const chat = { id: 7, type: "group", title: "Ops" } as const;
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat,
-        message_id: 100,
-        date: 1736380800,
-        text: "stale context",
-        from: { id: 100, is_bot: false, first_name: "Requester" },
-      } as Message,
-    });
-    await cache.record({
-      accountId: "default",
-      chatId: 7,
-      msg: {
-        chat,
-        message_id: 101,
-        date: 1736380860,
-        text: "/new",
-        from: { id: 101, is_bot: false, first_name: "Requester" },
-      } as Message,
-    });
-
-    const context = await buildTelegramConversationContext({
-      cache,
-      accountId: "default",
-      chatId: 7,
-      messageId: "101",
-      replyChainNodes: [],
-      recentLimit: 10,
-      replyTargetWindowSize: 1,
-    });
-
-    expect(context).toEqual([]);
-  });
-
-  it("does not select messages before the persisted session start when the reset command is absent", async () => {
-    const cache = createTelegramMessageCache();
-    const beforeSession = Date.parse("2026-05-10T12:40:00.000Z");
-    const sessionStartedAt = Date.parse("2026-05-10T17:30:43.127Z");
-    const afterSession = Date.parse("2026-05-11T23:36:00.000Z");
-    const staleInstruction = "okay so we just flip in openclaw? if yes do it up";
-    const record = (params: {
-      id: number;
-      text: string;
-      timestampMs: number;
-      replyTo?: { id: number; text: string; timestampMs: number };
-    }) =>
-      cache.record({
-        accountId: "default",
-        chatId: -1001234567890,
-        threadId: 22534,
-        msg: {
-          chat: {
-            id: -1001234567890,
-            type: "supergroup",
-            title: "Ops",
-            is_forum: true,
-          },
-          message_thread_id: 22534,
-          message_id: params.id,
-          date: Math.floor(params.timestampMs / 1000),
-          text: params.text,
-          from: { id: 101, is_bot: false, first_name: "Requester" },
-          ...(params.replyTo
-            ? {
-                reply_to_message: {
-                  chat: {
-                    id: -1001234567890,
-                    type: "supergroup",
-                    title: "Ops",
-                    is_forum: true,
-                  },
-                  message_thread_id: 22534,
-                  message_id: params.replyTo.id,
-                  date: Math.floor(params.replyTo.timestampMs / 1000),
-                  text: params.replyTo.text,
-                  from: { id: 101, is_bot: false, first_name: "Requester" },
-                } as Message["reply_to_message"],
-              }
-            : {}),
-        } as Message,
-      });
-
-    await record({
-      id: 84649,
-      text: "tools.toolSearch: true",
-      timestampMs: beforeSession - 5 * 60_000,
-    });
-    await record({ id: 84670, text: staleInstruction, timestampMs: beforeSession });
-    await record({
-      id: 87184,
-      text: "how does this determine stability?",
-      timestampMs: afterSession,
-    });
-    const currentNode = await record({
-      id: 87227,
-      text: "what config change?",
-      timestampMs: afterSession + 2 * 60 * 60_000,
-      replyTo: { id: 84670, text: staleInstruction, timestampMs: beforeSession },
-    });
-    const current = currentNode?.sourceMessage;
-    if (!current) {
-      throw new Error("expected current Telegram message");
-    }
-
-    const replyChainNodes = await buildTelegramReplyChain({
-      cache,
-      accountId: "default",
-      chatId: -1001234567890,
-      msg: current,
-    });
-    const context = await buildTelegramConversationContext({
-      cache,
-      accountId: "default",
-      chatId: -1001234567890,
-      messageId: "87227",
-      threadId: 22534,
-      replyChainNodes,
-      recentLimit: 10,
-      replyTargetWindowSize: 1,
-      minTimestampMs: sessionStartedAt,
-    });
-
-    expect(context.map((entry) => entry.node.messageId)).toEqual(["87184"]);
-    expect(context.map((entry) => entry.node.body)).not.toContain(staleInstruction);
-    expect(context.map((entry) => entry.node.body)).not.toContain("tools.toolSearch: true");
+    await record(message(9124, "Nora", { date: 1_736_380_700, text: "State message" }));
+    expect(
+      await cache.recentBefore({ accountId, chatId, messageId: "9007199254740992", limit: 10 }),
+    ).toEqual([]);
   });
 });

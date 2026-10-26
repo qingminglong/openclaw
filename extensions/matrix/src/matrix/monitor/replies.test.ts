@@ -1,27 +1,46 @@
-// Matrix tests cover replies plugin behavior.
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
+import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginRuntime, RuntimeEnv } from "../../../runtime-api.js";
+import { prepareMatrixReplyPayload } from "../../outbound.js";
 import type { MatrixClient } from "../sdk.js";
+import type { MatrixSendResult } from "../send/types.js";
 
-const sendMessageMatrixMock = vi.hoisted(() => vi.fn().mockResolvedValue({ messageId: "mx-1" }));
-const chunkMatrixTextMock = vi.hoisted(() =>
-  vi.fn((text: string, _opts?: unknown) => ({
-    trimmedText: text.trim(),
-    convertedText: text,
-    singleEventLimit: 4000,
-    fitsInSingleEvent: true,
-    chunks: text ? [text] : [],
-  })),
-);
+type MatrixSend = typeof import("../send.js").sendMessageMatrix;
+const sendMessageMatrixMock = vi.hoisted(() => vi.fn<MatrixSend>());
 
+// mock-isolation: delivery fixtures record sends without starting a Matrix transport.
 vi.mock("../send.js", () => ({
-  chunkMatrixText: (text: string, opts?: unknown) => chunkMatrixTextMock(text, opts),
-  sendMessageMatrix: (to: string, message: string, opts?: unknown) =>
-    sendMessageMatrixMock(to, message, opts),
+  sendMessageMatrix: sendMessageMatrixMock,
 }));
 
 import { setMatrixRuntime } from "../../runtime.js";
-import { deliverMatrixReplies } from "./replies.js";
+import {
+  createMatrixTestReplyDispatcher,
+  type MatrixTestReplyOptions,
+} from "./reply-dispatcher.test-support.js";
+
+let nextMessageId = 0;
+
+const resolveMockMatrixSend: MatrixSend = async (_to, message, opts) => {
+  nextMessageId += 1;
+  const messageId = `mx-${nextMessageId}`;
+  const content = message || `media:${opts.mediaUrl ?? "unknown"}`;
+  const result: MatrixSendResult = {
+    messageId,
+    roomId: "room:1",
+    primaryMessageId: messageId,
+    receipt: {
+      primaryPlatformMessageId: messageId,
+      platformMessageIds: [messageId],
+      parts: [{ platformMessageId: messageId, kind: "text" as const, index: 0 }],
+      sentAt: 1,
+    },
+    content,
+  };
+  await opts.onDeliveryResult?.(result);
+  return result;
+};
 
 function sendCall(index: number) {
   const call = sendMessageMatrixMock.mock.calls.at(index);
@@ -31,228 +50,199 @@ function sendCall(index: number) {
   return call;
 }
 
-function sendOptions(index: number): Record<string, unknown> {
-  const options = sendCall(index)[2];
-  if (!options || typeof options !== "object") {
-    throw new Error(`Expected send options at call ${index}`);
-  }
-  return options as Record<string, unknown>;
+function sendOptions(index: number) {
+  return sendCall(index)[2];
 }
 
-describe("deliverMatrixReplies", () => {
+describe("Matrix reply dispatcher delivery", () => {
+  const PRESENTATION_KEY = "com.openclaw.presentation";
   const cfg = { channels: { matrix: {} } };
-  const loadConfigMock = vi.fn(() => ({}));
-  const resolveMarkdownTableModeMock = vi.fn<(params: unknown) => string>(() => "code");
-  const convertMarkdownTablesMock = vi.fn((text: string) => text);
-  const resolveChunkModeMock = vi.fn<
-    (cfg: unknown, channel: unknown, accountId?: unknown) => string
-  >(() => "length");
-  const chunkMarkdownTextWithModeMock = vi.fn((text: string) => [text]);
-
-  const runtimeStub = {
-    config: {
-      current: () => loadConfigMock(),
-    },
-    channel: {
-      text: {
-        resolveMarkdownTableMode: (params: unknown) => resolveMarkdownTableModeMock(params),
-        convertMarkdownTables: (text: string) => convertMarkdownTablesMock(text),
-        resolveChunkMode: (cfgLocal: unknown, channel: unknown, accountId?: unknown) =>
-          resolveChunkModeMock(cfgLocal, channel, accountId),
-        chunkMarkdownTextWithMode: (text: string) => chunkMarkdownTextWithModeMock(text),
-      },
-    },
-    logging: {
-      shouldLogVerbose: () => false,
-    },
-  } as unknown as PluginRuntime;
 
   const runtimeEnv: RuntimeEnv = {
     log: vi.fn(),
     error: vi.fn(),
   } as unknown as RuntimeEnv;
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-    setMatrixRuntime(runtimeStub);
-    chunkMatrixTextMock.mockReset().mockImplementation((text: string) => ({
-      trimmedText: text.trim(),
-      convertedText: text,
-      singleEventLimit: 4000,
-      fitsInSingleEvent: true,
-      chunks: text ? [text] : [],
-    }));
-  });
-
-  it("keeps replyToId on first reply only when replyToMode=first", async () => {
-    chunkMatrixTextMock.mockImplementation((text: string) => ({
-      trimmedText: text.trim(),
-      convertedText: text,
-      singleEventLimit: 4000,
-      fitsInSingleEvent: true,
-      chunks: text.split("|"),
-    }));
-
-    await deliverMatrixReplies({
+  async function createDispatcher(options: Partial<MatrixTestReplyOptions> = {}) {
+    return createMatrixTestReplyDispatcher({
       cfg,
-      replies: [
-        { text: "first-a|first-b", replyToId: "reply-1" },
-        { text: "second", replyToId: "reply-2" },
-      ],
-      roomId: "room:1",
-      client: {} as MatrixClient,
-      runtime: runtimeEnv,
-      textLimit: 4000,
-      replyToMode: "first",
-    });
-
-    expect(sendMessageMatrixMock).toHaveBeenCalledTimes(3);
-    expect(sendOptions(0).replyToId).toBe("reply-1");
-    expect(sendOptions(0).threadId).toBeUndefined();
-    expect(sendOptions(1).replyToId).toBe("reply-1");
-    expect(sendOptions(1).threadId).toBeUndefined();
-    expect(sendOptions(2).replyToId).toBeUndefined();
-    expect(sendOptions(2).threadId).toBeUndefined();
-  });
-
-  it("keeps replyToId on every reply when replyToMode=all", async () => {
-    await deliverMatrixReplies({
-      cfg,
-      replies: [
-        {
-          text: "caption",
-          mediaUrls: ["https://example.com/a.jpg", "https://example.com/b.jpg"],
-          replyToId: "reply-media",
-          audioAsVoice: true,
-        },
-        { text: "plain", replyToId: "reply-text" },
-      ],
       roomId: "room:2",
       client: {} as MatrixClient,
       runtime: runtimeEnv,
-      textLimit: 4000,
-      replyToMode: "all",
-      mediaLocalRoots: ["/tmp/openclaw-matrix-test"],
+      replyToMode: "off",
+      ...options,
     });
+  }
 
-    expect(sendMessageMatrixMock).toHaveBeenCalledTimes(3);
-    expect(sendCall(0)[0]).toBe("room:2");
-    expect(sendCall(0)[1]).toBe("caption");
-    expect(sendOptions(0).mediaUrl).toBe("https://example.com/a.jpg");
-    expect(sendOptions(0).mediaLocalRoots).toEqual(["/tmp/openclaw-matrix-test"]);
-    expect(sendOptions(0).replyToId).toBe("reply-media");
-    expect(sendCall(1)[0]).toBe("room:2");
-    expect(sendCall(1)[1]).toBe("");
-    expect(sendOptions(1).mediaUrl).toBe("https://example.com/b.jpg");
-    expect(sendOptions(1).mediaLocalRoots).toEqual(["/tmp/openclaw-matrix-test"]);
-    expect(sendOptions(1).replyToId).toBe("reply-media");
-    expect(sendOptions(2).replyToId).toBe("reply-text");
+  async function deliver(options: Partial<MatrixTestReplyOptions> & { replies: ReplyPayload[] }) {
+    const dispatcher = await createDispatcher(options);
+    const results = [];
+    for (const reply of options.replies) {
+      results.push(await dispatcher.deliverReply(reply, { kind: "final" }));
+    }
+    return results.at(-1);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    nextMessageId = 0;
+    sendMessageMatrixMock.mockReset().mockImplementation(resolveMockMatrixSend);
+    setMatrixRuntime({ logging: { shouldLogVerbose: () => false } } as unknown as PluginRuntime);
   });
 
-  it("keeps replyToId when threadId is set so Matrix can send fallback metadata", async () => {
-    chunkMatrixTextMock.mockImplementation((text: string) => ({
-      trimmedText: text.trim(),
-      convertedText: text,
-      singleEventLimit: 4000,
-      fitsInSingleEvent: true,
-      chunks: text.split("|"),
-    }));
+  function deliverTexts(texts: string[]) {
+    return deliver({ replies: texts.map((text) => ({ text })), roomId: "room:5" });
+  }
 
-    await deliverMatrixReplies({
-      cfg,
-      replies: [{ text: "hello|thread" }],
-      roomId: "room:3",
-      client: {} as MatrixClient,
-      runtime: runtimeEnv,
-      textLimit: 4000,
-      replyToMode: "off",
-      threadId: "thread-77",
-      replyToId: "reply-thread",
+  it("does not consume the first reply when Matrix delivery fails", async () => {
+    const dispatcher = await createDispatcher({
+      roomId: "room:1",
+      replyToMode: "first",
+      replyToEventId: "reply-1",
     });
+    sendMessageMatrixMock.mockRejectedValueOnce(new Error("Matrix unavailable"));
+    await expect(dispatcher.deliverReply({ text: "retry me" }, { kind: "final" })).rejects.toThrow(
+      "Matrix unavailable",
+    );
+    await expect(
+      dispatcher.deliverReply({ text: "retry me" }, { kind: "final" }),
+    ).resolves.toMatchObject({
+      visibleReplySent: true,
+    });
+    expect(sendOptions(0).replyToId).toBe("reply-1");
+    expect(sendOptions(1).replyToId).toBe("reply-1");
+  });
 
-    expect(sendMessageMatrixMock).toHaveBeenCalledTimes(2);
-    expect(sendOptions(0).replyToId).toBe("reply-thread");
-    expect(sendOptions(0).threadId).toBe("thread-77");
-    expect(sendOptions(1).replyToId).toBe("reply-thread");
-    expect(sendOptions(1).threadId).toBe("thread-77");
+  it.each([undefined, "   "])("reports blank-only media with text=%j as missing", async (text) => {
+    const result = await deliver({ replies: [{ text, mediaUrls: ["   "] }] });
+    expect(runtimeEnv.error).toHaveBeenCalledWith("matrix reply missing text/media");
+    expect(sendMessageMatrixMock).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      visibleReplySent: false,
+      suppression: { reason: "no_visible_result" },
+    });
   });
 
   it("suppresses reasoning-only text before Matrix sends", async () => {
-    await deliverMatrixReplies({
-      cfg,
-      replies: [
-        { text: "Reasoning:\n_hidden_" },
-        { text: "<think>still hidden</think>" },
-        { text: "Visible answer" },
-      ],
-      roomId: "room:5",
-      client: {} as MatrixClient,
-      runtime: runtimeEnv,
-      textLimit: 4000,
-      replyToMode: "off",
-    });
-
+    await deliverTexts([
+      "Reasoning:\n_hidden_",
+      "<think>still hidden</think>",
+      "<mm:think>MiniMax private reasoning</mm:think>",
+      "<mm:thought>MiniMax private thought</mm:thought>",
+      "<antml:thinking>Anthropic private reasoning</antml:thinking>",
+      "Visible answer",
+    ]);
     expect(sendMessageMatrixMock).toHaveBeenCalledTimes(1);
     expect(sendCall(0)[0]).toBe("room:5");
     expect(sendCall(0)[1]).toBe("Visible answer");
     expect(sendOptions(0).cfg).toBe(cfg);
   });
 
-  it("uses supplied cfg for chunking and send delivery without reloading runtime config", async () => {
-    const explicitCfg = {
-      channels: {
-        matrix: {
-          accounts: {
-            ops: {
-              chunkMode: "newline",
-            },
-          },
-        },
-      },
-    };
-    loadConfigMock.mockImplementation(() => {
-      throw new Error("deliverMatrixReplies should not reload runtime config when cfg is provided");
-    });
+  it.each([false, true])(
+    "gates suppression diagnostics through runtime.log with verbose=%s",
+    async (verbose) => {
+      setMatrixRuntime(createPluginRuntimeMock({ logging: { shouldLogVerbose: () => verbose } }));
+      await deliverTexts(["Reasoning: private"]);
+      expect(runtimeEnv.log).toHaveBeenCalledTimes(verbose ? 1 : 0);
+      if (verbose) {
+        expect(runtimeEnv.log).toHaveBeenCalledWith("matrix reply suppressed as reasoning-only");
+      }
+      expect(sendMessageMatrixMock).not.toHaveBeenCalled();
+    },
+  );
 
-    await deliverMatrixReplies({
-      cfg: explicitCfg,
-      replies: [{ text: "hello", replyToId: "reply-1" }],
-      roomId: "room:4",
-      client: {} as MatrixClient,
-      runtime: runtimeEnv,
-      textLimit: 4000,
-      replyToMode: "all",
-      accountId: "ops",
-    });
-
-    expect(loadConfigMock).not.toHaveBeenCalled();
-    expect(chunkMatrixTextMock).toHaveBeenCalledWith("hello", {
-      cfg: explicitCfg,
-      accountId: "ops",
-      tableMode: "code",
-    });
-    expect(sendCall(0)[0]).toBe("room:4");
-    expect(sendCall(0)[1]).toBe("hello");
-    expect(sendOptions(0).cfg).toBe(explicitCfg);
-    expect(sendOptions(0).accountId).toBe("ops");
-    expect(sendOptions(0).replyToId).toBe("reply-1");
+  it("strips namespaced reasoning while delivering visible Matrix replies", async () => {
+    const cases = [
+      ["<mm:think>private</mm:think>MiniMax answer", "MiniMax answer"],
+      ["<antml:thinking>private</antml:thinking>Answer", "Answer"],
+      ["<br>HTML answer<mm:think>private</mm:think>", "<br>HTML answer"],
+      ["Safe answer<mm:think>unfinished", "Safe answer"],
+      ["Answer<think>old</think><think>unfinished", "Answer"],
+      ["<thinking>private</think>Alias answer", "Alias answer"],
+      ["<final>Final answer", "Final answer"],
+    ] as const;
+    await deliverTexts(cases.map(([text]) => text));
+    expect(sendMessageMatrixMock).toHaveBeenCalledTimes(cases.length);
+    expect(sendMessageMatrixMock.mock.calls.map((call) => call[1])).toEqual(
+      cases.map(([, text]) => text),
+    );
   });
 
-  it("passes raw media captions through to sendMessageMatrix without pre-converting them", async () => {
-    convertMarkdownTablesMock.mockImplementation((text: string) => `converted:${text}`);
-
-    await deliverMatrixReplies({
-      cfg,
-      replies: [{ text: "caption", mediaUrl: "https://example.com/a.jpg" }],
-      roomId: "room:6",
-      client: {} as MatrixClient,
-      runtime: runtimeEnv,
-      textLimit: 4000,
-      replyToMode: "off",
+  it("delivers Matrix media without a reasoning-only caption", async () => {
+    await deliver({
+      replies: [
+        {
+          text: "<mm:think>MiniMax private reasoning</mm:think>",
+          mediaUrl: "https://example.com/a.jpg",
+        },
+      ],
+      roomId: "room:5",
     });
-
-    expect(sendCall(0)[0]).toBe("room:6");
-    expect(sendCall(0)[1]).toBe("caption");
+    expect(sendMessageMatrixMock).toHaveBeenCalledTimes(1);
+    expect(sendCall(0)[1]).toBe("");
     expect(sendOptions(0).mediaUrl).toBe("https://example.com/a.jpg");
+  });
+
+  async function deliverPresentation(
+    reply: ReplyPayload,
+    blocks: NonNullable<ReplyPayload["presentation"]>["blocks"],
+  ) {
+    return deliver({
+      replies: [await prepareMatrixReplyPayload({ ...reply, presentation: { blocks } })],
+    });
+  }
+
+  it("attaches the controls to the first event of a reply that carries media", async () => {
+    await deliverPresentation(
+      {
+        text: "Pick one",
+        mediaUrls: ["https://example.com/a.jpg", "https://example.com/b.jpg"],
+      },
+      [
+        { type: "text", text: "Deploy to production?" },
+        {
+          type: "buttons",
+          buttons: [{ label: "Approve", action: { type: "callback", value: "approve" } }],
+        },
+      ],
+    );
+    expect(sendMessageMatrixMock).toHaveBeenCalledTimes(2);
+    expect(sendOptions(0).extraContent).toHaveProperty(PRESENTATION_KEY, expect.anything());
+    expect(sendOptions(1).extraContent).toBeUndefined();
+  });
+
+  const authoredText =
+    "Status: ok\nUptime: 42s\nReference UTC: 12:00\n\n| agent | state |\n| --- | --- |\n| main | idle |";
+  it.each([false, true])("preserves presentation fallback (native context: %s)", async (native) => {
+    const blocks: NonNullable<ReplyPayload["presentation"]>["blocks"] = [
+      { type: "context", text: native ? "took 42s" : "Status: ok · Uptime: 42s" },
+    ];
+    if (!native) {
+      blocks.push({
+        type: "table",
+        caption: "Agents",
+        headers: ["agent", "state"],
+        rows: [["main", "idle"]],
+      });
+    }
+    await deliverPresentation(
+      {
+        text: native ? "Deploy finished." : authoredText,
+        presentationTextMode: "fallback",
+      },
+      blocks,
+    );
+    expect(sendMessageMatrixMock).toHaveBeenCalledTimes(1);
+    expect(sendCall(0)[1]).toEqual(native ? expect.stringContaining("took 42s") : authoredText);
+    expect(sendOptions(0).extraContent).toEqual(
+      native
+        ? expect.objectContaining({
+            [PRESENTATION_KEY]: expect.objectContaining({
+              type: "message.presentation",
+              version: 1,
+            }),
+          })
+        : undefined,
+    );
   });
 });

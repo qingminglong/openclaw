@@ -1,422 +1,119 @@
-// skill_workshop tests cover proposal creation/revision/listing without
-// applying generated skills to the workspace.
-import fs from "node:fs/promises";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../config/runtime-snapshot.js";
+import { consumeRunSkillUsage } from "../../skills/runtime/run-usage.js";
+import { listWorkshopArchive, listWorkshopChanges } from "../../skills/workshop/library.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
-import { createTrackedTempDirs } from "../../test-utils/tracked-temp-dirs.js";
-import { createOpenClawTools } from "../openclaw-tools.js";
-import { createSkillWorkshopTool } from "./skill-workshop-tool.js";
+import { createSkillWorkshopTool, type SkillWorkshopToolOptions } from "./skill-workshop-tool.js";
 
-const tempDirs = createTrackedTempDirs();
-let testState: OpenClawTestState;
-let stateDir = "";
+let state: OpenClawTestState;
 
 beforeEach(async () => {
-  testState = await createOpenClawTestState({
-    layout: "state-only",
-    prefix: "openclaw-skill-workshop-state-",
+  state = await createOpenClawTestState({ layout: "state-only" });
+  setRuntimeConfigSnapshot({});
+  await workshop()("create", {
+    content: "---\nname: deploy\ndescription: Deploy staging\n---\n\n1. Run make deploy.\n",
   });
-  stateDir = testState.stateDir;
 });
 
 afterEach(async () => {
-  await testState.cleanup();
-  await tempDirs.cleanup();
+  await state.cleanup();
+  clearRuntimeConfigSnapshot();
 });
 
-describe("skill_workshop tool", () => {
-  it("is exposed in the OpenClaw tool set", async () => {
-    const workspaceDir = await tempDirs.make("openclaw-skill-workshop-tool-");
-    const tools = createOpenClawTools({
-      workspaceDir,
-      config: {},
-      disablePluginTools: true,
-    });
-    expect(tools.some((tool) => tool.name === "skill_workshop")).toBe(true);
-  });
+const patch = { old_text: "make deploy", new_text: "make ship" };
+const supportFile = { file_path: "references/old.md", content: "stale notes\n" };
 
-  it("stays exposed when autonomous proposal capture is disabled", async () => {
-    const workspaceDir = await tempDirs.make("openclaw-skill-workshop-tool-");
-    const tools = createOpenClawTools({
-      workspaceDir,
-      config: {
-        skills: {
-          workshop: {
-            autonomous: {
-              enabled: false,
-            },
-          },
-        },
-      },
-      disablePluginTools: true,
-    });
-    expect(tools.some((tool) => tool.name === "skill_workshop")).toBe(true);
-  });
+function workshop(options: Omit<SkillWorkshopToolOptions, "config" | "agentId"> = {}) {
+  const tool = createSkillWorkshopTool({ config: {}, agentId: "main", ...options });
+  return async (action: string, params: Record<string, unknown> = {}, signal?: AbortSignal) => {
+    const result = await tool.execute(action, { action, name: "deploy", ...params }, signal);
+    return result.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+  };
+}
 
-  it("is not exposed from sandboxed OpenClaw tool sets", async () => {
-    const workspaceDir = await tempDirs.make("openclaw-skill-workshop-tool-");
-    const tools = createOpenClawTools({
-      workspaceDir,
-      config: {},
-      disablePluginTools: true,
-      sandboxed: true,
-    });
+describe("skill_workshop", () => {
+  it("requires viewing an existing skill before a background run edits or archives it", async () => {
+    const tool = workshop({ runId: "review-run", reviewOf: "agent:main:main" });
 
-    expect(tools.some((tool) => tool.name === "skill_workshop")).toBe(false);
-  });
-
-  it("creates pending skill proposals without applying them", async () => {
-    // Creation writes reviewable proposal artifacts under state, not live skill
-    // files in the workspace.
-    const workspaceDir = await tempDirs.make("openclaw-skill-workshop-tool-");
-    const tool = createSkillWorkshopTool({
-      workspaceDir,
-      config: {},
-      agentId: "main",
-      origin: {
-        agentId: "main",
-        sessionKey: "agent:main:dashboard:workshop-test",
-        runId: "run-workshop-test",
-      },
+    await expect(tool("patch", patch)).rejects.toThrow("View it first");
+    // Retries rebuild the tool inside the same run; the read must carry over.
+    await tool("view");
+    const retried = workshop({
+      sessionKey: "agent:main:internal-session-effects:skill-workshop-review_1",
+      runId: "review-run",
+      reviewOf: "agent:main:telegram:direct:42",
     });
+    await retried("patch", { ...patch, reason: "renamed target" });
+    await expect(retried("archive")).rejects.toThrow(/archive needs absorbed_into .* or a reason/);
 
-    const result = await tool.execute("call-1", {
-      action: "create",
-      name: "Weather Planner",
-      description: "Plan around current weather",
-      proposal_content: "# Weather Planner\n\nCheck weather before outdoor recommendations.\n",
-      support_files: [
-        {
-          path: "references/weather.md",
-          content: "Use weather API details.\n",
-        },
-      ],
-      goal: "Reuse weather planning steps",
-    });
-
-    expect(result.details).toMatchObject({
-      status: "pending",
-      kind: "create",
-      skillKey: "weather-planner",
-      scanState: "clean",
-      supportFileCount: 1,
-    });
-    expect((result.content[0] as { text: string }).text).toBe(
-      `Created skill proposal ${(result.details as { id: string }).id} (pending) for weather-planner.`,
-    );
-    await expect(
-      fs.readFile(
-        path.join(
-          stateDir,
-          "skill-workshop",
-          "proposals",
-          (result.details as { id: string }).id,
-          "PROPOSAL.md",
-        ),
-        "utf8",
-      ),
-    ).resolves.toContain("status: proposal");
-    await expect(
-      fs
-        .readFile(
-          path.join(
-            stateDir,
-            "skill-workshop",
-            "proposals",
-            (result.details as { id: string }).id,
-            "proposal.json",
-          ),
-          "utf8",
-        )
-        .then((raw) => JSON.parse(raw).origin),
-    ).resolves.toEqual({
-      agentId: "main",
-      sessionKey: "agent:main:dashboard:workshop-test",
-      runId: "run-workshop-test",
-    });
-    await expect(
-      fs.readFile(
-        path.join(
-          stateDir,
-          "skill-workshop",
-          "proposals",
-          (result.details as { id: string }).id,
-          "references",
-          "weather.md",
-        ),
-        "utf8",
-      ),
-    ).resolves.toContain("Use weather API details.");
-    await expect(
-      fs.access(path.join(workspaceDir, "skills", "weather-planner", "SKILL.md")),
-    ).rejects.toThrow();
-
-    const revised = await tool.execute("call-2", {
-      action: "revise",
-      proposal_id: (result.details as { id: string }).id,
-      proposal_content: "# Weather Planner\n\nCheck weather, alerts, and timing.\n",
-      support_files: [
-        {
-          path: "references/weather.md",
-          content: "Use weather API details and current alerts.\n",
-        },
-      ],
-      evidence: "User asked for more precise planning.",
-    });
-
-    expect(revised.details).toMatchObject({
-      id: (result.details as { id: string }).id,
-      status: "pending",
-      kind: "create",
-      skillKey: "weather-planner",
-      supportFileCount: 1,
-    });
-    expect((revised.content[0] as { text: string }).text).toBe(
-      `Revised skill proposal ${(result.details as { id: string }).id} (pending) for weather-planner.`,
-    );
-    await expect(
-      fs.readFile(
-        path.join(
-          stateDir,
-          "skill-workshop",
-          "proposals",
-          (result.details as { id: string }).id,
-          "PROPOSAL.md",
-        ),
-        "utf8",
-      ),
-    ).resolves.toContain('version: "v2"');
-
-    const listed = await tool.execute("call-3", {
-      action: "list",
-      status: "pending",
-      query: "weather",
-    });
-
-    expect((listed.content[0] as { text: string }).text).toContain("weather-planner");
-    expect(
-      (listed.details as { proposals: Array<{ id: string; skillKey: string }> }).proposals,
-    ).toEqual([
-      expect.objectContaining({
-        id: (result.details as { id: string }).id,
-        skillKey: "weather-planner",
-      }),
-    ]);
-    const punctuationOnly = await tool.execute("call-3b", {
-      action: "list",
-      status: "pending",
-      query: "!!!",
-    });
-    expect((punctuationOnly.content[0] as { text: string }).text).toBe(
-      "No skill proposals matched.",
-    );
-    expect((punctuationOnly.details as { proposals: unknown[] }).proposals).toEqual([]);
-
-    const inspected = await tool.execute("call-4", {
-      action: "inspect",
-      name: "weather-planner",
-    });
-
-    expect((inspected.content[0] as { text: string }).text).toContain(
-      "Proposal: " + (result.details as { id: string }).id,
-    );
-    expect((inspected.details as { proposalContent: string }).proposalContent).toContain(
-      "Check weather, alerts, and timing.",
-    );
-    expect((inspected.content[0] as { text: string }).text).toContain(
-      "--- references/weather.md ---",
-    );
-    expect(
-      (
-        inspected.details as {
-          supportFiles: Array<{ path: string; content: string }>;
-        }
-      ).supportFiles,
-    ).toEqual([
+    expect(consumeRunSkillUsage("review-run")).toEqual([]);
+    // Changes credit the conversation the review learned from, not its internal session.
+    expect(await listWorkshopChanges("main", { runId: "review-run" })).toMatchObject([
       {
-        path: "references/weather.md",
-        content: "Use weather API details and current alerts.\n",
+        action: "patch",
+        actor: "review",
+        summary: "renamed target",
+        sessionKey: "agent:main:telegram:direct:42",
       },
     ]);
-
-    const revisedByName = await tool.execute("call-5", {
-      action: "revise",
-      name: "weather-planner",
-      proposal_content: "# Weather Planner\n\nCheck weather, alerts, timing, and location.\n",
-    });
-
-    expect(revisedByName.details).toMatchObject({
-      id: (result.details as { id: string }).id,
-      proposedVersion: "v3",
-      scanState: "clean",
-    });
-    expect((revisedByName.content[0] as { text: string }).text).toBe(
-      `Revised skill proposal ${(result.details as { id: string }).id} (pending) for weather-planner.`,
-    );
   });
 
-  it("applies, rejects, and quarantines proposals through the workshop service", async () => {
-    const workspaceDir = await tempDirs.make("openclaw-skill-workshop-tool-");
-    const tool = createSkillWorkshopTool({ workspaceDir, config: {}, agentId: "main" });
-
-    const created = await tool.execute("call-1", {
-      action: "create",
-      name: "Weather Planner",
-      description: "Plan around current weather",
-      proposal_content: "# Weather Planner\n\nCheck weather before outdoor recommendations.\n",
-      support_files: [
-        {
-          path: "references/weather.md",
-          content: "Use weather API details.\n",
-        },
-      ],
-    });
-    const createdId = (created.details as { id: string }).id;
-
-    const applied = await tool.execute("call-2", {
-      action: "apply",
-      proposal_id: createdId,
-      reason: "user approved the proposal",
-    });
-
-    expect((applied.content[0] as { text: string }).text).toContain(
-      `Applied skill proposal ${createdId}.`,
-    );
-    expect(applied.details).toMatchObject({
-      id: createdId,
-      status: "applied",
-      kind: "create",
-      skillKey: "weather-planner",
-      scanState: "clean",
-    });
-    await expect(
-      fs.readFile(path.join(workspaceDir, "skills", "weather-planner", "SKILL.md"), "utf8"),
-    ).resolves.toContain("Check weather before outdoor recommendations.");
-    await expect(
-      fs.readFile(path.join(workspaceDir, "skills", "weather-planner", "SKILL.md"), "utf8"),
-    ).resolves.not.toContain("status: proposal");
-    await expect(
-      fs.readFile(
-        path.join(workspaceDir, "skills", "weather-planner", "references", "weather.md"),
-        "utf8",
-      ),
-    ).resolves.toContain("Use weather API details.");
-
-    const update = await tool.execute("call-update", {
-      action: "update",
-      skill_name: "weather-planner",
-      description: "Refresh weather planning steps",
-      proposal_content: "# Weather Planner\n\nCheck weather, alerts, and timing.\n",
-    });
-
-    expect((update.content[0] as { text: string }).text).toBe(
-      `Created skill update proposal ${(update.details as { id: string }).id} (pending) for weather-planner.`,
-    );
-    expect(update.details).toMatchObject({
-      status: "pending",
-      kind: "update",
-      skillKey: "weather-planner",
-    });
-
-    const rejected = await tool.execute("call-3", {
-      action: "create",
-      name: "Rejected Skill",
-      description: "Rejected proposal",
-      proposal_content: "# Rejected Skill\n\nDo not apply this.\n",
-    });
-    const rejectedId = (rejected.details as { id: string }).id;
-    const rejectResult = await tool.execute("call-4", {
-      action: "reject",
-      proposal_id: rejectedId,
-      reason: "not needed",
-    });
-
-    expect((rejectResult.content[0] as { text: string }).text).toContain(
-      `Rejected skill proposal ${rejectedId}.`,
-    );
-    expect(rejectResult.details).toMatchObject({
-      id: rejectedId,
-      status: "rejected",
-      kind: "create",
-      skillKey: "rejected-skill",
-    });
-    await expect(
-      fs.access(path.join(workspaceDir, "skills", "rejected-skill", "SKILL.md")),
-    ).rejects.toThrow();
-
-    const quarantined = await tool.execute("call-5", {
-      action: "create",
-      name: "Quarantined Skill",
-      description: "Quarantined proposal",
-      proposal_content: "# Quarantined Skill\n\nDo not apply this.\n",
-    });
-    const quarantinedId = (quarantined.details as { id: string }).id;
-    const quarantineResult = await tool.execute("call-6", {
-      action: "quarantine",
-      proposal_id: quarantinedId,
-      reason: "unsafe for now",
-    });
-
-    expect((quarantineResult.content[0] as { text: string }).text).toContain(
-      `Quarantined skill proposal ${quarantinedId}.`,
-    );
-    expect(quarantineResult.details).toMatchObject({
-      id: quarantinedId,
-      status: "quarantined",
-      kind: "create",
-      skillKey: "quarantined-skill",
-      scanState: "quarantined",
-    });
-    await expect(
-      fs.access(path.join(workspaceDir, "skills", "quarantined-skill", "SKILL.md")),
-    ).rejects.toThrow();
+  it("gates remove_file behind a prior view in background runs", async () => {
+    await workshop()("write_file", supportFile);
+    const tool = workshop({ runId: "review-remove-run", reviewOf: "agent:main:main" });
+    const remove = { file_path: supportFile.file_path };
+    await expect(tool("remove_file", remove)).rejects.toThrow("View it first");
+    // Reading an old saved version is not reading the live skill it would edit.
+    const [entry] = await listWorkshopArchive({}, "main");
+    await tool("view", { version: entry?.versions[0]?.id });
+    await expect(tool("remove_file", remove)).rejects.toThrow("View it first");
+    await tool("view");
+    expect(await tool("remove_file", remove)).toContain('Updated "deploy"');
   });
 
-  it("scopes proposal discovery to the tool workspace", async () => {
-    const firstWorkspaceDir = await tempDirs.make("openclaw-skill-workshop-tool-first-");
-    const secondWorkspaceDir = await tempDirs.make("openclaw-skill-workshop-tool-second-");
-    const firstTool = createSkillWorkshopTool({
-      workspaceDir: firstWorkspaceDir,
-      config: {},
-      agentId: "main",
-    });
-    const secondTool = createSkillWorkshopTool({
-      workspaceDir: secondWorkspaceDir,
-      config: {},
-      agentId: "main",
-    });
+  it("does not write once the invoking run is aborted", async () => {
+    const aborted = AbortSignal.abort(new Error("run aborted"));
+    await expect(workshop()("patch", patch, aborted)).rejects.toThrow("run aborted");
+    expect(await listWorkshopChanges("main", {})).toHaveLength(1);
+  });
+  it("removes one support file as an undoable change and never removes SKILL.md", async () => {
+    const tool = workshop({ runId: "fg-run" });
+    await tool("write_file", supportFile);
 
-    const first = await firstTool.execute("call-1", {
-      action: "create",
-      name: "First Workspace Skill",
-      description: "First workspace proposal",
-      proposal_content: "# First\n",
-    });
-    const second = await secondTool.execute("call-2", {
-      action: "create",
-      name: "Second Workspace Skill",
-      description: "Second workspace proposal",
-      proposal_content: "# Second\n",
-    });
+    await expect(tool("remove_file", { file_path: "SKILL.md" })).rejects.toThrow(
+      "SKILL.md cannot be removed. Archive the skill",
+    );
+    await expect(tool("remove_file", { file_path: "references/nope.md" })).rejects.toThrow(
+      "references/nope.md does not exist",
+    );
 
-    const listed = await firstTool.execute("call-3", {
-      action: "list",
-      status: "pending",
+    await tool("remove_file", { file_path: supportFile.file_path });
+    expect(await tool("view")).not.toContain("references/old.md");
+    expect(consumeRunSkillUsage("fg-run")).toEqual([
+      expect.objectContaining({ name: "deploy", source: "workspace", activation: "read" }),
+    ]);
+
+    await tool("restore");
+    expect(await tool("view", { file_path: supportFile.file_path })).toContain("stale notes\n");
+    expect((await listWorkshopChanges("main", { runId: "fg-run" })).map((c) => c.action)).toEqual([
+      "restore",
+      "remove_file",
+      "write_file",
+    ]);
+  });
+  it("shows the other learned skills on create so the agent can merge duplicates", async () => {
+    const result = await workshop()("create", {
+      name: "staging-deploy",
+      content: "---\nname: staging-deploy\ndescription: Deploy to staging\n---\n\n1. Run it.\n",
     });
-    expect(
-      (listed.details as { proposals: Array<{ id: string }> }).proposals.map(
-        (proposal) => proposal.id,
-      ),
-    ).toEqual([(first.details as { id: string }).id]);
-    await expect(
-      firstTool.execute("call-4", {
-        action: "inspect",
-        proposal_id: (second.details as { id: string }).id,
-      }),
-    ).rejects.toThrow(`Skill proposal not found: ${(second.details as { id: string }).id}`);
+    expect(result).toContain('Created "staging-deploy"');
+    expect(result).toContain("- deploy: Deploy staging");
+    expect(result).not.toContain("- staging-deploy:");
   });
 });

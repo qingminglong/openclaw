@@ -1,113 +1,169 @@
-// Markdown Core tests cover frontmatter behavior.
-import JSON5 from "json5";
-import { describe, expect, it } from "vitest";
-import { parseFrontmatterBlock } from "./frontmatter.js";
+import { expect, it } from "vitest";
+import {
+  parseFrontmatterBlock,
+  parseFrontmatterBlockResult,
+  stripFrontmatterBlock,
+} from "./frontmatter.js";
 
-describe("parseFrontmatterBlock", () => {
-  it("parses YAML block scalars", () => {
-    const content = `---
-name: yaml-hook
-description: |
-  line one
-  line two
----
-`;
-    const result = parseFrontmatterBlock(content);
-    expect(result.name).toBe("yaml-hook");
-    expect(result.description).toBe("line one\nline two");
-  });
+const block = (body: string) => `---\n${body}\n---\n`;
+const parse = (body: string) => parseFrontmatterBlock(block(body));
+const parseResult = (body: string) => parseFrontmatterBlockResult(block(body));
+const task = "signals: user announcing a conversion task";
 
-  it("handles JSON5-style multi-line metadata", () => {
-    const content = `---
-name: session-memory
-metadata:
-  {
-    "openclaw":
-      {
-        "emoji": "disk",
-        "events": ["command:new"],
-      },
+it.each<[string, string, Record<string, string>]>([
+  [
+    "JSON5 metadata",
+    'metadata:\n  {\n    "openclaw":\n      {\n        "emoji": "disk",\n        "events": ["command:new"],\n      },\n  }',
+    { metadata: '{"openclaw":{"emoji":"disk","events":["command:new"]}}' },
+  ],
+  [
+    "indented YAML flow",
+    "  metadata: {openclaw: {emoji: lobster}} # display metadata",
+    { metadata: '{"openclaw":{"emoji":"lobster"}}' },
+  ],
+  ["multiline flow", "metadata: {a: 1,\n  b: 2}", { metadata: '{"a":1,"b":2}' }],
+  [
+    "objects and arrays",
+    "enabled: true\nretries: 3\ntags:\n  - alpha\n  - beta\nmetadata:\n  openclaw:\n    events:\n      - command:new",
+    {
+      enabled: "true",
+      retries: "3",
+      tags: '["alpha","beta"]',
+      metadata: '{"openclaw":{"events":["command:new"]}}',
+    },
+  ],
+  [
+    "colon-rich description",
+    "description: Use anime style IMPORTANT: Must be kawaii",
+    { description: "Use anime style IMPORTANT: Must be kawaii" },
+  ],
+  [
+    "multiple colon-rich fields",
+    "read_when: " + task + "\nsummary: handles formats: pdf and docx",
+    { read_when: task, summary: "handles formats: pdf and docx" },
+  ],
+  [
+    "structured sibling",
+    "read_when: " + task + "\nmetadata:\n  openclaw:\n    emoji: beaker",
+    { read_when: task, metadata: '{"openclaw":{"emoji":"beaker"}}' },
+  ],
+  [
+    "commented sibling",
+    "description: text # note\nread_when: " + task,
+    { description: "text", read_when: task },
+  ],
+  [
+    "escaped sibling",
+    'description: "line\\n: detail"\nread_when: ' + task,
+    { description: "line\n: detail", read_when: task },
+  ],
+  ["double-quoted key", '"description": ' + task, { description: task }],
+  ["single-quoted key", "'read_when': " + task, { read_when: task }],
+  ["quoted escape", 'description: "line\\nbreak"', { description: "line\nbreak" }],
+  [
+    "block scalar",
+    "description: | # note\n  line one\n  line two",
+    { description: "line one\nline two" },
+  ],
+  [
+    "hash-led text",
+    "description: # Add a description here\nsummary: #1 pick for audits\ncolor: #ff8800",
+    { summary: "#1 pick for audits", color: "#ff8800" },
+  ],
+  [
+    "chomped block scalar",
+    "description: |-\n  {json-like text}",
+    { description: "{json-like text}" },
+  ],
+])("parses frontmatter: %s", (_name, body, frontmatter) => {
+  expect(parseResult(body)).toEqual({ frontmatter, issues: [] });
+});
+
+it.each(["", " # display metadata", " #"])("preserves inline JSON before %j", (comment) => {
+  expect(parse('metadata: {"openclaw": {"events": ["test#tag"]}}' + comment).metadata).toBe(
+    '{"openclaw": {"events": ["test#tag"]}}',
+  );
+});
+
+it.each([
+  [
+    "strict structured field",
+    "read_when: " + task + "\nmetadata: owner: value",
+    "BLOCK_AS_IMPLICIT_KEY",
+  ],
+  ["malformed sequence", "name: [broken\ndescription: Broken skill", "BAD_INDENT"],
+  ["duplicate key", "name: first\ndescription: Working skill\nname: second", "DUPLICATE_KEY"],
+  ["unresolved alias", "name: sample-skill\nmetadata: *missing", "YAML_EXCEPTION"],
+  [
+    "quoted alias key",
+    'name: sample-skill\ndescription: Working skill\n"metadata": *missing',
+    "YAML_EXCEPTION",
+  ],
+])("retains parser error: %s", (_name, body, code) => {
+  const result = parseResult(body);
+  expect(result.issues[0]).toMatchObject({ code });
+  if (code === "BAD_INDENT") {
+    expect(result.frontmatter.name).toBe("[broken");
   }
----
-`;
-    const result = parseFrontmatterBlock(content);
-    expect(result.metadata).toBe('{"openclaw":{"emoji":"disk","events":["command:new"]}}');
+});
 
-    const parsed = JSON5.parse(result.metadata);
-    expect(parsed.openclaw?.emoji).toBe("disk");
+it.each(["*legacy", "Use anime style IMPORTANT: Must be kawaii"])(
+  "recovers description %s without masking structured aliases",
+  (description) => {
+    expect(parseResult("description: " + description + "\nmetadata: *missing").issues).toEqual([
+      expect.objectContaining({ code: "YAML_EXCEPTION" }),
+    ]);
+  },
+);
+
+it("returns empty when frontmatter is missing", () => {
+  expect(parseFrontmatterBlock("# No frontmatter")).toStrictEqual({});
+});
+
+it("reports an unterminated frontmatter block", () => {
+  expect(
+    parseFrontmatterBlockResult("---\nname: broken\ndescription: Missing delimiter\n"),
+  ).toEqual({
+    frontmatter: {},
+    issues: [expect.objectContaining({ code: "UNTERMINATED_FRONTMATTER" })],
   });
+});
 
-  it("preserves inline JSON values", () => {
-    const content = `---
-name: inline-json
-metadata: {"openclaw": {"events": ["test"]}}
----
-`;
-    const result = parseFrontmatterBlock(content);
-    expect(result.metadata).toBe('{"openclaw": {"events": ["test"]}}');
-  });
+it.each(["---not", "----", "--- name"])("ignores opening prefix %s", (prefix) => {
+  expect(parseFrontmatterBlock(prefix + "\nname: nope\n---\nBody text")).toStrictEqual({});
+});
 
-  it("stringifies YAML objects and arrays", () => {
-    const content = `---
-name: yaml-objects
-enabled: true
-retries: 3
-tags:
-  - alpha
-  - beta
-metadata:
-  openclaw:
-    events:
-      - command:new
----
-`;
-    const result = parseFrontmatterBlock(content);
-    expect(result.enabled).toBe("true");
-    expect(result.retries).toBe("3");
-    expect(JSON.parse(result.tags ?? "[]")).toEqual(["alpha", "beta"]);
-    const parsed = JSON5.parse(result.metadata ?? "");
-    expect(parsed.openclaw?.events).toEqual(["command:new"]);
-  });
+it.each(["---not", "---\u2028Body text"])("ignores closing prefix %s", (closing) => {
+  const content = "---\nname: nope\n" + closing + "\nBody text";
+  expect(parseFrontmatterBlock(content)).toStrictEqual({});
+  expect(stripFrontmatterBlock(content)).toBe(content);
+});
 
-  it("preserves inline description values containing colons", () => {
-    const content = `---
-name: sample-skill
-description: Use anime style IMPORTANT: Must be kawaii
----`;
-    const result = parseFrontmatterBlock(content);
-    expect(result.description).toBe("Use anime style IMPORTANT: Must be kawaii");
-  });
+it("accepts delimiter lines with trailing whitespace", () => {
+  const content = "---   \nname: sample\n---\t\nBody text";
+  expect(parseFrontmatterBlock(content)).toStrictEqual({ name: "sample" });
+  expect(stripFrontmatterBlock(content)).toBe("Body text");
+});
 
-  it("does not replace YAML block scalars with block indicators", () => {
-    const content = `---
-name: sample-skill
-description: |-
-  {json-like text}
----`;
-    const result = parseFrontmatterBlock(content);
-    expect(result.description).toBe("{json-like text}");
-  });
+it("preserves prototype-named keys when YAML value is null", () => {
+  const keys = ["toString", "constructor", "valueOf", "hasOwnProperty"];
+  const result = parse("title: Hello\n" + keys.map((key) => key + ": null").join("\n"));
+  for (const key of keys) {
+    expect(Object.hasOwn(result, key)).toBe(true);
+    expect(result[key]).toBe("null");
+  }
+  expect(result.title).toBe("Hello");
+});
 
-  it("keeps nested YAML mappings as structured JSON", () => {
-    const content = `---
-name: sample-skill
-metadata:
-  openclaw: true
----`;
-    const result = parseFrontmatterBlock(content);
-    expect(result.metadata).toBe('{"openclaw":true}');
-  });
+it("parses frontmatter after a leading UTF-8 BOM", () => {
+  expect(
+    parseFrontmatterBlock(
+      "\uFEFF" + block("name: windows-skill\ndescription: Written by PowerShell"),
+    ),
+  ).toEqual({ name: "windows-skill", description: "Written by PowerShell" });
+});
 
-  it("returns empty when frontmatter is missing", () => {
-    const content = "# No frontmatter";
-    expect(parseFrontmatterBlock(content)).toStrictEqual({});
-  });
-
-  it("parses frontmatter after a leading UTF-8 BOM", () => {
-    const content = "\uFEFF---\nname: windows-skill\ndescription: Written by PowerShell\n---\n";
-    const result = parseFrontmatterBlock(content);
-
-    expect(result.name).toBe("windows-skill");
-    expect(result.description).toBe("Written by PowerShell");
-  });
+it("preserves Markdown that starts with a non-delimiter prefix", () => {
+  const content = "---not\nname: nope\n---not\nBody text";
+  expect(stripFrontmatterBlock(content)).toBe(content);
 });

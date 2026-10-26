@@ -1,605 +1,414 @@
-// Memory Core tests cover tools plugin behavior.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import "./tools.session-catalog.test-mocks.js";
+import type { MemorySearchResult } from "openclaw/plugin-sdk/memory-core-host-runtime-files";
+import { clearMemoryPluginState } from "openclaw/plugin-sdk/memory-host-core";
+import { Value } from "typebox/value";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { MemoryToolOptions } from "./memory-tool-contract.js";
 import {
   getMemoryCloseMockCalls,
   getMemorySearchManagerMockCalls,
-  getMemorySearchManagerMockConfigs,
   getMemorySearchManagerMockParams,
   getMemorySyncMockCalls,
   resetMemoryToolMockState,
-  setMemoryBackend,
+  setMemoryCloseImpl,
   setMemoryCustomStatus,
+  setMemoryLastSyncError,
   setMemorySearchImpl,
   setMemorySearchManagerImpl,
+  setMemorySourceCounts,
+  setMemoryStatusDirty,
 } from "./memory-tool-manager.test-mocks.js";
-import { createMemorySearchTool, testing as memoryToolsTesting } from "./tools.js";
+import { testing as memoryToolsTesting } from "./tools.js";
 import {
-  buildMemorySearchUnavailableResult,
-  MemoryGetSchema,
-  MemorySearchSchema,
-} from "./tools.shared.js";
-import {
-  asOpenClawConfig,
   createMemorySearchToolOrThrow,
   expectUnavailableMemorySearchDetails,
 } from "./tools.test-helpers.js";
 
-const sessionStore = vi.hoisted(() => ({
-  "agent:main:main": {
-    sessionId: "thread-1",
-    updatedAt: 1,
-    sessionFile: "/tmp/sessions/thread-1.jsonl",
-  },
-}));
+function hit(
+  path: string,
+  source: "memory" | "sessions",
+  snippet: string,
+  score = 0.9,
+): MemorySearchResult {
+  return { path, source, snippet, score, startLine: 1, endLine: 2 };
+}
 
-vi.mock("openclaw/plugin-sdk/session-transcript-hit", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("openclaw/plugin-sdk/session-transcript-hit")>();
-  return {
-    ...actual,
-    loadCombinedSessionStoreForGateway: vi.fn(() => ({
-      storePath: "(test)",
-      store: sessionStore,
-    })),
-  };
+function mockSearch(impl: Parameters<typeof setMemorySearchImpl>[0]) {
+  const search = vi.fn(impl);
+  setMemorySearchImpl(search);
+  return search;
+}
+
+const searchHits = (hits: MemorySearchResult[]) => mockSearch(async () => hits);
+
+function corpusTool(
+  search: NonNullable<NonNullable<MemoryToolOptions["config"]>["memory"]>["search"] = {},
+  options: Pick<MemoryToolOptions, "agentSessionKey" | "conversationRecall"> = {},
+  visibility: "self" | "agent" | "all" = "self",
+  dmScope?: "per-channel-peer",
+) {
+  return createMemorySearchToolOrThrow({
+    config: {
+      agents: { entries: { main: {} } },
+      memory: { citations: "off", search },
+      tools: { sessions: { visibility } },
+      ...(dmScope ? { session: { dmScope } } : {}),
+    },
+    agentSessionKey: "agent:main:main",
+    ...options,
+  });
+}
+
+const recall = (corpus: "sessions" | "configured") => ({
+  anchorSessionKey: "agent:main:main",
+  scope: "same-agent-private" as const,
+  corpus,
 });
 
-describe("memory tool schemas", () => {
-  it("uses flat corpus enums for provider tool compatibility", () => {
-    const searchCorpus = MemorySearchSchema.properties.corpus as {
-      anyOf?: unknown;
-      enum?: unknown;
-    };
-    const getCorpus = MemoryGetSchema.properties.corpus as {
-      anyOf?: unknown;
-      enum?: unknown;
-    };
+function executeSearch(
+  tool = createMemorySearchToolOrThrow(),
+  params: Record<string, unknown> = {},
+  signal?: AbortSignal,
+) {
+  return tool.execute("search", { query: "hello", ...params }, signal);
+}
 
-    expect(searchCorpus.anyOf).toBeUndefined();
-    expect(searchCorpus.enum).toEqual(["memory", "wiki", "all", "sessions"]);
-    expect(getCorpus.anyOf).toBeUndefined();
-    expect(getCorpus.enum).toEqual(["memory", "wiki", "all"]);
+describe("memory tool schemas", () => {
+  it.each([
+    [{ min_score: 0.3, max_results: 3 }, true],
+    [{ minScore: 0.3, maxResults: 3 }, true],
+    [{ minScore: 0.3, limit: 3 }, true],
+    [{ maxResults: 3, limit: 10 }, false],
+    [{ max_results: 3, limit: 10 }, false],
+    [{ limit: 10, max_results: 5, maxResults: 3 }, false],
+  ] as const)("normalizes aliases and prioritizes explicit caps: %j", (args, scored) => {
+    const tool = createMemorySearchToolOrThrow();
+    const input = { query: "X", ...args };
+    const prepared = tool.prepareArguments?.(input) ?? input;
+    expect(Value.Check(tool.parameters, prepared)).toBe(true);
+    expect(prepared).toEqual({ query: "X", maxResults: 3, ...(scored ? { minScore: 0.3 } : {}) });
+  });
+
+  it.each([0, -1, 1.5, "3", null])("rejects invalid result caps: %j", (value) => {
+    const tool = createMemorySearchToolOrThrow();
+    for (const caps of [
+      { limit: value },
+      { maxResults: value },
+      { maxResults: value, max_results: 3, limit: 10 },
+      { max_results: value, limit: 10 },
+    ]) {
+      const prepared = tool.prepareArguments?.({ query: "X", ...caps });
+      expect(prepared).toEqual({ query: "X", maxResults: value });
+      expect(Value.Check(tool.parameters, prepared)).toBe(false);
+    }
+  });
+
+  it("describes search as evidence-driven without repeating supplied recall", () => {
+    const description = createMemorySearchToolOrThrow().description;
+
+    expect(description).toContain("not already present in the current turn");
+    expect(description).toContain("Do not repeat memory retrieval");
+    expect(description).not.toContain("Mandatory recall step");
   });
 });
 
 describe("memory_search unavailable payloads", () => {
   beforeEach(() => {
-    resetMemoryToolMockState({ searchImpl: async () => [] });
+    clearMemoryPluginState();
+    resetMemoryToolMockState();
     memoryToolsTesting.resetMemorySearchToolCooldowns();
   });
+  afterEach(() => vi.useRealTimers());
 
-  it("rejects fractional maxResults before searching", async () => {
-    const tool = createMemorySearchToolOrThrow();
-
-    await expect(
-      tool.execute("fractional-max-results", {
-        query: "hello",
-        maxResults: 1.5,
-      }),
-    ).rejects.toThrow("maxResults must be a positive integer");
-
+  it("rejects an unknown corpus before searching", async () => {
+    await expect(executeSearch(undefined, { corpus: "everything" })).rejects.toThrow(
+      "corpus must be one of: memory, wiki, all, sessions",
+    );
     expect(getMemorySearchManagerMockCalls()).toBe(0);
   });
 
-  it("rejects malformed minScore before searching", async () => {
-    const tool = createMemorySearchToolOrThrow();
-
-    await expect(
-      tool.execute("malformed-min-score", {
-        query: "hello",
-        minScore: "0.8junk",
-      }),
-    ).rejects.toThrow("minScore must be a finite number");
-
-    expect(getMemorySearchManagerMockCalls()).toBe(0);
-  });
-
-  it("passes string minScore through to memory search", async () => {
-    let seenMinScore: number | undefined;
-    setMemorySearchImpl(async (opts) => {
-      seenMinScore = opts?.minScore;
-      return [];
-    });
-    const tool = createMemorySearchToolOrThrow();
-
-    await tool.execute("string-min-score", {
-      query: "hello",
-      minScore: "0.8",
-    });
-
-    expect(seenMinScore).toBe(0.8);
-  });
-
-  it("returns explicit unavailable metadata for quota failures", async () => {
-    setMemorySearchImpl(async () => {
-      throw new Error("openai embeddings failed: 429 insufficient_quota");
-    });
-
-    const tool = createMemorySearchToolOrThrow();
-    const result = await tool.execute("quota", { query: "hello" });
-    expectUnavailableMemorySearchDetails(result.details, {
+  it.each([
+    {
       error: "openai embeddings failed: 429 insufficient_quota",
       warning: "Memory search is unavailable because the embedding provider quota is exhausted.",
       action: "Top up or switch embedding provider, then retry memory_search.",
-    });
-  });
-
-  it("returns explicit unavailable metadata for missing node:sqlite failures", async () => {
-    const error =
-      "SQLite support is unavailable in this Node runtime (missing node:sqlite). No such built-in module: node:sqlite";
-    setMemorySearchImpl(async () => {
-      throw new Error(error);
-    });
-
-    const tool = createMemorySearchToolOrThrow();
-    const result = await tool.execute("missing-node-sqlite", { query: "hello" });
-    expectUnavailableMemorySearchDetails(result.details, {
-      error,
+    },
+    {
+      error:
+        "SQLite support is unavailable in this Node runtime (missing node:sqlite). No such built-in module: node:sqlite",
       warning:
         "Memory search is unavailable because this OpenClaw Node runtime does not provide SQLite support.",
       action:
         "Run OpenClaw with a Node runtime that includes node:sqlite, then retry memory_search.",
-    });
+    },
+  ])("reports actionable unavailability for $error", async (expected) => {
+    setMemorySearchManagerImpl(async () => ({ error: expected.error }));
+    const result = await executeSearch();
+    expectUnavailableMemorySearchDetails(result.details, expected);
   });
 
-  it("keeps explicit unavailable metadata overrides for missing node:sqlite reasons", () => {
-    const result = buildMemorySearchUnavailableResult("missing node:sqlite", {
-      warning: "custom warning",
-      action: "custom action",
-    });
+  it.each(["memory_search timed out after 30s", "SQLite read-only worker scope closed"])(
+    "does not classify provider errors by wording: %s",
+    async (error) => {
+      const searchImpl = mockSearch(async () => {
+        throw new Error(error);
+      });
 
-    expectUnavailableMemorySearchDetails(result, {
-      error: "missing node:sqlite",
-      warning: "custom warning",
-      action: "custom action",
-    });
-  });
-
-  it("returns explicit unavailable metadata for non-quota failures", async () => {
-    setMemorySearchImpl(async () => {
-      throw new Error("embedding provider timeout");
-    });
-
-    const tool = createMemorySearchToolOrThrow();
-    const result = await tool.execute("generic", { query: "hello" });
-    expectUnavailableMemorySearchDetails(result.details, {
-      error: "embedding provider timeout",
-      warning: "Memory search is unavailable due to an embedding/provider error.",
-      action: "Check embedding provider configuration and retry memory_search.",
-    });
-  });
-
-  it("returns unavailable metadata when manager setup does not settle", async () => {
-    vi.useFakeTimers();
-    try {
-      setMemorySearchManagerImpl(async () => await new Promise(() => {}));
       const tool = createMemorySearchToolOrThrow();
-
-      const resultPromise = tool.execute("manager-timeout", { query: "hello" });
-      await vi.advanceTimersByTimeAsync(15_000);
-
-      const result = await resultPromise;
+      const result = await executeSearch(tool);
+      expect(result.details).not.toHaveProperty("timedOut");
       expectUnavailableMemorySearchDetails(result.details, {
-        error: "memory_search timed out after 15s",
+        error,
         warning: "Memory search is unavailable due to an embedding/provider error.",
         action: "Check embedding provider configuration and retry memory_search.",
       });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+      const cooldownResult = await executeSearch(tool, { query: "hello again" });
+      expect(cooldownResult.details).toEqual(result.details);
+      expect(searchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["initialization", "search"] as const)(
+    "classifies a closed storage scope by code during %s",
+    async (phase) => {
+      const error = "SQLite read-only worker scope closed";
+      const storage = {
+        error,
+        code: "SQLITE_READONLY_WORKER_SCOPE_CLOSED",
+      };
+      if (phase === "initialization") {
+        setMemorySearchManagerImpl(async () => storage);
+      } else {
+        mockSearch(async () => {
+          throw Object.assign(new Error(error), { code: storage.code });
+        });
+      }
+      expectUnavailableMemorySearchDetails((await executeSearch()).details, {
+        error,
+        warning: "Memory search is unavailable because its storage scope closed.",
+        action:
+          "Run openclaw plugins reload memory-core, or restart the Gateway, then retry memory_search.",
+      });
+    },
+  );
 
   it("returns unavailable metadata when memory search does not settle", async () => {
     vi.useFakeTimers();
-    try {
+    let searchSignal: AbortSignal | undefined;
+    const searchImpl = mockSearch(async (opts) => {
+      searchSignal = opts?.signal;
+      return await new Promise((_resolve, reject) => {
+        searchSignal?.addEventListener(
+          "abort",
+          () => reject(new Error("embedding query aborted")),
+          { once: true },
+        );
+      });
+    });
+    const tool = createMemorySearchToolOrThrow();
+
+    const resultPromise = executeSearch(tool);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(searchSignal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const result = await resultPromise;
+    expectUnavailableMemorySearchDetails(result.details, {
+      error: "memory_search timed out after 30s",
+      timeoutMs: 30_000,
+      warning: "Memory search did not finish within its time limit.",
+      action:
+        "Retry memory_search after a short wait: a memory-corpus timeout pauses retries for up to a minute. If memory-corpus timeouts persist, run: openclaw memory status --deep --agent main, and rebuild with openclaw memory index --force --agent main only if it reports the index dirty or incomplete",
+    });
+    expect(searchSignal?.aborted).toBe(true);
+    const cooldownResult = await executeSearch(tool, { query: "hello again" });
+    expect(cooldownResult.details).toEqual(result.details);
+    expect(searchImpl).toHaveBeenCalledTimes(1);
+    searchImpl.mockResolvedValue([]);
+    await vi.advanceTimersByTimeAsync(59_999);
+    const pausedResult = await executeSearch(tool, { query: "hello again" });
+    expect(pausedResult.details).toEqual(cooldownResult.details);
+    expect(searchImpl).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const retryResult = await executeSearch(tool, { query: "hello again" });
+    expect(retryResult.details).toMatchObject({ results: [] });
+    expect(retryResult.details).not.toHaveProperty("unavailable");
+    expect(searchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["search", "cleanup"] as const)(
+    "propagates caller cancellation during %s without cooldown",
+    async (phase) => {
+      const controller = new AbortController();
+      const abortError = new Error("agent run cancelled");
       let searchCalls = 0;
-      let searchSignal: AbortSignal | undefined;
+      let firstSignal: AbortSignal | undefined;
       setMemorySearchImpl(async (opts) => {
         searchCalls += 1;
-        searchSignal = opts?.signal;
-        return await new Promise(() => {});
+        if (phase === "search" && searchCalls === 1) {
+          firstSignal = opts?.signal;
+          return await new Promise(() => {});
+        }
+        return [hit("MEMORY.md", "memory", "retry after cancellation")];
       });
-      const tool = createMemorySearchToolOrThrow();
-
-      const resultPromise = tool.execute("search-timeout", { query: "hello" });
-      await vi.advanceTimersByTimeAsync(15_000);
-
-      const result = await resultPromise;
-      expectUnavailableMemorySearchDetails(result.details, {
-        error: "memory_search timed out after 15s",
-        warning: "Memory search is unavailable due to an embedding/provider error.",
-        action: "Check embedding provider configuration and retry memory_search.",
-      });
-      // The deadline must abort the orphaned search, not just race past it.
-      expect(searchSignal?.aborted).toBe(true);
-      const cooldownResult = await tool.execute("search-cooldown", { query: "hello again" });
-      expectUnavailableMemorySearchDetails(cooldownResult.details, {
-        error: "memory_search timed out after 15s",
-        warning: "Memory search is unavailable due to an embedding/provider error.",
-        action: "Check embedding provider configuration and retry memory_search.",
-      });
-      expect(searchCalls).toBe(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("keeps the timeout result when an abort-aware search rejects on abort", async () => {
-    vi.useFakeTimers();
-    try {
-      setMemorySearchImpl(
-        async (opts) =>
-          await new Promise((_resolve, reject) => {
-            opts?.signal?.addEventListener(
-              "abort",
-              () => reject(new Error("openai-compatible embeddings query failed: aborted")),
-              { once: true },
-            );
-          }),
-      );
-      const tool = createMemorySearchToolOrThrow();
-
-      const resultPromise = tool.execute("abort-aware-timeout", { query: "hello" });
-      await vi.advanceTimersByTimeAsync(15_000);
-
-      const result = await resultPromise;
-      expectUnavailableMemorySearchDetails(result.details, {
-        error: "memory_search timed out after 15s",
-        warning: "Memory search is unavailable due to an embedding/provider error.",
-        action: "Check embedding provider configuration and retry memory_search.",
-      });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("re-resolves the manager once when a cached sqlite handle was closed", async () => {
-    let searchCalls = 0;
-    setMemorySearchImpl(async () => {
-      searchCalls += 1;
-      if (searchCalls === 1) {
-        throw new Error("database is not open");
+      if (phase === "cleanup") {
+        setMemoryCloseImpl(async () => await new Promise(() => {}));
       }
-      return [
-        {
-          path: "MEMORY.md",
-          startLine: 1,
-          endLine: 1,
-          score: 0.9,
-          snippet: "Thread-hidden codename: ORBIT-22.",
-          source: "memory" as const,
-        },
-      ];
-    });
-
-    const tool = createMemorySearchToolOrThrow({
-      config: {
-        agents: { list: [{ id: "main", default: true }] },
-        memory: { citations: "off" },
-      },
-    });
-    const result = await tool.execute("closed-db", { query: "hidden thread codename" });
-
-    expect((result.details as { results?: Array<{ path: string }> }).results).toEqual([
-      {
-        corpus: "memory",
-        path: "MEMORY.md",
-        startLine: 1,
-        endLine: 1,
-        score: 0.9,
-        snippet: "Thread-hidden codename: ORBIT-22.",
-        source: "memory",
-      },
-    ]);
-    expect(searchCalls).toBe(2);
-    expect(getMemorySearchManagerMockCalls()).toBe(2);
-    expect(getMemorySearchManagerMockParams()).toEqual([
-      expect.objectContaining({ purpose: undefined }),
-      expect.objectContaining({ purpose: undefined }),
-    ]);
-    expect(getMemoryCloseMockCalls()).toBe(0);
-  });
-
-  it("re-resolves and closes one-shot CLI managers when a cached sqlite handle was closed", async () => {
-    let searchCalls = 0;
-    setMemorySearchImpl(async () => {
-      searchCalls += 1;
-      if (searchCalls === 1) {
-        throw new Error("database is not open");
+      const tool = createMemorySearchToolOrThrow({ oneShotCliRun: phase === "cleanup" });
+      const cancelled = executeSearch(tool, {}, controller.signal);
+      await vi.waitFor(() => {
+        if (phase === "search") {
+          expect(firstSignal).toBeInstanceOf(AbortSignal);
+        } else {
+          expect(getMemoryCloseMockCalls()).toBe(1);
+        }
+      });
+      expect(getMemorySearchManagerMockParams()[0]?.purpose === "cli").toBe(phase === "cleanup");
+      controller.abort(abortError);
+      await expect(cancelled).rejects.toBe(abortError);
+      if (phase === "search") {
+        expect(firstSignal?.aborted).toBe(true);
+        expect(firstSignal?.reason).toBe(abortError);
       }
-      return [
-        {
-          path: "MEMORY.md",
-          startLine: 1,
-          endLine: 1,
-          score: 0.9,
-          snippet: "Thread-hidden codename: ORBIT-22.",
-          source: "memory" as const,
-        },
-      ];
-    });
+      setMemoryCloseImpl(async () => {});
+      const retry = await executeSearch(tool, { query: "hello again" });
+      expect(retry.details).toMatchObject({
+        results: [expect.objectContaining({ path: "MEMORY.md" })],
+      });
+      expect(searchCalls).toBe(2);
+    },
+  );
 
-    const tool = createMemorySearchToolOrThrow({
-      config: {
-        agents: { list: [{ id: "main", default: true }] },
-        memory: { citations: "off" },
-      },
-      oneShotCliRun: true,
-    });
-    const result = await tool.execute("closed-db-cli", { query: "hidden thread codename" });
-
-    expect((result.details as { results?: Array<{ path: string }> }).results).toEqual([
-      {
-        corpus: "memory",
-        path: "MEMORY.md",
-        startLine: 1,
-        endLine: 1,
-        score: 0.9,
-        snippet: "Thread-hidden codename: ORBIT-22.",
-        source: "memory",
-      },
-    ]);
-    expect(searchCalls).toBe(2);
-    expect(getMemorySearchManagerMockCalls()).toBe(2);
-    expect(getMemorySearchManagerMockParams()).toEqual([
-      expect.objectContaining({ purpose: "cli" }),
-      expect.objectContaining({ purpose: "cli" }),
-    ]);
-    expect(getMemoryCloseMockCalls()).toBe(1);
-  });
-
-  it("forces a sync and retries once when the first search has zero hits", async () => {
-    let searchCalls = 0;
-    setMemorySearchImpl(async () => {
-      searchCalls += 1;
-      if (searchCalls === 1) {
-        return [];
-      }
-      return [
-        {
-          path: "MEMORY.md",
-          startLine: 1,
-          endLine: 1,
-          score: 0.9,
-          snippet: "Thread-hidden codename: ORBIT-22.",
-          source: "memory" as const,
-        },
-      ];
-    });
-
-    const tool = createMemorySearchToolOrThrow({
-      config: {
-        agents: { list: [{ id: "main", default: true }] },
-        memory: { citations: "off" },
-      },
-    });
-    const result = await tool.execute("zero-hit-retry", { query: "hidden thread codename" });
-
-    expect((result.details as { results?: Array<{ path: string }> }).results?.[0]?.path).toBe(
-      "MEMORY.md",
-    );
-    expect(searchCalls).toBe(2);
-  });
-
-  it("returns unavailable metadata when the index identity is paused", async () => {
-    let searchCalls = 0;
-    setMemorySearchImpl(async () => {
-      searchCalls += 1;
-      return [];
-    });
+  it("withholds paused-index hits without starting a tool-owned rebuild", async () => {
     const reason = "index was built for provider openai, expected ollama";
     setMemoryCustomStatus({
-      indexIdentity: {
-        status: "mismatched",
-        reason,
-      },
+      indexIdentity: { status: "mismatched", reason, code: "provider", owner: "configuration" },
     });
-
-    const tool = createMemorySearchToolOrThrow({
-      config: {
-        agents: { list: [{ id: "main", default: true }] },
-        memory: { citations: "off" },
-      },
-    });
-    const result = await tool.execute("paused-index", { query: "hidden thread codename" });
-
-    expectUnavailableMemorySearchDetails(result.details, {
-      error: reason,
-      warning:
-        "Tell the user: memory search is paused because the memory index was built with a different embedding provider/model/settings.",
-      action:
-        "Tell the user to run: openclaw memory status --index or openclaw memory index --force.",
-    });
-    expect(searchCalls).toBe(1);
+    searchHits([hit("MEMORY.md", "memory", "stale result")]);
+    const result = await executeSearch();
+    expect(result.details).toMatchObject({ results: [], unavailable: true, error: reason });
     expect(getMemorySyncMockCalls()).toBe(0);
   });
 
-  it("returns structured search debug metadata for qmd results", async () => {
-    setMemoryBackend("qmd");
-    setMemorySearchImpl(async (opts) => {
-      opts?.onDebug?.({
-        backend: "qmd",
-        configuredMode: opts.qmdSearchModeOverride ?? "query",
-        effectiveMode: "query",
-        fallback: "unsupported-search-flags",
-      });
-      return [
-        {
-          path: "MEMORY.md",
-          startLine: 1,
-          endLine: 2,
-          score: 0.9,
-          snippet: "ramen",
-          source: "memory",
-        },
-      ];
+  it("qualifies results after automatic indexing fails", async () => {
+    setMemoryStatusDirty(true);
+    setMemoryLastSyncError("embedding request timed out");
+    setMemorySearchImpl(async () => []);
+    const result = await executeSearch(
+      createMemorySearchToolOrThrow({ config: { memory: { citations: "off" } } }),
+    );
+    expect(result.details).toMatchObject({
+      results: [],
+      stale: true,
+      warning:
+        "Memory index is stale: embedding request timed out. Search results may be incomplete.",
+      action:
+        "Run: openclaw memory status --index --agent main. Rebuilding may call the configured embedding provider and can incur provider cost.",
     });
-
-    const tool = createMemorySearchToolOrThrow({
-      config: {
-        plugins: {
-          entries: {
-            "active-memory": {
-              config: {
-                qmd: {
-                  searchMode: "search",
-                },
-              },
-            },
-          },
-        },
-        memory: {
-          backend: "qmd",
-          qmd: {
-            searchMode: "query",
-            limits: {
-              maxInjectedChars: 1000,
-            },
-          },
-        },
-      },
-      agentSessionKey: "agent:main:main:active-memory:debug",
-    });
-    const result = await tool.execute("debug", { query: "favorite food" });
-    const details = result.details as {
-      mode?: unknown;
-      debug?: {
-        backend?: unknown;
-        configuredMode?: unknown;
-        effectiveMode?: unknown;
-        fallback?: unknown;
-        hits?: unknown;
-        searchMs?: number;
-      };
-    };
-    expect(details.mode).toBe("query");
-    expect(details.debug?.backend).toBe("qmd");
-    expect(details.debug?.configuredMode).toBe("search");
-    expect(details.debug?.effectiveMode).toBe("query");
-    expect(details.debug?.fallback).toBe("unsupported-search-flags");
-    expect(details.debug?.hits).toBe(1);
-    expect(details.debug?.searchMs).toBeGreaterThanOrEqual(0);
   });
 });
 
 describe("memory_search corpus labels", () => {
-  beforeEach(() => {
-    resetMemoryToolMockState({ searchImpl: async () => [] });
+  beforeEach(() => resetMemoryToolMockState());
+
+  it("backfills a visible bootstrap result when the published chunk count is zero", async () => {
+    const hits = [
+      hit("sessions/missing.jsonl", "sessions", "hidden"),
+      hit("sessions/past-thread.jsonl", "sessions", "visible"),
+    ];
+    const searchImpl = mockSearch(async (options) => hits.slice(0, options?.maxResults));
+    setMemorySourceCounts([]);
+    const tool = corpusTool(
+      { sources: ["sessions"], rememberAcrossConversations: true },
+      {},
+      "all",
+    );
+    const result = await executeSearch(tool, { corpus: "sessions", maxResults: 1 });
+    expect(searchImpl).toHaveBeenCalledWith(expect.objectContaining({ maxResults: 200 }));
+    expect(result.details).toMatchObject({ results: [{ snippet: "visible" }] });
   });
 
-  it("uses explicit plugin context agent over synthetic active-memory session keys", async () => {
-    const tool = createMemorySearchToolOrThrow({
-      config: asOpenClawConfig({
-        agents: {
-          list: [
-            { id: "main", default: true, memorySearch: { enabled: false } },
-            { id: "recall", memorySearch: { enabled: true } },
-          ],
-        },
-      }),
-      agentId: "recall",
-      agentSessionKey: "explicit:user-session:active-memory:abc123",
-    });
-
-    await tool.execute("recall", { query: "favorite food" });
-
-    expect(getMemorySearchManagerMockParams().at(-1)?.agentId).toBe("recall");
-  });
-
-  it("re-resolves config when executing a previously created tool", async () => {
-    const startupConfig = asOpenClawConfig({
-      agents: {
-        defaults: {
-          memorySearch: {
-            provider: "ollama",
-            model: "nomic-embed-text",
-          },
-        },
-        list: [{ id: "main", default: true }],
-      },
-      memory: {
-        backend: "builtin",
-      },
-    });
-    const patchedConfig = asOpenClawConfig({
-      agents: {
-        defaults: {
-          memorySearch: {
-            provider: "openai",
-            model: "text-embedding-3-small",
-          },
-        },
-        list: [{ id: "main", default: true }],
-      },
-      memory: {
-        backend: "builtin",
-      },
-    });
-    let liveConfig = startupConfig;
-    const tool = createMemorySearchTool({
-      config: startupConfig,
-      getConfig: () => liveConfig,
-    });
-    if (!tool) {
-      throw new Error("tool missing");
-    }
-
-    liveConfig = patchedConfig;
-    await tool.execute("patched-config", { query: "provider switch" });
-
-    expect(getMemorySearchManagerMockConfigs()).toEqual([patchedConfig]);
-  });
-
-  it("preserves source corpus labels for memory and session transcript hits", async () => {
-    setMemorySearchImpl(async () => [
-      {
-        path: "MEMORY.md",
-        startLine: 3,
-        endLine: 4,
-        score: 0.95,
-        snippet: "Durable memory note",
-        source: "memory" as const,
-      },
-      {
-        path: "sessions/thread-1.jsonl",
-        startLine: 1,
-        endLine: 2,
-        score: 0.9,
-        snippet: "Thread transcript note",
-        source: "sessions" as const,
-      },
+  it("does not let corpus=all broaden implicitly indexed recall transcripts", async () => {
+    const searchImpl = searchHits([
+      hit("sessions/private-group.jsonl", "sessions", "private transcript", 0.95),
     ]);
+    const tool = corpusTool({ rememberAcrossConversations: true }, {}, "all");
 
-    const tool = createMemorySearchToolOrThrow({
-      config: {
-        agents: { list: [{ id: "main", default: true }] },
-        memory: { citations: "off" },
-        tools: { sessions: { visibility: "all" } },
-      },
-      agentSessionKey: "agent:main:main",
+    const result = await executeSearch(tool, { corpus: "all" });
+    expect(searchImpl).toHaveBeenCalledWith(expect.objectContaining({ sources: ["memory"] }));
+    expect(result.details).toHaveProperty("results", []);
+  });
+
+  it("does not expose recall-only sessions to ordinary search", async () => {
+    const tool = corpusTool({ rememberAcrossConversations: true }, {}, "all");
+
+    const result = await executeSearch(tool, { corpus: "sessions" });
+    expect(result.details).toMatchObject({
+      error: "Session transcript search is not enabled.",
+      warning: "Session transcript search is unavailable for this agent.",
+      action: expect.stringContaining(
+        "If an exact session-history capability is available for this run",
+      ),
     });
-    const result = await tool.execute("mixed", { query: "thread note" });
-    const details = result.details as { results: Array<{ corpus: string; path: string }> };
+    expect((result.details as { action?: string }).action).not.toContain("sessions_search");
+    expect(getMemorySearchManagerMockCalls()).toBe(0);
+  });
 
-    expect(details.results).toEqual([
+  it.each([
+    { visibility: "agent" as const, visible: true },
+    { visibility: "self" as const, visible: false },
+  ])(
+    "keeps migrated isolated-DM reset recall within visibility=$visibility",
+    async ({ visibility, visible }) => {
+      const searchImpl = searchHits([
+        hit(
+          "sessions/main/past-thread.jsonl.reset.2026-08-23T07-10-59.000Z",
+          "sessions",
+          "pre-reset fact",
+        ),
+      ]);
+      const tool = corpusTool(
+        {
+          rememberAcrossConversations: false,
+          experimental: { sessionMemory: true },
+          sources: ["memory", "sessions"],
+        },
+        {},
+        visibility,
+        "per-channel-peer",
+      );
+
+      const result = await executeSearch(tool, { corpus: "sessions" });
+      expect(searchImpl).toHaveBeenCalledWith(expect.objectContaining({ sources: ["sessions"] }));
+      expect(result.details).toHaveProperty(
+        "results",
+        visible ? [expect.objectContaining({ corpus: "sessions", snippet: "pre-reset fact" })] : [],
+      );
+    },
+  );
+
+  it.each([
+    { corpus: "sessions" as const, path: "sessions/past-thread.jsonl" },
+    { corpus: "configured" as const, path: "MEMORY.md" },
+  ])("restricts trusted $corpus recall to its authorized source", async ({ corpus, path }) => {
+    const searchImpl = searchHits([
+      hit("MEMORY.md", "memory", "Shared memory note", 0.95),
+      hit("sessions/past-thread.jsonl", "sessions", "Prior private conversation", 0.9),
+    ]);
+    const tool = corpusTool(
+      {},
       {
-        corpus: "memory",
-        path: "MEMORY.md",
-        startLine: 3,
-        endLine: 4,
-        score: 0.95,
-        snippet: "Durable memory note",
-        source: "memory",
+        conversationRecall: recall(corpus),
+        ...(corpus === "sessions"
+          ? { agentSessionKey: "agent:main:main:active-memory:abcdef123456" }
+          : {}),
       },
-      {
-        corpus: "sessions",
-        path: "sessions/thread-1.jsonl",
-        startLine: 1,
-        endLine: 2,
-        score: 0.9,
-        snippet: "Thread transcript note",
-        source: "sessions",
-      },
+    );
+    const result = await executeSearch(tool, { corpus: "memory" });
+    const source = corpus === "configured" ? "memory" : corpus;
+    expect(searchImpl).toHaveBeenCalledWith(expect.objectContaining({ sources: [source] }));
+    expect(result.details).toHaveProperty("results", [
+      expect.objectContaining({ corpus: source, path }),
     ]);
   });
 });

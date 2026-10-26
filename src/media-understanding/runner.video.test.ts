@@ -1,11 +1,18 @@
-// Video runner tests cover provider request wiring, auth/config precedence, and
-// provider output handling for video attachments.
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.js";
-import { withTempDir } from "../test-helpers/temp-dir.js";
-import { withEnvAsync } from "../test-utils/env.js";
+import type { ModelDefinitionConfig, ModelProviderConfig } from "../config/types.models.js";
+import type { MediaUnderstandingModelConfig } from "../config/types.tools.js";
+import { mediaModels } from "./media-config.test-support.js";
+import { runMediaFixture } from "./runner-case.test-support.js";
+import { createMediaAttachmentCache, normalizeMediaAttachments } from "./runner.attachments.js";
 import { runCapability } from "./runner.js";
 import { withVideoFixture } from "./runner.test-utils.js";
+import type { MediaUnderstandingProvider } from "./types.js";
+
+const nativeModel = { provider: "lmstudio", model: "video-model" };
+const handoff = "handed-to-native-vision";
+type RunParams = Parameters<typeof runCapability>[0];
 
 vi.mock("../media/channel-inbound-roots.js", () => ({
   resolveChannelInboundAttachmentRoots: () => undefined,
@@ -29,213 +36,133 @@ vi.mock("../agents/model-auth.js", async () => {
   return createAvailableModelAuthMockModule();
 });
 
-type CapabilityResult = Awaited<ReturnType<typeof runCapability>>;
-
-function requireCapabilityOutput(result: CapabilityResult, index: number) {
-  const output = result.outputs[index];
-  if (!output) {
-    throw new Error(`expected media-understanding output at index ${index}`);
-  }
-  return output;
+function videoConfig(models?: MediaUnderstandingModelConfig[]): OpenClawConfig {
+  return {
+    models: {
+      providers: {
+        moonshot: { baseUrl: "https://video.example/v1", apiKey: "test-key", models: [] },
+      },
+    },
+    tools: { media: { models, video: { enabled: true } } },
+  };
 }
 
-describe("runCapability video provider wiring", () => {
-  it("merges video baseUrl and headers with entry precedence", async () => {
-    let seenBaseUrl: string | undefined;
-    let seenHeaders: Record<string, string> | undefined;
+function nativeVideoConfig(
+  input: ModelDefinitionConfig["input"] = ["text", "video"],
+  api: ModelProviderConfig["api"] = "openai-completions",
+): OpenClawConfig {
+  return {
+    models: mediaModels("lmstudio", "video-model", input, {
+      api,
+      baseUrl: "http://127.0.0.1:1234/v1",
+    }),
+  };
+}
 
-    await withTempDir({ prefix: "openclaw-video-auth-" }, async (isolatedAgentDir) => {
-      await withVideoFixture("openclaw-video-merge", async ({ ctx, media, cache }) => {
-        const cfg = {
-          models: {
-            providers: {
-              moonshot: {
-                auth: "api-key",
-                apiKey: "provider-key", // pragma: allowlist secret
-                baseUrl: "https://provider.example/v1",
-                headers: { "X-Provider": "1" },
-                models: [],
-              },
-            },
-          },
-          tools: {
-            media: {
-              video: {
-                enabled: true,
-                baseUrl: "https://config.example/v1",
-                headers: { "X-Config": "2" },
-                models: [
-                  {
-                    provider: "moonshot",
-                    model: "kimi-k2.5",
-                    baseUrl: "https://entry.example/v1",
-                    headers: { "X-Entry": "3" },
-                  },
-                ],
-              },
-            },
-          },
-        } as unknown as OpenClawConfig;
+function runVideo(
+  provider: MediaUnderstandingProvider,
+  cfg: OpenClawConfig,
+  activeModel?: RunParams["activeModel"],
+) {
+  return runMediaFixture("video", "openclaw-video", {
+    cfg,
+    providerRegistry: new Map([[provider.id, provider]]),
+    activeModel,
+  });
+}
 
-        const result = await runCapability({
-          capability: "video",
-          cfg,
-          ctx,
-          agentDir: isolatedAgentDir,
-          attachments: cache,
-          media,
-          providerRegistry: new Map([
-            [
-              "moonshot",
-              {
-                id: "moonshot",
-                capabilities: ["video"],
-                describeVideo: async (req) => {
-                  seenBaseUrl = req.baseUrl;
-                  seenHeaders = req.headers;
-                  return { text: "video ok", model: req.model };
-                },
-              },
-            ],
-          ]),
-        });
+async function runNativeVideo(ctx: RunParams["ctx"]) {
+  const media = normalizeMediaAttachments(ctx);
+  const cache = createMediaAttachmentCache(media);
+  try {
+    return await runCapability({
+      capability: "video",
+      cfg: nativeVideoConfig(),
+      ctx,
+      attachments: cache,
+      media,
+      providerRegistry: new Map(),
+      activeModel: nativeModel,
+    });
+  } finally {
+    await cache.cleanup();
+  }
+}
 
-        const output = requireCapabilityOutput(result, 0);
-        expect(output.text).toBe("video ok");
-        expect(output.provider).toBe("moonshot");
-        expect(seenBaseUrl).toBe("https://entry.example/v1");
-        expect(seenHeaders).toEqual({
-          "X-Provider": "1",
-          "X-Config": "2",
-          "X-Entry": "3",
+describe("runCapability video", () => {
+  it.each<[string, OpenClawConfig, string, ModelProviderConfig["api"]?]>([
+    ["configured video", nativeVideoConfig(), handoff],
+    ["text-only model", nativeVideoConfig(["text"]), "no-model"],
+    ["another API", nativeVideoConfig(["text", "video"], "openai-responses"), "no-model"],
+    ["prepared completions", nativeVideoConfig(), handoff, "openai-completions"],
+    ["prepared responses", nativeVideoConfig(), "no-model", "openai-responses"],
+  ])("native video handoff: %s", async (_name, cfg, kind, api) => {
+    if (api) {
+      delete expectDefined(cfg.models?.providers?.lmstudio, "provider").api;
+    }
+    const result = await runVideo({ id: "lmstudio" }, cfg, {
+      ...nativeModel,
+      ...(api ? { api } : {}),
+    });
+    expect(result.outputs).toEqual([]);
+    expect(result.decision.attachmentDispositions).toEqual({ 0: { kind } });
+  });
+
+  it("hands off every local video despite the default understanding attachment limit", async () => {
+    await withVideoFixture("openclaw-video-first", async (first) => {
+      await withVideoFixture("openclaw-video-second", async (second) => {
+        const ctx = { media: [...first.ctx.media, ...second.ctx.media] };
+        const result = await runNativeVideo(ctx);
+        expect(result.decision.attachmentDispositions).toEqual({
+          0: { kind: handoff },
+          1: { kind: handoff },
         });
       });
     });
   });
 
-  it("auto-selects moonshot for video when google is unavailable", async () => {
-    await withTempDir({ prefix: "openclaw-video-agent-" }, async (isolatedAgentDir) => {
-      await withEnvAsync(
+  it("does not claim native handoff for a remote video URL", async () => {
+    const result = await runNativeVideo({
+      media: [{ url: "https://cdn.example.test/video.mp4", contentType: "video/mp4" }],
+    });
+    expect(result.decision.attachmentDispositions).toEqual({
+      0: { kind: "failed", reason: "remote-url video is not natively deliverable" },
+    });
+  });
+
+  const prefix = "v".repeat(79);
+  const text = `${prefix}${String.fromCodePoint(0x1f600)}tail`;
+  it.each([
+    [
+      videoConfig([{ provider: "moonshot", model: "kimi-k2.5", maxChars: 80 }]),
+      undefined,
+      "kimi-k2.5",
+      prefix,
+    ],
+    [videoConfig(), { provider: "moonshot" }, undefined, text],
+  ] as const)(
+    "resolves video models and output limits: %#",
+    async (cfg, activeModel, model, expectedText) => {
+      let seenModel: string | undefined;
+      const result = await runVideo(
         {
-          GEMINI_API_KEY: undefined,
-          GOOGLE_API_KEY: undefined,
-          MOONSHOT_API_KEY: undefined,
-          OPENCLAW_AGENT_DIR: isolatedAgentDir,
+          id: "moonshot",
+          capabilities: ["video"],
+          describeVideo: async (req) => {
+            seenModel = req.model;
+            return { text, model: req.model ?? "provider-default" };
+          },
         },
-        async () => {
-          await withVideoFixture("openclaw-video-auto-moonshot", async ({ ctx, media, cache }) => {
-            const cfg = {
-              models: {
-                providers: {
-                  moonshot: {
-                    auth: "api-key",
-                    apiKey: "moonshot-key", // pragma: allowlist secret
-                    models: [],
-                  },
-                },
-              },
-              tools: {
-                media: {
-                  video: {
-                    enabled: true,
-                  },
-                },
-              },
-            } as unknown as OpenClawConfig;
-
-            const result = await runCapability({
-              capability: "video",
-              cfg,
-              ctx,
-              agentDir: isolatedAgentDir,
-              attachments: cache,
-              media,
-              providerRegistry: new Map([
-                [
-                  "google",
-                  {
-                    id: "google",
-                    capabilities: ["video"],
-                    describeVideo: async () => ({ text: "google" }),
-                  },
-                ],
-                [
-                  "moonshot",
-                  {
-                    id: "moonshot",
-                    capabilities: ["video"],
-                    describeVideo: async () => ({ text: "moonshot", model: "kimi-k2.5" }),
-                  },
-                ],
-              ]),
-            });
-
-            expect(result.decision.outcome).toBe("success");
-            const output = requireCapabilityOutput(result, 0);
-            expect(output.provider).toBe("moonshot");
-            expect(output.text).toBe("moonshot");
-          });
-        },
+        cfg,
+        activeModel,
       );
-    });
-  });
-
-  it("does not use provider api config as video auth modelApi", async () => {
-    const modelAuth = await import("../agents/model-auth.js");
-    const resolveApiKeyForProvider = vi.mocked(modelAuth.resolveApiKeyForProvider);
-    resolveApiKeyForProvider.mockClear();
-
-    await withTempDir({ prefix: "openclaw-video-provider-api-" }, async (isolatedAgentDir) => {
-      await withVideoFixture("openclaw-video-provider-api", async ({ ctx, media, cache }) => {
-        let seenApiKey: string | undefined;
-        const cfg = {
-          models: {
-            providers: {
-              openai: {
-                api: "openai-responses",
-                models: [],
-              },
-            },
-          },
-          tools: {
-            media: {
-              video: {
-                enabled: true,
-                models: [{ provider: "openai", model: "video-model" }],
-              },
-            },
-          },
-        } as unknown as OpenClawConfig;
-
-        const result = await runCapability({
-          capability: "video",
-          cfg,
-          ctx,
-          agentDir: isolatedAgentDir,
-          attachments: cache,
-          media,
-          providerRegistry: new Map([
-            [
-              "openai",
-              {
-                id: "openai",
-                capabilities: ["video"],
-                describeVideo: async (req) => {
-                  seenApiKey = req.apiKey;
-                  return { text: "video ok", model: req.model };
-                },
-              },
-            ],
-          ]),
-        });
-
-        expect(result.decision.outcome).toBe("success");
-        expect(seenApiKey).toBe("test-key");
+      expect(result.decision.outcome).toBe("success");
+      expect(result.outputs[0]).toMatchObject({
+        provider: "moonshot",
+        model: model ?? "provider-default",
+        text: expectedText,
       });
-    });
-
-    const firstCall = resolveApiKeyForProvider.mock.calls[0]?.[0];
-    expect(firstCall?.provider).toBe("openai");
-    expect(firstCall?.modelApi).toBeUndefined();
-  });
+      expect(seenModel).toBe(model);
+    },
+  );
 });

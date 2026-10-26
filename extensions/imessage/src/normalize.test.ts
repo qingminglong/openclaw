@@ -1,4 +1,3 @@
-// Imessage tests cover normalize plugin behavior.
 import { describe, expect, it } from "vitest";
 import { looksLikeIMessageTargetId, normalizeIMessageMessagingTarget } from "./normalize.js";
 
@@ -7,8 +6,15 @@ describe("normalizeIMessageMessagingTarget", () => {
     expect(normalizeIMessageMessagingTarget("   ")).toBeUndefined();
   });
 
-  it("preserves service prefixes for handles", () => {
-    expect(normalizeIMessageMessagingTarget("sms:+1 (555) 222-3333")).toBe("sms:+15552223333");
+  it.each([
+    ["sms:auto:Alice Smith", undefined],
+    ["auto:C0AG22RN7L3", "auto:C0AG22RN7L3"],
+  ] as const)("preserves the service and contact boundary for %s", (input, expected) => {
+    expect(normalizeIMessageMessagingTarget(input)).toBe(expected);
+  });
+
+  it("rejects unqualified provider identifiers instead of coercing them into phone numbers", () => {
+    expect(normalizeIMessageMessagingTarget("C0AG22RN7L3")).toBeUndefined();
   });
 
   it("drops service prefixes for chat targets", () => {
@@ -25,5 +31,6 @@ describe("looksLikeIMessageTargetId", () => {
     expect(looksLikeIMessageTargetId("user@example.com")).toBe(true);
     expect(looksLikeIMessageTargetId("+15555550123")).toBe(true);
     expect(looksLikeIMessageTargetId("")).toBe(false);
+    expect(looksLikeIMessageTargetId("7d5297154d5f436d83dbbdf03fcc8fdd")).toBe(true);
   });
 });

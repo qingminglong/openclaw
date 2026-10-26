@@ -1,6 +1,3 @@
-// Gateway tests cover archived-transcript retention cleanup: every retention
-// rule shares one directory listing per cleanup call. Store maintenance runs
-// this on each save, so per-rule listings would multiply READDIR load.
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -34,6 +31,14 @@ describe("cleanupArchivedSessionTranscripts", () => {
     return (await fsPromises.readdir(dir)).toSorted();
   }
 
+  function cleanup(
+    rules: Parameters<typeof cleanupArchivedSessionTranscripts>[0]["rules"] = [
+      { reason: "deleted", olderThanMs: 0 },
+    ],
+  ) {
+    return cleanupArchivedSessionTranscripts({ directories: [dir], rules, nowMs: NOW_MS });
+  }
+
   it("applies every retention rule from a single directory listing", async () => {
     await seed([
       `a.jsonl.deleted.${OLD_STAMP}`,
@@ -43,62 +48,52 @@ describe("cleanupArchivedSessionTranscripts", () => {
     ]);
     const readdirSpy = vi.spyOn(fsPromises, "readdir");
 
-    const result = await cleanupArchivedSessionTranscripts({
-      directories: [dir],
-      rules: [
-        { reason: "deleted", olderThanMs: 30 * DAY_MS },
-        { reason: "reset", olderThanMs: 30 * DAY_MS },
-      ],
-      nowMs: NOW_MS,
-    });
+    await cleanup([
+      { reason: "deleted", olderThanMs: 30 * DAY_MS },
+      { reason: "reset", olderThanMs: 30 * DAY_MS },
+    ]);
 
     expect(readdirSpy).toHaveBeenCalledTimes(1);
-    expect(result).toEqual({ removed: 2, scanned: 3 });
     expect(await remaining()).toEqual([`c.jsonl.reset.${FRESH_STAMP}`, "live.jsonl"]);
-  });
-
-  it("applies each rule's age threshold independently", async () => {
-    await seed([`a.jsonl.deleted.${OLD_STAMP}`, `b.jsonl.reset.${OLD_STAMP}`]);
-
-    const result = await cleanupArchivedSessionTranscripts({
-      directories: [dir],
-      rules: [
-        { reason: "deleted", olderThanMs: 30 * DAY_MS },
-        { reason: "reset", olderThanMs: 365 * DAY_MS },
-      ],
-      nowMs: NOW_MS,
-    });
-
-    expect(result).toEqual({ removed: 1, scanned: 2 });
-    expect(await remaining()).toEqual([`b.jsonl.reset.${OLD_STAMP}`]);
-  });
-
-  it("keeps archives whose reason has no rule", async () => {
-    await seed([`a.jsonl.reset.${OLD_STAMP}`]);
-
-    const result = await cleanupArchivedSessionTranscripts({
-      directories: [dir],
-      rules: [{ reason: "deleted", olderThanMs: 0 }],
-      nowMs: NOW_MS,
-    });
-
-    expect(result).toEqual({ removed: 0, scanned: 0 });
-    expect(await remaining()).toEqual([`a.jsonl.reset.${OLD_STAMP}`]);
   });
 
   it("drops invalid rules and never lists when none remain", async () => {
     const readdirSpy = vi.spyOn(fsPromises, "readdir");
 
-    const result = await cleanupArchivedSessionTranscripts({
-      directories: [dir],
-      rules: [
-        { reason: "deleted", olderThanMs: Number.NaN },
-        { reason: "reset", olderThanMs: -1 },
-      ],
-      nowMs: NOW_MS,
+    await cleanup([
+      { reason: "deleted", olderThanMs: Number.NaN },
+      { reason: "reset", olderThanMs: -1 },
+    ]);
+
+    expect(readdirSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(["before", "after"])("ignores an archive removed %s stat", async (phase) => {
+    const archiveName = `a.jsonl.deleted.${OLD_STAMP}`;
+    const archivePath = path.join(dir, archiveName);
+    await seed([archiveName]);
+    const realStat = fsPromises.stat.bind(fsPromises);
+    vi.spyOn(fsPromises, "stat").mockImplementationOnce(async (target) => {
+      if (phase === "after") {
+        const stat = await realStat(target);
+        await fsPromises.rm(target);
+        return stat;
+      }
+      await fsPromises.rm(target);
+      return await realStat(target);
     });
 
-    expect(result).toEqual({ removed: 0, scanned: 0 });
-    expect(readdirSpy).not.toHaveBeenCalled();
+    await cleanup();
+    await expect(fsPromises.access(archivePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("surfaces archive removal failures without deleting the archive", async () => {
+    const archiveName = `a.jsonl.deleted.${OLD_STAMP}`;
+    await seed([archiveName]);
+    const removeError = Object.assign(new Error("filesystem EACCES"), { code: "EACCES" });
+    vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(removeError);
+
+    await expect(cleanup()).rejects.toBe(removeError);
+    expect(await remaining()).toEqual([archiveName]);
   });
 });

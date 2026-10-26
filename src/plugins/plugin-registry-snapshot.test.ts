@@ -1,35 +1,40 @@
-// Covers stable plugin registry snapshot generation.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resolveConfigWidePluginMetadataSnapshot } from "../config/io.plugin-metadata.js";
+import { captureRuntimeConfig } from "../config/runtime-source-projection.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import {
-  clearCurrentPluginMetadataSnapshot,
-  setCurrentPluginMetadataSnapshot,
-} from "./current-plugin-metadata-snapshot.js";
+import { setCurrentPluginMetadataSnapshot } from "./current-plugin-metadata.test-support.js";
 import type { PluginCandidate } from "./discovery.js";
 import { loadInstalledPluginIndexInstallRecordsSync } from "./installed-plugin-index-records.js";
-import { writePersistedInstalledPluginIndexSync } from "./installed-plugin-index-store.js";
+import { writePersistedInstalledPluginIndex } from "./installed-plugin-index-store-write.js";
 import {
   loadInstalledPluginIndex,
   resolveInstalledPluginIndexPolicyHash,
   type InstalledPluginIndex,
 } from "./installed-plugin-index.js";
-import {
-  markRetainedManagedNpmInstall,
-  RETAINED_MANAGED_NPM_INSTALL_MARKER,
-} from "./managed-npm-retention.js";
-import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
+import { markRetainedManagedNpmInstall } from "./managed-npm-retention.js";
+import { loadPluginManifestRegistryForInstalledIndex } from "./manifest-registry-installed.js";
+import { clearPluginMetadataLifecycleCaches } from "./plugin-metadata-lifecycle.js";
+import { loadPluginMetadataSnapshot } from "./plugin-metadata-snapshot.js";
 import { loadPluginRegistrySnapshotWithMetadata } from "./plugin-registry-snapshot.js";
+import { createColdPluginFixture } from "./test-helpers/cold-plugin-fixtures.js";
 import { cleanupTrackedTempDirs, makeTrackedTempDir } from "./test-helpers/fs-fixtures.js";
+import { mockLinuxMountInfo } from "./test-helpers/linux-mountinfo.js";
 import { writeManagedNpmPlugin } from "./test-helpers/managed-npm-plugin.js";
+import { writeRegistryPackagePlugin } from "./test-helpers/plugin-registry-snapshot.js";
 
 const tempDirs: string[] = [];
 
+function writeJson(filePath: string, data: unknown) {
+  fs.writeFileSync(filePath, JSON.stringify(data), "utf8");
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
-  clearCurrentPluginMetadataSnapshot();
+  clearPluginMetadataLifecycleCaches();
   cleanupTrackedTempDirs(tempDirs);
 });
 
@@ -46,90 +51,90 @@ function createHermeticEnv(rootDir: string): NodeJS.ProcessEnv {
   };
 }
 
-function writeManifestlessClaudeBundle(rootDir: string) {
-  fs.mkdirSync(path.join(rootDir, "skills"), { recursive: true });
-  fs.writeFileSync(path.join(rootDir, "skills", "SKILL.md"), "# Workspace skill\n", "utf8");
+function isolatedRegistry() {
+  const tempRoot = makeTempDir();
+  return {
+    tempRoot,
+    stateDir: path.join(tempRoot, "state"),
+    env: { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" },
+  };
 }
 
-function writePackagePlugin(rootDir: string, options: { configPaths?: readonly string[] } = {}) {
-  fs.mkdirSync(rootDir, { recursive: true });
-  fs.writeFileSync(path.join(rootDir, "index.ts"), "export default { register() {} };\n", "utf8");
-  fs.writeFileSync(
-    path.join(rootDir, "openclaw.plugin.json"),
-    JSON.stringify({
-      id: "demo",
-      name: "Demo",
-      description: "one",
-      configSchema: { type: "object" },
-      ...(options.configPaths ? { activation: { onConfigPaths: options.configPaths } } : {}),
-    }),
-    "utf8",
-  );
-  fs.writeFileSync(
-    path.join(rootDir, "package.json"),
-    JSON.stringify({ name: "demo", version: "1.0.0" }),
-    "utf8",
-  );
+function configuredRegistry(disabled = false) {
+  const fixture = isolatedRegistry();
+  const rootDir = path.join(fixture.tempRoot, "workspace");
+  const config = {
+    plugins: {
+      load: { paths: [rootDir] },
+      ...(disabled ? { entries: { demo: { enabled: false } } } : {}),
+    },
+  };
+  return { ...fixture, rootDir, config };
 }
 
-function writeBundledPlugin(rootDir: string, pluginId: string, entryPath: string) {
+function bundledRegistry() {
+  const tempRoot = makeTempDir();
+  const packageRoot = path.join(tempRoot, "openclaw");
+  const bundledRoot = path.join(packageRoot, "dist", "extensions");
+  const sourceRoot = path.join(packageRoot, "extensions");
+  const stateDir = path.join(tempRoot, "state");
+  const env: NodeJS.ProcessEnv = {
+    ...createHermeticEnv(tempRoot),
+    OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
+  };
+  return { tempRoot, packageRoot, bundledRoot, sourceRoot, stateDir, env };
+}
+
+function disabledBundledRegistry() {
+  const tempRoot = makeTempDir();
+  const bundledRoot = path.join(tempRoot, "dist", "extensions");
+  const pluginRoot = path.join(bundledRoot, "whatsapp");
+  const stateDir = path.join(tempRoot, "state");
+  const env = { ...createHermeticEnv(tempRoot), OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot };
+  const config = { plugins: { entries: { whatsapp: { enabled: false } } } };
+  const contractPath = path.join(pluginRoot, "doctor-contract-api.ts");
+  writeBundledPlugin(pluginRoot, "whatsapp", "index.js");
+  fs.writeFileSync(contractPath, "export const stateMigrations = [];\n", "utf8");
+  return { pluginRoot, stateDir, env, config, contractPath };
+}
+
+function writeCheckout(packageRoot: string) {
+  fs.mkdirSync(path.join(packageRoot, "src"), { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, ".git"), "gitdir: /tmp/mock\n", "utf8");
+  fs.writeFileSync(path.join(packageRoot, "pnpm-workspace.yaml"), "packages: []\n", "utf8");
+}
+
+function writeBundledPlugin(
+  rootDir: string,
+  pluginId: string,
+  entryPath: string,
+  build?: Record<string, unknown>,
+) {
   fs.mkdirSync(rootDir, { recursive: true });
   fs.writeFileSync(path.join(rootDir, entryPath), "export default { register() {} };\n", "utf8");
-  fs.writeFileSync(
-    path.join(rootDir, "openclaw.plugin.json"),
-    JSON.stringify({
-      id: pluginId,
-      name: pluginId,
-      description: pluginId,
-      configSchema: { type: "object" },
-    }),
-    "utf8",
-  );
-  fs.writeFileSync(
-    path.join(rootDir, "package.json"),
-    JSON.stringify({
-      name: `@openclaw/${pluginId}`,
-      version: "1.0.0",
-      openclaw: { extensions: [`./${entryPath}`] },
-    }),
-    "utf8",
-  );
-}
-
-function mockLinuxMountInfo(mountPoints: readonly string[]) {
-  const originalReadFileSync = fs.readFileSync;
-  return vi.spyOn(fs, "readFileSync").mockImplementation((filePath, options) => {
-    if (filePath === "/proc/self/mountinfo") {
-      return mountPoints
-        .map(
-          (mountPoint, index) => `${100 + index} 99 0:${index} / ${mountPoint} rw - tmpfs tmpfs rw`,
-        )
-        .join("\n");
-    }
-    return originalReadFileSync(filePath, options as never) as never;
+  writeJson(path.join(rootDir, "openclaw.plugin.json"), {
+    id: pluginId,
+    configSchema: { type: "object" },
+  });
+  writeJson(path.join(rootDir, "package.json"), {
+    name: `@openclaw/${pluginId}`,
+    version: "1.0.0",
+    openclaw: {
+      extensions: [`./${entryPath}`],
+      ...(build ? { build } : {}),
+    },
   });
 }
 
 function createCandidate(rootDir: string, pluginId = "demo"): PluginCandidate {
   fs.mkdirSync(rootDir, { recursive: true });
   fs.writeFileSync(path.join(rootDir, "index.ts"), "export default { register() {} };\n", "utf8");
-  fs.writeFileSync(
-    path.join(rootDir, "openclaw.plugin.json"),
-    JSON.stringify({
-      id: pluginId,
-      name: pluginId,
-      description: pluginId,
-      configSchema: { type: "object" },
-      providers: [pluginId],
-    }),
-    "utf8",
-  );
-  return {
-    idHint: pluginId,
-    source: path.join(rootDir, "index.ts"),
-    rootDir,
-    origin: "global",
-  };
+  writeJson(path.join(rootDir, "openclaw.plugin.json"), {
+    id: pluginId,
+    configSchema: { type: "object" },
+    providers: [pluginId],
+  });
+  return { idHint: pluginId, source: path.join(rootDir, "index.ts"), rootDir, origin: "global" };
 }
 
 function replaceFilePreservingSizeAndMtime(filePath: string, contents: string) {
@@ -145,311 +150,172 @@ function fileHash(filePath: string): string {
 
 function fileSignature(filePath: string) {
   const stat = fs.statSync(filePath);
-  return {
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    ctimeMs: stat.ctimeMs,
-  };
-}
-
-function createManifestlessClaudeBundleIndex(params: {
-  rootDir: string;
-  env: NodeJS.ProcessEnv;
-}): InstalledPluginIndex {
-  return loadInstalledPluginIndex({
-    config: {
-      plugins: {
-        load: { paths: [params.rootDir] },
-      },
-    },
-    env: params.env,
-  });
+  return { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
 }
 
 function expectDiagnosticsContainCode(diagnostics: readonly { code?: unknown }[], code: string) {
   expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain(code);
 }
 
-function expectDiagnosticsContainSource(
-  diagnostics: readonly { source?: unknown }[],
-  source: string,
-) {
-  expect(diagnostics.map((diagnostic) => diagnostic.source)).toContain(source);
-}
-
-function expectDiagnosticsDoNotContainSource(
-  diagnostics: readonly { source?: unknown }[],
-  source: string,
-) {
-  expect(diagnostics.map((diagnostic) => diagnostic.source)).not.toContain(source);
-}
-
 function requirePluginRecord(
   plugins: InstalledPluginIndex["plugins"],
   pluginId: string,
 ): InstalledPluginIndex["plugins"][number] {
-  const plugin = plugins.find((candidate) => candidate.pluginId === pluginId);
-  if (!plugin) {
-    throw new Error(`expected plugin ${pluginId}`);
-  }
-  return plugin;
+  return expectDefined(
+    plugins.find((candidate) => candidate.pluginId === pluginId),
+    `expected plugin ${pluginId}`,
+  );
+}
+
+function persistFirstPlugin(
+  index: InstalledPluginIndex,
+  stateDir: string,
+  overrides: Partial<InstalledPluginIndex["plugins"][number]>,
+) {
+  const [plugin, ...rest] = index.plugins;
+  return writePersistedInstalledPluginIndex(
+    {
+      ...index,
+      plugins: [{ ...expectDefined(plugin, "expected test plugin"), ...overrides }, ...rest],
+    },
+    { stateDir },
+  );
+}
+
+function expectPersisted(result: ReturnType<typeof loadPluginRegistrySnapshotWithMetadata>) {
+  expect(result.source).toBe("persisted");
+  expect(result.diagnostics).toStrictEqual([]);
+}
+
+function expectStale(result: ReturnType<typeof loadPluginRegistrySnapshotWithMetadata>) {
+  expect(result.source).toBe("derived");
+  expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
 }
 
 function dropStartupConfigPaths(
   plugin: InstalledPluginIndex["plugins"][number],
 ): InstalledPluginIndex["plugins"][number] {
-  return {
-    ...plugin,
-    startup: {
-      sidecar: plugin.startup.sidecar,
-      memory: plugin.startup.memory,
-      deferConfiguredChannelFullLoadUntilAfterListen:
-        plugin.startup.deferConfiguredChannelFullLoadUntilAfterListen,
-      agentHarnesses: plugin.startup.agentHarnesses,
-    },
-  };
+  const { configPaths: _configPaths, ...startup } = plugin.startup;
+  return { ...plugin, startup };
 }
 
 describe("loadPluginRegistrySnapshotWithMetadata", () => {
-  it("reuses a compatible current metadata snapshot", () => {
-    const env = createHermeticEnv(makeTempDir());
-    const config = {};
-    const workspaceDir = path.join(makeTempDir(), "workspace");
-    const policyHash = resolveInstalledPluginIndexPolicyHash(config);
-    const index: InstalledPluginIndex = {
-      version: 1,
-      hostContractVersion: "test",
-      compatRegistryVersion: "test",
-      migrationVersion: 1,
-      policyHash,
-      generatedAtMs: 0,
-      installRecords: {},
-      plugins: [],
-      diagnostics: [],
-    };
-    const snapshot: PluginMetadataSnapshot = {
-      policyHash,
-      configFingerprint: "",
-      workspaceDir,
-      index,
-      registryDiagnostics: [],
-      manifestRegistry: { plugins: [], diagnostics: [] },
-      plugins: [],
-      diagnostics: [],
-      byPluginId: new Map(),
-      normalizePluginId: (pluginId: string) => pluginId,
-      owners: {
-        channels: new Map(),
-        channelConfigs: new Map(),
-        providers: new Map(),
-        modelCatalogProviders: new Map(),
-        cliBackends: new Map(),
-        setupProviders: new Map(),
-        commandAliases: new Map(),
-        contracts: new Map(),
-      },
-      metrics: {
-        registrySnapshotMs: 0,
-        manifestRegistryMs: 0,
-        ownerMapsMs: 0,
-        totalMs: 0,
-        indexPluginCount: 0,
-        manifestPluginCount: 0,
-      },
-    };
-    setCurrentPluginMetadataSnapshot(snapshot, { config, env, workspaceDir });
-
-    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, workspaceDir });
-
-    expect(result).toEqual({
-      snapshot: index,
-      source: "provided",
-      diagnostics: [],
-    });
-  });
-
-  it("does not treat diagnostic current metadata as provided registry input", () => {
-    const env = {
-      ...createHermeticEnv(makeTempDir()),
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-    };
-    const config = {};
-    const workspaceDir = path.join(makeTempDir(), "workspace");
-    const policyHash = resolveInstalledPluginIndexPolicyHash(config);
-    const index: InstalledPluginIndex = {
-      version: 1,
-      hostContractVersion: "test",
-      compatRegistryVersion: "test",
-      migrationVersion: 1,
-      policyHash,
-      generatedAtMs: 0,
-      installRecords: {},
-      plugins: [],
-      diagnostics: [],
-    };
-    setCurrentPluginMetadataSnapshot(
-      {
-        policyHash,
-        configFingerprint: "",
-        workspaceDir,
-        index,
-        registryDiagnostics: [
-          {
-            level: "info",
-            code: "persisted-registry-missing",
-            message: "missing",
-          },
-        ],
-        manifestRegistry: { plugins: [], diagnostics: [] },
-        plugins: [],
-        diagnostics: [],
-        byPluginId: new Map(),
-        normalizePluginId: (pluginId: string) => pluginId,
-        owners: {
-          channels: new Map(),
-          channelConfigs: new Map(),
-          providers: new Map(),
-          modelCatalogProviders: new Map(),
-          cliBackends: new Map(),
-          setupProviders: new Map(),
-          commandAliases: new Map(),
-          contracts: new Map(),
+  it.each(["persisted", "current"])(
+    "reselects checkout plugins for a fresh config request after a %s global selection",
+    async (cache) => {
+      const root = fs.realpathSync(makeTempDir());
+      const packageRoot = path.join(root, "openclaw");
+      const bundledRoot = path.join(packageRoot, "dist", "extensions");
+      const bundledPlugin = path.join(bundledRoot, "demo");
+      const globalPlugin = path.join(root, "state", "extensions", "demo");
+      const env: NodeJS.ProcessEnv = {
+        ...createHermeticEnv(root),
+        OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
+      };
+      fs.mkdirSync(path.join(packageRoot, "src"), { recursive: true });
+      fs.mkdirSync(path.join(packageRoot, "extensions"));
+      fs.writeFileSync(path.join(packageRoot, "package.json"), '{"name":"openclaw"}');
+      fs.writeFileSync(path.join(packageRoot, "pnpm-workspace.yaml"), "packages: []\n");
+      writeBundledPlugin(bundledPlugin, "demo", "index.js");
+      writeBundledPlugin(globalPlugin, "demo", "index.js");
+      const config = { plugins: { entries: { demo: { enabled: true } } } };
+      const index = loadInstalledPluginIndex({
+        config,
+        env,
+        installRecords: {
+          demo: { source: "path", sourcePath: globalPlugin, installPath: globalPlugin },
         },
-        metrics: {
-          registrySnapshotMs: 0,
-          manifestRegistryMs: 0,
-          ownerMapsMs: 0,
-          totalMs: 0,
-          indexPluginCount: 0,
-          manifestPluginCount: 0,
-        },
-      },
-      { config, env, workspaceDir },
-    );
+      });
+      expect(requirePluginRecord(index.plugins, "demo").origin).toBe("global");
+      await writePersistedInstalledPluginIndex(index, { stateDir: env.OPENCLAW_STATE_DIR });
+      if (cache === "current") {
+        setCurrentPluginMetadataSnapshot(loadPluginMetadataSnapshot({ config, env }), {
+          config,
+          env,
+        });
+      }
+      const result = loadPluginRegistrySnapshotWithMetadata({
+        config: structuredClone(config),
+        env: { ...env, OPENCLAW_DEV_SOURCE_ROOT: packageRoot },
+      });
+      expect(requirePluginRecord(result.snapshot.plugins, "demo")).toMatchObject({
+        origin: "bundled",
+        rootDir: bundledPlugin,
+      });
+    },
+  );
 
-    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, workspaceDir });
-
-    expect(result.source).not.toBe("provided");
-  });
-
-  it("does not reuse current metadata when explicit derivation inputs are supplied", () => {
-    const tempRoot = makeTempDir();
-    const env = {
-      ...createHermeticEnv(tempRoot),
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
+  it.each(["current", "persisted", "explicit"])("selects the %s metadata source", async (mode) => {
+    const { tempRoot, env } = isolatedRegistry();
+    const params = { config: {}, env, workspaceDir: path.join(tempRoot, "workspace") };
+    const snapshot: ReturnType<typeof loadPluginMetadataSnapshot> = {
+      ...loadPluginMetadataSnapshot({ ...params, preferPersisted: false }),
+      registryDiagnostics: [
+        { level: "info" as const, code: "persisted-registry-missing", message: "missing" },
+      ],
     };
-    const config = {};
-    const workspaceDir = path.join(tempRoot, "workspace");
-    const policyHash = resolveInstalledPluginIndexPolicyHash(config);
-    const currentIndex: InstalledPluginIndex = {
-      version: 1,
-      hostContractVersion: "test",
-      compatRegistryVersion: "test",
-      migrationVersion: 1,
-      policyHash,
-      generatedAtMs: 0,
-      installRecords: {},
-      plugins: [],
-      diagnostics: [],
-    };
-    setCurrentPluginMetadataSnapshot(
-      {
-        policyHash,
-        configFingerprint: "",
-        workspaceDir,
-        index: currentIndex,
-        registryDiagnostics: [],
-        manifestRegistry: { plugins: [], diagnostics: [] },
-        plugins: [],
-        diagnostics: [],
-        byPluginId: new Map(),
-        normalizePluginId: (pluginId: string) => pluginId,
-        owners: {
-          channels: new Map(),
-          channelConfigs: new Map(),
-          providers: new Map(),
-          modelCatalogProviders: new Map(),
-          cliBackends: new Map(),
-          setupProviders: new Map(),
-          commandAliases: new Map(),
-          contracts: new Map(),
-        },
-        metrics: {
-          registrySnapshotMs: 0,
-          manifestRegistryMs: 0,
-          ownerMapsMs: 0,
-          totalMs: 0,
-          indexPluginCount: 0,
-          manifestPluginCount: 0,
-        },
-      },
-      { config, env, workspaceDir },
-    );
-
+    expect(snapshot.registrySource).toBe("derived");
+    await writePersistedInstalledPluginIndex(snapshot.index, { env });
+    setCurrentPluginMetadataSnapshot(snapshot, params);
+    const candidates =
+      mode === "explicit"
+        ? [createCandidate(path.join(tempRoot, "candidate"), "explicit")]
+        : undefined;
+    const reads = [
+      vi.spyOn(fs, "readdirSync"),
+      vi.spyOn(fs, "readFileSync"),
+      vi.spyOn(fs, "statSync"),
+    ];
     const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      workspaceDir,
-      candidates: [createCandidate(path.join(tempRoot, "candidate"), "explicit")],
+      ...params,
+      allowCurrent: mode !== "persisted",
+      candidates,
     });
-
-    expect(result.source).toBe("derived");
-    expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).toEqual(["explicit"]);
+    if (mode === "current") {
+      expect(result.snapshot).toBe(snapshot.index);
+      expect(result.source).toBe("derived");
+      expect(result.diagnostics).toEqual(snapshot.registryDiagnostics);
+      expect(result.manifestRegistry).toEqual({ plugins: [], diagnostics: [] });
+      for (const read of reads) {
+        expect(read).not.toHaveBeenCalled();
+      }
+    } else if (mode === "persisted") {
+      expectPersisted(result);
+      expect(result.snapshot).toEqual(snapshot.index);
+    } else {
+      expect(result.source).toBe("derived");
+      expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).toEqual(["explicit"]);
+    }
   });
 
-  it("recovers managed npm plugins missing from a stale persisted registry", () => {
-    const tempRoot = makeTempDir();
-    const stateDir = path.join(tempRoot, "state");
-    const env = {
-      ...createHermeticEnv(tempRoot),
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      OPENCLAW_STATE_DIR: stateDir,
-    };
-    const config = {};
-    const whatsappDir = writeManagedNpmPlugin({
-      stateDir,
-      packageName: "@openclaw/whatsapp",
-      pluginId: "whatsapp",
-      version: "2026.5.2",
-    });
-    const staleIndex = loadInstalledPluginIndex({
-      config,
-      env,
-      stateDir,
-      installRecords: {},
-    });
-    expect(staleIndex.plugins.map((plugin) => plugin.pluginId)).not.toContain("whatsapp");
-    writePersistedInstalledPluginIndexSync(staleIndex, { stateDir });
+  it.each<[string, NonNullable<OpenClawConfig["plugins"]>]>([
+    ["entry", { entries: { "memory-demo": { enabled: true } } }],
+    ["allowlist", { allow: ["memory-demo"] }],
+    ["memory slot", { slots: { memory: " memory-demo " } }],
+    ["context-engine slot", { slots: { contextEngine: " memory-demo " } }],
+  ])(
+    "recovers a global source plugin selected by %s from a stale registry",
+    async (_selection, plugins) => {
+      const { stateDir, env } = isolatedRegistry();
+      const config = { plugins };
+      const staleIndex = loadInstalledPluginIndex({ config, env, stateDir, installRecords: {} });
+      expect(staleIndex.plugins.map((plugin) => plugin.pluginId)).not.toContain("memory-demo");
+      await writePersistedInstalledPluginIndex(staleIndex, { stateDir });
+      writeRegistryPackagePlugin(path.join(stateDir, "extensions", "memory-demo-source"), {
+        pluginId: "memory-demo",
+      });
 
-    const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      stateDir,
-    });
+      const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
 
-    expect(result.source).toBe("derived");
-    expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
-    expect(result.snapshot.installRecords.whatsapp).toEqual({
-      source: "npm",
-      spec: "@openclaw/whatsapp@2026.5.2",
-      installPath: whatsappDir,
-      version: "2026.5.2",
-      resolvedName: "@openclaw/whatsapp",
-      resolvedVersion: "2026.5.2",
-      resolvedSpec: "@openclaw/whatsapp@2026.5.2",
-    });
-    const whatsappPlugin = requirePluginRecord(result.snapshot.plugins, "whatsapp");
-    expect(whatsappPlugin.origin).toBe("global");
-  });
+      expect(result.source).toBe("derived");
+      expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
+      const memoryPlugin = requirePluginRecord(result.snapshot.plugins, "memory-demo");
+      expect(memoryPlugin.origin).toBe("global");
+    },
+  );
 
   it("does not recover retained managed npm generations as install records", async () => {
-    const tempRoot = makeTempDir();
-    const stateDir = path.join(tempRoot, "state");
-    const env = {
-      ...createHermeticEnv(tempRoot),
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      OPENCLAW_STATE_DIR: stateDir,
-    };
+    const { stateDir, env } = isolatedRegistry();
     const config = {};
     const codexDir = writeManagedNpmPlugin({
       stateDir,
@@ -460,36 +326,20 @@ describe("loadPluginRegistrySnapshotWithMetadata", () => {
     await markRetainedManagedNpmInstall({
       packageDir: codexDir,
       pluginId: "codex",
-      retainedAt: "2026-06-21T00:00:00.000Z",
       reason: "test-retained-generation",
     });
-    const staleIndex = loadInstalledPluginIndex({
-      config,
-      env,
-      stateDir,
-      installRecords: {},
-    });
-    writePersistedInstalledPluginIndexSync(staleIndex, { stateDir });
+    const staleIndex = loadInstalledPluginIndex({ config, env, stateDir, installRecords: {} });
+    await writePersistedInstalledPluginIndex(staleIndex, { stateDir });
 
     expect(loadInstalledPluginIndexInstallRecordsSync({ env, stateDir }).codex).toBeUndefined();
-    const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      stateDir,
-    });
+    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
 
     expect(result.snapshot.installRecords.codex).toBeUndefined();
     expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).not.toContain("codex");
   });
 
   it("does not trust package-owned retained npm marker files during recovery", () => {
-    const tempRoot = makeTempDir();
-    const stateDir = path.join(tempRoot, "state");
-    const env = {
-      ...createHermeticEnv(tempRoot),
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      OPENCLAW_STATE_DIR: stateDir,
-    };
+    const { stateDir, env } = isolatedRegistry();
     const codexDir = writeManagedNpmPlugin({
       stateDir,
       packageName: "@openclaw/codex",
@@ -497,7 +347,7 @@ describe("loadPluginRegistrySnapshotWithMetadata", () => {
       version: "2026.6.10-beta.1",
     });
     fs.writeFileSync(
-      path.join(codexDir, RETAINED_MANAGED_NPM_INSTALL_MARKER),
+      path.join(codexDir, ".openclaw-retained-npm-install.json"),
       '{"version":1,"pluginId":"codex"}\n',
       "utf8",
     );
@@ -505,378 +355,253 @@ describe("loadPluginRegistrySnapshotWithMetadata", () => {
     expect(loadInstalledPluginIndexInstallRecordsSync({ env, stateDir }).codex).toBeDefined();
   });
 
-  it("keeps vanished recovered install records on the persisted fast path", () => {
-    const tempRoot = makeTempDir();
-    const stateDir = path.join(tempRoot, "state");
-    const goneDir = path.join(tempRoot, "gone");
-    const env = {
-      ...createHermeticEnv(tempRoot),
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      OPENCLAW_STATE_DIR: stateDir,
+  it("keeps unrelated installed plugins usable beside a vanished package owner", async () => {
+    const { stateDir, env } = isolatedRegistry();
+    const demoDir = path.join(stateDir, "extensions", "demo");
+    const goneDir = path.join(stateDir, "extensions", "gone");
+    writeRegistryPackagePlugin(demoDir, { pluginId: "demo" });
+    const config = { plugins: { entries: { demo: { enabled: true }, gone: { enabled: true } } } };
+    const installRecords = {
+      demo: { source: "path" as const, sourcePath: demoDir, installPath: demoDir },
+      gone: { source: "path" as const, sourcePath: goneDir, installPath: goneDir },
     };
-    writePersistedInstalledPluginIndexSync(
-      {
-        ...loadInstalledPluginIndex({ config: {}, env, stateDir, installRecords: {} }),
-        installRecords: { gone: { source: "npm", spec: "gone@1.0.0", installPath: goneDir } },
-      },
-      { stateDir },
-    );
+    const index = loadInstalledPluginIndex({ config, env, stateDir, installRecords });
+    await writePersistedInstalledPluginIndex(index, { stateDir });
 
-    const result = loadPluginRegistrySnapshotWithMetadata({ config: {}, env, stateDir });
+    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
 
     expect(result.source).toBe("persisted");
-    expect(result.diagnostics).toStrictEqual([]);
+    expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).toContain("demo");
   });
 
-  it("keeps persisted manifestless Claude bundles on the fast path", () => {
-    const tempRoot = makeTempDir();
-    const rootDir = path.join(tempRoot, "workspace");
-    const stateDir = path.join(tempRoot, "state");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {
-      plugins: {
-        load: { paths: [rootDir] },
-      },
-    };
-    writeManifestlessClaudeBundle(rootDir);
-    const index = createManifestlessClaudeBundleIndex({ rootDir, env });
-    writePersistedInstalledPluginIndexSync(index, { stateDir });
-
-    const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      stateDir,
-    });
-
-    expect(result.source).toBe("persisted");
-    expect(result.diagnostics).toStrictEqual([]);
-  });
-
-  it("refreshes a memoized derived snapshot when workspace plugins are installed", () => {
-    const tempRoot = makeTempDir();
-    const workspaceDir = path.join(tempRoot, "workspace");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-
-    const first = loadPluginRegistrySnapshotWithMetadata({ config: {}, env, workspaceDir });
-    expect(first.snapshot.plugins.map((plugin) => plugin.pluginId)).not.toContain("demo");
-
-    writePackagePlugin(path.join(workspaceDir, ".openclaw", "extensions", "demo"));
-
-    const second = loadPluginRegistrySnapshotWithMetadata({ config: {}, env, workspaceDir });
-    expect(second.snapshot.plugins.map((plugin) => plugin.pluginId)).toContain("demo");
-  });
-
-  it("ignores malformed load paths while fingerprinting memoized snapshots", () => {
-    const tempRoot = makeTempDir();
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {
-      plugins: {
-        load: { paths: "not-an-array" },
-      },
-    } as unknown as OpenClawConfig;
-
-    expect(() => loadPluginRegistrySnapshotWithMetadata({ config, env })).not.toThrow();
-  });
-
-  it("keeps persisted package plugins when file hashes match", () => {
-    const tempRoot = makeTempDir();
-    const rootDir = path.join(tempRoot, "workspace");
-    const stateDir = path.join(tempRoot, "state");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {
-      plugins: {
-        load: { paths: [rootDir] },
-      },
-    };
-    writePackagePlugin(rootDir);
+  it("keeps persisted manifestless Claude bundles on the fast path", async () => {
+    const { rootDir, stateDir, env, config } = configuredRegistry();
+    fs.mkdirSync(path.join(rootDir, "skills"), { recursive: true });
+    fs.writeFileSync(path.join(rootDir, "skills", "SKILL.md"), "# Workspace skill\n", "utf8");
     const index = loadInstalledPluginIndex({ config, env });
-    const [record] = index.plugins;
-    if (!record?.packageJson?.fileSignature || !record.manifestFile) {
-      throw new Error("expected package plugin index record with file signatures");
-    }
-    expect(record.manifestFile.size).toBe(
-      fs.statSync(path.join(rootDir, "openclaw.plugin.json")).size,
-    );
-    expect(record.packageJson.fileSignature.size).toBe(
-      fs.statSync(path.join(rootDir, "package.json")).size,
-    );
-    writePersistedInstalledPluginIndexSync(index, { stateDir });
+    await writePersistedInstalledPluginIndex(index, { stateDir });
 
-    const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      stateDir,
-    });
+    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
 
-    expect(result.source).toBe("persisted");
-    expect(result.diagnostics).toStrictEqual([]);
+    expectPersisted(result);
   });
 
-  it("rebuilds legacy config-path persisted registries before startup scoping", () => {
-    const tempRoot = makeTempDir();
-    const rootDir = path.join(tempRoot, "workspace");
-    const stateDir = path.join(tempRoot, "state");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {
-      plugins: {
-        load: { paths: [rootDir] },
-      },
-    };
-    writePackagePlugin(rootDir, { configPaths: ["browser"] });
-    const index = loadInstalledPluginIndex({ config, env });
-    const legacyIndex: InstalledPluginIndex = {
-      ...index,
-      plugins: index.plugins.map(dropStartupConfigPaths),
-    };
-    writePersistedInstalledPluginIndexSync(legacyIndex, { stateDir });
+  it("derives a complete index when a configured load-path plugin is missing", async () => {
+    const { tempRoot, stateDir, env } = isolatedRegistry();
+    const firstRoot = path.join(tempRoot, "first");
+    const secondRoot = path.join(tempRoot, "second");
+    const staleConfig = { plugins: { load: { paths: [firstRoot] } } };
+    const config = { plugins: { load: { paths: [firstRoot, secondRoot] } } };
+    writeRegistryPackagePlugin(firstRoot, { pluginId: "first", requiresPlugins: ["second"] });
+    writeRegistryPackagePlugin(secondRoot, { pluginId: "second" });
+    const staleIndex = loadInstalledPluginIndex({ config: staleConfig, env });
+    expect(staleIndex.policyHash).toBe(resolveInstalledPluginIndexPolicyHash(config));
+    await writePersistedInstalledPluginIndex(staleIndex, { stateDir });
 
-    const result = loadPluginRegistrySnapshotWithMetadata({
+    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
+
+    expectStale(result);
+    expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).toEqual(["first", "second"]);
+    expect(result.snapshot.plugins.map((plugin) => plugin.origin)).toEqual(["config", "config"]);
+    const scopedRegistry = loadPluginManifestRegistryForInstalledIndex({
+      index: result.snapshot,
       config,
       env,
-      stateDir,
+      pluginIds: ["first"],
+      includeDisabled: true,
     });
-
-    expect(result.source).toBe("derived");
-    expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
-    expect(result.snapshot.plugins[0]?.startup.configPaths).toEqual(["browser"]);
+    expect(scopedRegistry.plugins.map((plugin) => plugin.id)).toEqual(["first"]);
+    expect(scopedRegistry.diagnostics).not.toContainEqual(
+      expect.objectContaining({
+        pluginId: "first",
+        message: expect.stringContaining('requires plugin "second"'),
+      }),
+    );
   });
 
-  it("keeps persisted package plugins with dot-prefixed package metadata paths", () => {
-    const tempRoot = makeTempDir();
-    const rootDir = path.join(tempRoot, "workspace");
-    const stateDir = path.join(tempRoot, "state");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {
-      plugins: {
-        load: { paths: [rootDir] },
-      },
-    };
-    writePackagePlugin(rootDir);
+  it("keeps persisted package plugins with dot-prefixed package metadata paths", async () => {
+    const { rootDir, stateDir, env, config } = configuredRegistry();
+    writeRegistryPackagePlugin(rootDir);
     const metaDir = path.join(rootDir, "..meta");
     fs.mkdirSync(metaDir, { recursive: true });
     const packageJsonPath = path.join(metaDir, "package.json");
-    fs.writeFileSync(packageJsonPath, JSON.stringify({ name: "demo", version: "1.0.0" }), "utf8");
-    const index = loadInstalledPluginIndex({ config, env });
-    const [plugin] = index.plugins;
-    if (!plugin) {
-      throw new Error("expected test plugin");
-    }
-    writePersistedInstalledPluginIndexSync(
-      {
-        ...index,
-        plugins: [
-          {
-            ...plugin,
-            packageJson: {
-              path: "..meta/package.json",
-              hash: fileHash(packageJsonPath),
-              fileSignature: fileSignature(packageJsonPath),
-            },
-          },
-          ...index.plugins.slice(1),
-        ],
+    writeJson(packageJsonPath, {
+      name: "demo",
+      version: "1.0.0",
+      openclaw: {
+        channel: {
+          id: "demo",
+          label: "Demo",
+          commands: { nativeCommandsAutoEnabled: true, nativeSkillsAutoEnabled: false },
+        },
       },
-      { stateDir },
-    );
-
-    const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      stateDir,
+    });
+    const index = loadInstalledPluginIndex({ config, env });
+    await persistFirstPlugin(index, stateDir, {
+      packageJson: {
+        path: "..meta/package.json",
+        hash: fileHash(packageJsonPath),
+        fileSignature: fileSignature(packageJsonPath),
+      },
     });
 
-    expect(result.source).toBe("persisted");
-    expect(result.diagnostics).toStrictEqual([]);
+    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
+
+    expectPersisted(result);
+    expect(result.manifestRegistry).toBeUndefined();
+    const registry = loadPluginManifestRegistryForInstalledIndex({
+      index: result.snapshot,
+      config,
+      env,
+      includeDisabled: true,
+    });
+    expect(registry.plugins[0]?.channelCatalogMeta?.commands).toEqual({
+      nativeCommandsAutoEnabled: true,
+      nativeSkillsAutoEnabled: false,
+    });
   });
 
   it.runIf(process.platform !== "win32")(
     "treats persisted package metadata symlinks outside the plugin root as stale",
-    () => {
-      const tempRoot = makeTempDir();
-      const rootDir = path.join(tempRoot, "workspace");
-      const stateDir = path.join(tempRoot, "state");
+    async () => {
+      const { tempRoot, rootDir, stateDir, env, config } = configuredRegistry(true);
       const outsideDir = path.join(tempRoot, "outside");
       const packageJsonPath = path.join(rootDir, "package.json");
       const outsidePackageJsonPath = path.join(outsideDir, "package.json");
-      const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-      const config = {
-        plugins: {
-          load: { paths: [rootDir] },
-        },
-      };
-      writePackagePlugin(rootDir);
+      writeRegistryPackagePlugin(rootDir);
       fs.mkdirSync(outsideDir, { recursive: true });
       fs.rmSync(packageJsonPath);
-      fs.writeFileSync(
-        outsidePackageJsonPath,
-        JSON.stringify({ name: "demo", version: "1.0.0" }),
-        "utf8",
-      );
+      writeJson(outsidePackageJsonPath, { name: "demo", version: "1.0.0" });
       fs.symlinkSync(outsidePackageJsonPath, packageJsonPath);
       const index = loadInstalledPluginIndex({ config, env });
-      const [plugin] = index.plugins;
-      if (!plugin) {
-        throw new Error("expected test plugin");
-      }
-      writePersistedInstalledPluginIndexSync(
-        {
-          ...index,
-          plugins: [
-            {
-              ...plugin,
-              packageJson: {
-                path: "package.json",
-                hash: fileHash(packageJsonPath),
-                fileSignature: fileSignature(packageJsonPath),
-              },
-            },
-            ...index.plugins.slice(1),
-          ],
+      await persistFirstPlugin(index, stateDir, {
+        packageJson: {
+          path: "package.json",
+          hash: fileHash(packageJsonPath),
+          fileSignature: fileSignature(packageJsonPath),
         },
-        { stateDir },
-      );
-
-      const result = loadPluginRegistrySnapshotWithMetadata({
-        config,
-        env,
-        stateDir,
       });
+
+      const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
 
       expect(result.source).toBe("derived");
       expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
     },
   );
 
-  it("detects same-size same-mtime manifest replacements", () => {
-    const tempRoot = makeTempDir();
-    const rootDir = path.join(tempRoot, "workspace");
-    const stateDir = path.join(tempRoot, "state");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {
-      plugins: {
-        load: { paths: [rootDir] },
-      },
-    };
-    writePackagePlugin(rootDir);
-    const index = loadInstalledPluginIndex({ config, env });
-    writePersistedInstalledPluginIndexSync(index, { stateDir });
+  it.runIf(process.platform !== "win32")(
+    "rejects dangling root, source, and manifest links for disabled records",
+    async () => {
+      for (const artifact of ["root", "source", "manifest"] as const) {
+        const { tempRoot, rootDir, stateDir, env, config } = configuredRegistry(true);
+        writeRegistryPackagePlugin(rootDir);
+        await writePersistedInstalledPluginIndex(loadInstalledPluginIndex({ config, env }), {
+          stateDir,
+        });
+        const artifactPath =
+          artifact === "root"
+            ? rootDir
+            : path.join(rootDir, artifact === "source" ? "index.ts" : "openclaw.plugin.json");
+        fs.rmSync(artifactPath, { recursive: artifact === "root" });
+        fs.symlinkSync(path.join(tempRoot, "missing"), artifactPath);
 
-    replaceFilePreservingSizeAndMtime(
-      path.join(rootDir, "openclaw.plugin.json"),
-      JSON.stringify({
-        id: "demo",
-        name: "Demo",
-        description: "two",
-        configSchema: { type: "object" },
-      }),
-    );
+        const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
 
-    const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      stateDir,
+        expect([artifact, result.source]).toEqual([artifact, "derived"]);
+        expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
+      }
+    },
+  );
+
+  it.each(["legacy config paths", "escaped metadata", "manifest bytes", "package bytes"])(
+    "rebuilds stale persisted records: %s",
+    async (change) => {
+      const { rootDir, stateDir, env, config } = configuredRegistry(change === "escaped metadata");
+      writeRegistryPackagePlugin(
+        rootDir,
+        change === "legacy config paths" ? { configPaths: ["browser"] } : {},
+      );
+      const index = structuredClone(loadInstalledPluginIndex({ config, env }));
+      if (change === "legacy config paths") {
+        index.plugins = index.plugins.map(dropStartupConfigPaths);
+      } else if (change === "escaped metadata") {
+        index.plugins[0]!.packageJson = { path: "../gone/package.json", hash: "missing" };
+      } else if (change === "package bytes") {
+        const file = path.join(rootDir, "package.json");
+        replaceFilePreservingSizeAndMtime(file, JSON.stringify({ name: "demo", version: "1.0.1" }));
+        const plugin = requirePluginRecord(index.plugins, "demo");
+        if (!plugin.packageJson) {
+          throw new Error("expected test plugin package metadata");
+        }
+        plugin.packageJson.fileSignature = fileSignature(file);
+      }
+      await writePersistedInstalledPluginIndex(index, { stateDir });
+      if (change === "manifest bytes") {
+        replaceFilePreservingSizeAndMtime(
+          path.join(rootDir, "openclaw.plugin.json"),
+          JSON.stringify({
+            id: "demo",
+            name: "Demo",
+            description: "two",
+            configSchema: { type: "object" },
+          }),
+        );
+      }
+      const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
+      expectStale(result);
+      if (change === "legacy config paths") {
+        expect(result.snapshot.plugins[0]?.startup.configPaths).toEqual(["browser"]);
+      }
+    },
+  );
+
+  it.each([true, false])(
+    "trusts an unchanged Doctor signature and rehashes legacy records (signature: %s)",
+    async (signed) => {
+      const fixture = signed ? bundledRegistry() : configuredRegistry();
+      const rootDir =
+        "rootDir" in fixture ? fixture.rootDir : path.join(fixture.bundledRoot, "demo");
+      const { stateDir, env } = fixture;
+      const config = "config" in fixture ? fixture.config : {};
+      if (signed) {
+        writeBundledPlugin(rootDir, "demo", "index.js");
+      } else {
+        writeRegistryPackagePlugin(rootDir);
+      }
+      const contractPath = path.join(rootDir, "doctor-contract-api.ts");
+      fs.writeFileSync(contractPath, 'export const marker = "aaaa";\n', "utf8");
+      const index = loadInstalledPluginIndex({ config, env });
+      const plugin = requirePluginRecord(index.plugins, "demo");
+      expect(plugin.doctorContractFile).toEqual(fileSignature(contractPath));
+      await persistFirstPlugin(index, stateDir, {
+        doctorContractHash: "stale-contract-hash",
+        ...(!signed ? { doctorContractFile: undefined } : {}),
+      });
+
+      const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
+
+      if (signed) {
+        expect(result.source).toBe("persisted");
+        expect(result.snapshot.plugins[0]?.doctorContractHash).toBe("stale-contract-hash");
+      } else {
+        expectStale(result);
+        expect(result.snapshot.plugins[0]?.doctorContractHash).not.toBe("stale-contract-hash");
+      }
+    },
+  );
+
+  it("keeps mixed source-checkout bundled roots from the same checkout", async () => {
+    const { packageRoot, bundledRoot, sourceRoot, stateDir, env } = bundledRegistry();
+
+    writeCheckout(packageRoot);
+    writeBundledPlugin(path.join(bundledRoot, "codex"), "codex", "index.js", {
+      bundledDist: true,
+      openclawVersion: "2026.4.26",
+      pluginSdkVersion: "2026.4.26",
     });
-
-    expect(result.source).toBe("derived");
-    expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
-  });
-
-  it("detects same-size same-mtime package.json replacements", () => {
-    const tempRoot = makeTempDir();
-    const rootDir = path.join(tempRoot, "workspace");
-    const stateDir = path.join(tempRoot, "state");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {
-      plugins: {
-        load: { paths: [rootDir] },
-      },
-    };
-    writePackagePlugin(rootDir);
-    const index = loadInstalledPluginIndex({ config, env });
-    writePersistedInstalledPluginIndexSync(index, { stateDir });
-
-    replaceFilePreservingSizeAndMtime(
-      path.join(rootDir, "package.json"),
-      JSON.stringify({ name: "demo", version: "1.0.1" }),
-    );
-
-    const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      stateDir,
+    writeBundledPlugin(path.join(sourceRoot, "whatsapp"), "whatsapp", "index.ts", {
+      openclawVersion: "2026.4.26",
     });
-
-    expect(result.source).toBe("derived");
-    expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
-  });
-
-  it("detects package.json replacements even when stored stat fields still match", () => {
-    const tempRoot = makeTempDir();
-    const rootDir = path.join(tempRoot, "workspace");
-    const stateDir = path.join(tempRoot, "state");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {
-      plugins: {
-        load: { paths: [rootDir] },
-      },
-    };
-    writePackagePlugin(rootDir);
-    const index = loadInstalledPluginIndex({ config, env });
-
-    replaceFilePreservingSizeAndMtime(
-      path.join(rootDir, "package.json"),
-      JSON.stringify({ name: "demo", version: "1.0.1" }),
-    );
-    const stat = fs.statSync(path.join(rootDir, "package.json"));
-    const [plugin] = index.plugins;
-    if (!plugin?.packageJson) {
-      throw new Error("expected test plugin package metadata");
-    }
-    const stalePlugin = {
-      ...plugin,
-      packageJson: {
-        ...plugin.packageJson,
-        fileSignature: {
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-          ctimeMs: stat.ctimeMs,
-        },
-      },
-    };
-    const staleIndex: InstalledPluginIndex = {
-      ...index,
-      plugins: [stalePlugin, ...index.plugins.slice(1)],
-    };
-    writePersistedInstalledPluginIndexSync(staleIndex, { stateDir });
-
-    const result = loadPluginRegistrySnapshotWithMetadata({
-      config,
-      env,
-      stateDir,
-    });
-
-    expect(result.source).toBe("derived");
-    expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
-  });
-
-  it("keeps mixed source-checkout bundled roots from the same checkout", () => {
-    const tempRoot = makeTempDir();
-    const packageRoot = path.join(tempRoot, "openclaw");
-    const bundledRoot = path.join(packageRoot, "dist", "extensions");
-    const sourceRoot = path.join(packageRoot, "extensions");
-    const stateDir = path.join(tempRoot, "state");
-    const env = {
-      OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-      OPENCLAW_STATE_DIR: stateDir,
-      OPENCLAW_VERSION: "2026.4.26",
-      VITEST: "true",
-    };
-
-    fs.mkdirSync(path.join(packageRoot, "src"), { recursive: true });
-    fs.writeFileSync(path.join(packageRoot, ".git"), "gitdir: /tmp/mock\n", "utf8");
-    fs.writeFileSync(path.join(packageRoot, "pnpm-workspace.yaml"), "packages: []\n", "utf8");
-    writeBundledPlugin(path.join(bundledRoot, "codex"), "codex", "index.js");
-    writeBundledPlugin(path.join(sourceRoot, "whatsapp"), "whatsapp", "index.ts");
 
     const index = loadInstalledPluginIndex({ config: {}, env, stateDir });
     expect(index.plugins.map((plugin) => plugin.pluginId)).toEqual(["codex", "whatsapp"]);
@@ -884,147 +609,309 @@ describe("loadPluginRegistrySnapshotWithMetadata", () => {
       fs.realpathSync(path.join(bundledRoot, "codex")),
       fs.realpathSync(path.join(sourceRoot, "whatsapp")),
     ]);
-    writePersistedInstalledPluginIndexSync(index, { stateDir });
-
-    const result = loadPluginRegistrySnapshotWithMetadata({ config: {}, env, stateDir });
-
-    expect(result.source).toBe("persisted");
-    expect(result.diagnostics).toStrictEqual([]);
-    expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).toEqual(["codex", "whatsapp"]);
-  });
-
-  it("treats a persisted source bundled root as stale once its built peer appears", () => {
-    const tempRoot = makeTempDir();
-    const packageRoot = path.join(tempRoot, "openclaw");
-    const bundledRoot = path.join(packageRoot, "dist", "extensions");
-    const sourceRoot = path.join(packageRoot, "extensions");
-    const stateDir = path.join(tempRoot, "state");
-    const env = {
-      OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-      OPENCLAW_STATE_DIR: stateDir,
-      OPENCLAW_VERSION: "2026.4.26",
-      VITEST: "true",
-    };
-
-    fs.mkdirSync(path.join(packageRoot, "src"), { recursive: true });
-    fs.mkdirSync(bundledRoot, { recursive: true });
-    fs.writeFileSync(path.join(packageRoot, ".git"), "gitdir: /tmp/mock\n", "utf8");
-    fs.writeFileSync(path.join(packageRoot, "pnpm-workspace.yaml"), "packages: []\n", "utf8");
-    writeBundledPlugin(path.join(sourceRoot, "whatsapp"), "whatsapp", "index.ts");
-
-    const sourceIndex = loadInstalledPluginIndex({ config: {}, env, stateDir });
-    expect(sourceIndex.plugins.map((plugin) => plugin.rootDir)).toEqual([
-      fs.realpathSync(path.join(sourceRoot, "whatsapp")),
-    ]);
-    writePersistedInstalledPluginIndexSync(sourceIndex, { stateDir });
-    writeBundledPlugin(path.join(bundledRoot, "whatsapp"), "whatsapp", "index.js");
-
-    const result = loadPluginRegistrySnapshotWithMetadata({ config: {}, env, stateDir });
-
-    expect(result.source).toBe("derived");
-    expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
-    expect(result.snapshot.plugins.map((plugin) => plugin.rootDir)).toEqual([
-      fs.realpathSync(path.join(bundledRoot, "whatsapp")),
-    ]);
-  });
-
-  it("keeps a persisted bind-mounted source overlay when its built peer exists", () => {
-    const tempRoot = makeTempDir();
-    const packageRoot = path.join(tempRoot, "openclaw");
-    const bundledRoot = path.join(packageRoot, "dist", "extensions");
-    const sourcePluginDir = path.join(packageRoot, "extensions", "whatsapp");
-    const stateDir = path.join(tempRoot, "state");
-    const env = {
-      OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-      OPENCLAW_STATE_DIR: stateDir,
-      OPENCLAW_VERSION: "2026.4.26",
-      VITEST: "true",
-    };
-
-    fs.mkdirSync(path.join(packageRoot, "src"), { recursive: true });
-    fs.mkdirSync(bundledRoot, { recursive: true });
-    fs.writeFileSync(path.join(packageRoot, ".git"), "gitdir: /tmp/mock\n", "utf8");
-    fs.writeFileSync(path.join(packageRoot, "pnpm-workspace.yaml"), "packages: []\n", "utf8");
-    writeBundledPlugin(sourcePluginDir, "whatsapp", "index.ts");
-
-    const sourceIndex = loadInstalledPluginIndex({ config: {}, env, stateDir });
-    writePersistedInstalledPluginIndexSync(sourceIndex, { stateDir });
-    writeBundledPlugin(path.join(bundledRoot, "whatsapp"), "whatsapp", "index.js");
-    mockLinuxMountInfo([sourcePluginDir]);
-
-    const result = loadPluginRegistrySnapshotWithMetadata({ config: {}, env, stateDir });
-
-    expect(result.source).toBe("persisted");
-    expect(result.diagnostics).toStrictEqual([]);
-    expect(result.snapshot.plugins.map((plugin) => plugin.rootDir)).toEqual([
-      fs.realpathSync(sourcePluginDir),
-    ]);
-  });
-
-  it("treats persisted registry as stale when a plugin diagnostic source path no longer exists", () => {
-    const tempRoot = makeTempDir();
-    const stateDir = path.join(tempRoot, "state");
-    const env = {
-      ...createHermeticEnv(tempRoot),
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      OPENCLAW_STATE_DIR: stateDir,
-    };
-    const config = {};
-    const ghostDir = path.join(tempRoot, "extensions", "lossless-claw");
-    const npmPluginDir = writeManagedNpmPlugin({
-      stateDir,
-      packageName: "@martian-engineering/lossless-claw",
-      pluginId: "lossless-claw",
-      version: "0.9.4",
+    expect(requirePluginRecord(index.plugins, "codex").packageBuild).toEqual({
+      bundledDist: true,
+      openclawVersion: "2026.4.26",
+      pluginSdkVersion: "2026.4.26",
     });
-    const staleIndex: InstalledPluginIndex = {
-      ...loadInstalledPluginIndex({ config, env, stateDir, installRecords: {} }),
-      diagnostics: [
-        {
-          level: "warn",
-          message:
-            "installed plugin package requires compiled runtime output for TypeScript entry index.ts: expected ./dist/index.js",
-          pluginId: "lossless-claw",
-          source: ghostDir,
-        },
-      ],
-    };
-    writePersistedInstalledPluginIndexSync(staleIndex, { stateDir });
+    expect(requirePluginRecord(index.plugins, "whatsapp").packageBuild).toEqual({
+      openclawVersion: "2026.4.26",
+    });
+    await writePersistedInstalledPluginIndex(index, { stateDir });
+
+    const result = loadPluginRegistrySnapshotWithMetadata({ config: {}, env, stateDir });
+
+    expectPersisted(result);
+    expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).toEqual(["codex", "whatsapp"]);
+    expect(requirePluginRecord(result.snapshot.plugins, "codex").packageBuild).toEqual({
+      bundledDist: true,
+    });
+    expect(requirePluginRecord(result.snapshot.plugins, "whatsapp").packageBuild).toEqual({});
+  });
+
+  it("keeps missing disabled bundled records under the trusted bundled root", async () => {
+    const { pluginRoot, stateDir, env, config } = disabledBundledRegistry();
+    const index = loadInstalledPluginIndex({ config, env, stateDir });
+    const persistedPlugin = requirePluginRecord(index.plugins, "whatsapp");
+    expect(persistedPlugin.doctorContractHash).toMatch(/^[a-f0-9]{64}$/u);
+    expect(persistedPlugin.doctorContractFile).toBeDefined();
+    await writePersistedInstalledPluginIndex(index, { stateDir });
+    fs.rmSync(pluginRoot, { recursive: true });
 
     const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
 
-    expect(result.source).toBe("derived");
-    expectDiagnosticsDoNotContainSource(result.snapshot.diagnostics, ghostDir);
-    const losslessPlugin = requirePluginRecord(result.snapshot.plugins, "lossless-claw");
-    expect(losslessPlugin.origin).toBe("global");
-    expect(losslessPlugin.source).toBe(
-      fs.realpathSync(path.join(npmPluginDir, "dist", "index.js")),
-    );
-    expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
+    expectPersisted(result);
+    expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).toEqual(["whatsapp"]);
+    expect(result.snapshot.plugins[0]?.enabled).toBe(false);
+    expect(result.snapshot.plugins[0]?.doctorContractHash).toBe(persistedPlugin.doctorContractHash);
   });
 
-  it("keeps persisted registry when a non-plugin diagnostic source path still does not exist", () => {
-    const tempRoot = makeTempDir();
-    const stateDir = path.join(tempRoot, "state");
-    const env = { ...createHermeticEnv(tempRoot), OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" };
-    const config = {};
-    const missingConfiguredPath = path.join(tempRoot, "missing-configured-plugin");
-    const index: InstalledPluginIndex = {
-      ...loadInstalledPluginIndex({ config, env, stateDir, installRecords: {} }),
-      diagnostics: [
-        {
-          level: "error",
-          message: `plugin path not found: ${missingConfiguredPath}`,
-          source: missingConfiguredPath,
-        },
-      ],
+  it("invalidates disabled installed records when their Doctor contract disappears", async () => {
+    const { contractPath, stateDir, env, config } = disabledBundledRegistry();
+    const index = loadInstalledPluginIndex({ config, env, stateDir });
+    await writePersistedInstalledPluginIndex(index, { stateDir });
+    fs.rmSync(contractPath);
+
+    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
+
+    expectStale(result);
+  });
+
+  it("keeps missing disabled inventory beside unchanged configured plugins", async () => {
+    const { tempRoot, stateDir, env } = isolatedRegistry();
+    const liveRoot = path.join(tempRoot, "live");
+    const missingRoot = path.join(tempRoot, "missing");
+    const config = {
+      plugins: {
+        load: { paths: [liveRoot, missingRoot] },
+        entries: { missing: { enabled: false } },
+      },
     };
-    writePersistedInstalledPluginIndexSync(index, { stateDir });
+    writeRegistryPackagePlugin(liveRoot, { pluginId: "live" });
+    writeRegistryPackagePlugin(missingRoot, { pluginId: "missing" });
+    const index = loadInstalledPluginIndex({ config, env });
+    await writePersistedInstalledPluginIndex(index, { stateDir });
+    fs.rmSync(missingRoot, { recursive: true });
 
     const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
 
     expect(result.source).toBe("persisted");
-    expectDiagnosticsContainSource(result.snapshot.diagnostics, missingConfiguredPath);
-    expect(result.diagnostics).toStrictEqual([]);
+    expect(result.snapshot.plugins.map((plugin) => plugin.pluginId)).toEqual(["live", "missing"]);
+    expect(requirePluginRecord(result.snapshot.plugins, "missing").enabled).toBe(false);
   });
+
+  it.each(["built peer appears", "source opts out", "source mounted"] as const)(
+    "reselects the persisted bundled owner when %s",
+    async (change) => {
+      const { packageRoot, bundledRoot, sourceRoot, stateDir, env } = bundledRegistry();
+      const source = path.join(sourceRoot, "whatsapp");
+      const built = path.join(bundledRoot, "whatsapp");
+      writeCheckout(packageRoot);
+      fs.mkdirSync(bundledRoot, { recursive: true });
+      writeBundledPlugin(source, "whatsapp", "index.ts");
+      if (change === "source opts out") {
+        writeBundledPlugin(built, "whatsapp", "index.js");
+      }
+      const params = { config: {}, env, stateDir };
+      const index = loadInstalledPluginIndex(params);
+      expect(index.plugins.map((plugin) => plugin.rootDir)).toEqual([
+        fs.realpathSync(change === "source opts out" ? built : source),
+      ]);
+      await writePersistedInstalledPluginIndex(index, { stateDir });
+      if (change === "source opts out") {
+        writeJson(path.join(source, "package.json"), {
+          name: "@openclaw/whatsapp",
+          version: "1.0.0",
+          openclaw: { extensions: ["./index.ts"], build: { bundledDist: false } },
+        });
+      } else {
+        writeBundledPlugin(built, "whatsapp", "index.js");
+        if (change === "source mounted") {
+          mockLinuxMountInfo([source]);
+        }
+      }
+      const result = loadPluginRegistrySnapshotWithMetadata(params);
+      if (change === "source mounted") {
+        expectPersisted(result);
+      } else {
+        expectStale(result);
+      }
+      expect(result.snapshot.plugins.map((plugin) => plugin.rootDir)).toEqual([
+        fs.realpathSync(change === "built peer appears" ? built : source),
+      ]);
+    },
+  );
+
+  it.each(["plugin", "parent", "disabled"] as const)(
+    "respects %s source mounts after restarting with a persisted built registry",
+    async (mount) => {
+      const { tempRoot, bundledRoot, sourceRoot, stateDir, env } = bundledRegistry();
+      const builtPluginDir = path.join(bundledRoot, "demo");
+      const sourcePluginDir = path.join(sourceRoot, "demo");
+      const workspaceDir = path.join(tempRoot, "workspace");
+      if (mount === "disabled") {
+        env.OPENCLAW_DISABLE_BUNDLED_SOURCE_OVERLAYS = "1";
+      }
+      const config = { plugins: { entries: { demo: { enabled: true } } } };
+      writeBundledPlugin(builtPluginDir, "demo", "index.js");
+      writeBundledPlugin(sourcePluginDir, "demo", "index.ts");
+      const index = loadInstalledPluginIndex({ config, env, stateDir, workspaceDir });
+      expect(index.plugins.map((plugin) => plugin.rootDir)).toEqual([
+        fs.realpathSync(builtPluginDir),
+      ]);
+      await writePersistedInstalledPluginIndex(index, { stateDir });
+      clearPluginMetadataLifecycleCaches();
+      mockLinuxMountInfo([mount === "parent" ? sourceRoot : sourcePluginDir]);
+
+      const result = loadPluginRegistrySnapshotWithMetadata({
+        config,
+        env,
+        stateDir,
+        workspaceDir,
+      });
+
+      expect(result.source).toBe(mount === "disabled" ? "persisted" : "derived");
+      expect(result.snapshot.plugins.map((plugin) => plugin.rootDir)).toEqual([
+        fs.realpathSync(mount === "disabled" ? builtPluginDir : sourcePluginDir),
+      ]);
+    },
+  );
+
+  it.each([true, false])(
+    "revalidates missing diagnostic sources only for plugins (%s)",
+    async (plugin) => {
+      const { tempRoot, stateDir, env } = isolatedRegistry();
+      const params = { config: {}, env, stateDir };
+      const ghostDir = path.join(tempRoot, "extensions", "lossless-claw");
+      const npmPluginDir = plugin
+        ? writeManagedNpmPlugin({
+            stateDir,
+            packageName: "@martian-engineering/lossless-claw",
+            pluginId: "lossless-claw",
+            version: "0.9.4",
+          })
+        : undefined;
+      const staleIndex: InstalledPluginIndex = {
+        ...loadInstalledPluginIndex({ ...params, installRecords: {} }),
+        diagnostics: [
+          {
+            level: plugin ? "warn" : "error",
+            message: "missing source",
+            source: ghostDir,
+            ...(plugin ? { pluginId: "lossless-claw" } : {}),
+          },
+        ],
+      };
+      await writePersistedInstalledPluginIndex(staleIndex, { stateDir });
+      const result = loadPluginRegistrySnapshotWithMetadata(params);
+      const diagnosticSources = result.snapshot.diagnostics.map(({ source }) => source);
+      if (npmPluginDir) {
+        expectStale(result);
+        expect(diagnosticSources).not.toContain(ghostDir);
+        expect(requirePluginRecord(result.snapshot.plugins, "lossless-claw")).toMatchObject({
+          origin: "global",
+          source: fs.realpathSync(path.join(npmPluginDir, "dist", "index.js")),
+        });
+      } else {
+        expectPersisted(result);
+        expect(diagnosticSources).toContain(ghostDir);
+      }
+    },
+  );
+});
+it("checks shared persisted files once per fleet while discovering every workspace and refreshing the next operation", async () => {
+  const root = makeTempDir();
+  const bundled = path.join(root, "bundled");
+  const sharedRoot = path.join(bundled, "shared");
+  fs.mkdirSync(sharedRoot, { recursive: true });
+  const shared = createColdPluginFixture({ rootDir: sharedRoot, pluginId: "shared" });
+  const workspaces = Array.from({ length: 6 }, (_, index) => path.join(root, `agent-${index}`));
+  for (const [index, workspace] of workspaces.entries()) {
+    const localRoot = path.join(workspace, ".openclaw", "extensions", `local-${index}`);
+    fs.mkdirSync(localRoot, { recursive: true });
+    createColdPluginFixture({ rootDir: localRoot, pluginId: `local-${index}` });
+  }
+  const env = {
+    OPENCLAW_HOME: root,
+    OPENCLAW_STATE_DIR: path.join(root, "state"),
+    OPENCLAW_BUNDLED_PLUGINS_DIR: bundled,
+    OPENCLAW_VERSION: "2026.4.26",
+    VITEST: "true",
+  };
+  const configFor = (count: number) => ({
+    agents: {
+      ownership: "explicit" as const,
+      entries: Object.fromEntries(
+        workspaces.slice(0, count).map((workspace, index) => [`agent-${index}`, { workspace }]),
+      ),
+    },
+  });
+  await writePersistedInstalledPluginIndex(
+    loadInstalledPluginIndex({ config: configFor(3), env, workspaceDir: workspaces[0] }),
+    { env },
+  );
+  const manifestPath = path.join(sharedRoot, "openclaw.plugin.json");
+  const readFleet = (count: number) => {
+    const inspectPath = vi.spyOn(fs, "lstatSync");
+    try {
+      const snapshot = resolveConfigWidePluginMetadataSnapshot({
+        config: configFor(count),
+        env,
+        allowCurrent: false,
+      });
+      expect(snapshot.plugins.map((plugin) => plugin.id).toSorted()).toEqual(
+        ["shared", ...workspaces.slice(0, count).map((_, index) => `local-${index}`)].toSorted(),
+      );
+      expect(snapshot.registryIndex.workspaceDir).toBe(workspaces[0]);
+      expect(snapshot.plugins.find((plugin) => plugin.id === `local-${count - 1}`)?.source).toBe(
+        path.join(
+          root,
+          `agent-${count - 1}`,
+          ".openclaw",
+          "extensions",
+          `local-${count - 1}`,
+          "index.cjs",
+        ),
+      );
+      return {
+        snapshot,
+        sharedFileChecks: inspectPath.mock.calls.filter(([target]) => target === manifestPath)
+          .length,
+      };
+    } finally {
+      inspectPath.mockRestore();
+    }
+  };
+  const small = readFleet(3);
+  const large = readFleet(6);
+  expect(small.sharedFileChecks).toBeGreaterThan(0);
+  expect(large.sharedFileChecks).toBe(small.sharedFileChecks);
+
+  writeJson(manifestPath, {
+    id: "shared",
+    name: "Updated fleet plugin",
+    configSchema: { type: "object" },
+  });
+  expect(readFleet(6).snapshot.byPluginId.get("shared")?.name).toBe("Updated fleet plugin");
+  expect(large.snapshot.byPluginId.get("shared")?.name).toBe("Cold Control Plane");
+  expect(fs.existsSync(shared.runtimeMarker)).toBe(false);
+});
+
+it.each([false, true])("retains package source admissions (rebuilt: %s)", async (rebuilt) => {
+  const { rootDir, stateDir, env, config } = configuredRegistry();
+  writeRegistryPackagePlugin(rootDir);
+  const index = loadInstalledPluginIndex({ config, env });
+  const record = requirePluginRecord(index.plugins, "demo");
+  record.sourceAdmissions = {
+    [`${rootDir}\0`]: {
+      signature: "unchanged-source-inputs",
+      sourceDigest: "a".repeat(64),
+      nativeArtifacts: {},
+      nativeNamespaces: {},
+    },
+  };
+  await writePersistedInstalledPluginIndex(index, { stateDir });
+
+  if (rebuilt) {
+    const manifestPath = path.join(rootDir, "openclaw.plugin.json");
+    writeJson(manifestPath, {
+      ...JSON.parse(fs.readFileSync(manifestPath, "utf8")),
+      name: "Updated metadata",
+    });
+    clearPluginMetadataLifecycleCaches();
+  }
+
+  const result = loadPluginRegistrySnapshotWithMetadata({
+    config: captureRuntimeConfig(config),
+    env,
+    stateDir,
+  });
+
+  expect(result.source).toBe(rebuilt ? "derived" : "persisted");
+  if (rebuilt) {
+    expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
+  } else {
+    expect(result.diagnostics).toStrictEqual([]);
+  }
+  expect(result.snapshot.plugins[0]?.sourceAdmissions).toEqual(record.sourceAdmissions);
 });

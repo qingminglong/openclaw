@@ -1,30 +1,16 @@
-// Nodes CLI plugin registration tests cover node command plugin registration.
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loggingState } from "../logging/state.js";
 
-const registerPluginCliCommandsFromValidatedConfig = vi.fn(async () => ({}));
-const registerNodesCameraCommands = vi.fn();
-const registerNodesInvokeCommands = vi.fn();
-const registerNodesLocationCommands = vi.fn();
-const registerNodesNotifyCommand = vi.fn();
-const registerNodesPairingCommands = vi.fn();
-const registerNodesPushCommand = vi.fn();
-const registerNodesScreenCommands = vi.fn();
-const registerNodesStatusCommands = vi.fn();
+let routed: boolean | undefined;
+const registerPluginCliCommandsFromValidatedConfig = vi.fn(async () => {
+  routed = loggingState.forceConsoleToStderr;
+  return {};
+});
 
 vi.mock("../plugins/cli.js", () => ({
   registerPluginCliCommandsFromValidatedConfig,
 }));
-
-vi.mock("./nodes-cli/register.camera.js", () => ({ registerNodesCameraCommands }));
-vi.mock("./nodes-cli/register.invoke.js", () => ({ registerNodesInvokeCommands }));
-vi.mock("./nodes-cli/register.location.js", () => ({ registerNodesLocationCommands }));
-vi.mock("./nodes-cli/register.notify.js", () => ({ registerNodesNotifyCommand }));
-vi.mock("./nodes-cli/register.pairing.js", () => ({ registerNodesPairingCommands }));
-vi.mock("./nodes-cli/register.push.js", () => ({ registerNodesPushCommand }));
-vi.mock("./nodes-cli/register.screen.js", () => ({ registerNodesScreenCommands }));
-vi.mock("./nodes-cli/register.status.js", () => ({ registerNodesStatusCommands }));
 
 const { registerNodesCli } = await import("./nodes-cli/register.js");
 
@@ -35,6 +21,7 @@ describe("registerNodesCli plugin registration", () => {
   beforeEach(() => {
     originalForceConsoleToStderr = loggingState.forceConsoleToStderr;
     loggingState.forceConsoleToStderr = false;
+    routed = undefined;
     registerPluginCliCommandsFromValidatedConfig.mockClear();
   });
 
@@ -43,42 +30,54 @@ describe("registerNodesCli plugin registration", () => {
     loggingState.forceConsoleToStderr = originalForceConsoleToStderr;
   });
 
-  async function registerWithArgv(argv: string[]) {
-    process.argv = argv;
+  async function registerWithArgv(...args: string[]) {
+    process.argv = ["node", "openclaw", "nodes", ...args];
     const program = new Command();
     await registerNodesCli(program);
     return program;
   }
 
-  it("routes plugin registration logs to stderr for nodes --json commands", async () => {
-    let forceStderrDuringRegistration = false;
-    registerPluginCliCommandsFromValidatedConfig.mockImplementationOnce(async () => {
-      forceStderrDuringRegistration = loggingState.forceConsoleToStderr;
-      return {};
-    });
+  it("skips plugin CLI/runtime registration for built-in nodes subcommands", async () => {
+    for (const subcommand of ["status", "list", "describe", "invoke", "pending", "camera"]) {
+      registerPluginCliCommandsFromValidatedConfig.mockClear();
+      await registerWithArgv(subcommand, "--json");
+      expect(registerPluginCliCommandsFromValidatedConfig).not.toHaveBeenCalled();
+    }
+  });
 
-    const program = await registerWithArgv(["node", "openclaw", "nodes", "list", "--json"]);
-
+  it.each([
+    { args: ["canvas", "snapshot", "--json"], stderr: true },
+    { args: [], stderr: false },
+    { args: ["canvas", "--", "--json"], stderr: false },
+  ])("lazily registers nodes $args with stderr routing=$stderr", async ({ args, stderr }) => {
+    const program = await registerWithArgv(...args);
     expect(registerPluginCliCommandsFromValidatedConfig).toHaveBeenCalledWith(
       program,
       undefined,
       undefined,
       { mode: "lazy", primary: "nodes" },
     );
-    expect(forceStderrDuringRegistration).toBe(true);
-    expect(loggingState.forceConsoleToStderr).toBe(false);
+    expect({ during: routed, after: loggingState.forceConsoleToStderr }).toEqual({
+      during: stderr,
+      after: false,
+    });
   });
 
-  it("does not route pass-through --json after the terminator", async () => {
-    let forceStderrDuringRegistration = true;
-    registerPluginCliCommandsFromValidatedConfig.mockImplementationOnce(async () => {
-      forceStderrDuringRegistration = loggingState.forceConsoleToStderr;
-      return {};
+  it("documents current pairing and system.which command syntax", async () => {
+    const program = await registerWithArgv("--help");
+    const nodesCommand = program.commands.find((command) => command.name() === "nodes");
+    const output: string[] = [];
+
+    nodesCommand?.configureOutput({
+      writeOut: (value) => output.push(value),
+      writeErr: (value) => output.push(value),
     });
+    nodesCommand?.outputHelp();
+    const help = output.join("");
 
-    await registerWithArgv(["node", "openclaw", "nodes", "invoke", "--", "--json"]);
-
-    expect(forceStderrDuringRegistration).toBe(false);
-    expect(loggingState.forceConsoleToStderr).toBe(false);
+    expect(help).toContain(`--params '{"bins":["uname"]}'`);
+    expect(help).not.toContain(`--params '{"name":"uname"}'`);
+    expect(help).toContain("openclaw nodes pending");
+    expect(help).not.toContain("openclaw nodes pairing pending");
   });
 });

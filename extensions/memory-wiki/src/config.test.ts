@@ -1,104 +1,69 @@
-// Memory Wiki tests cover config plugin behavior.
 import fs from "node:fs";
 import path from "node:path";
 import {
   validateJsonSchemaValue,
   type JsonSchemaObject,
 } from "openclaw/plugin-sdk/json-schema-runtime";
+import { withEnv } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it } from "vitest";
-import {
-  DEFAULT_WIKI_RENDER_MODE,
-  DEFAULT_WIKI_SEARCH_BACKEND,
-  DEFAULT_WIKI_SEARCH_CORPUS,
-  DEFAULT_WIKI_VAULT_MODE,
-  resolveDefaultMemoryWikiVaultPath,
-  resolveMemoryWikiConfig,
-} from "./config.js";
+import { memoryWikiConfigSchema } from "./config-schema.js";
+import { resolveMemoryWikiAgentConfig, resolveMemoryWikiConfig } from "./config.js";
 
-function compileManifestConfigSchema() {
+function validateManifestConfig(value: unknown) {
   const manifest = JSON.parse(
     fs.readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
   ) as { configSchema: JsonSchemaObject };
-  return (value: unknown) =>
-    validateJsonSchemaValue({
-      cacheKey: "memory-wiki.manifest.config.test",
-      schema: manifest.configSchema,
-      value,
-      applyDefaults: true,
-    }).ok;
+  return validateJsonSchemaValue({
+    cacheKey: "memory-wiki.manifest.config.test",
+    schema: manifest.configSchema,
+    value,
+    applyDefaults: true,
+  }).ok;
 }
 
 describe("resolveMemoryWikiConfig", () => {
-  it("returns isolated defaults", () => {
-    const config = resolveMemoryWikiConfig(undefined, { homedir: "/Users/tester" });
-
-    expect(config.vaultMode).toBe(DEFAULT_WIKI_VAULT_MODE);
-    expect(config.vault.renderMode).toBe(DEFAULT_WIKI_RENDER_MODE);
-    expect(config.vault.path).toBe(resolveDefaultMemoryWikiVaultPath("/Users/tester"));
-    expect(config.search.backend).toBe(DEFAULT_WIKI_SEARCH_BACKEND);
-    expect(config.search.corpus).toBe(DEFAULT_WIKI_SEARCH_CORPUS);
-    expect(config.context.includeCompiledDigestPrompt).toBe(false);
+  it("uses the configured state directory for schema-resolved defaults", () => {
+    const stateDir = "/tmp/openclaw-schema-state";
+    withEnv({ OPENCLAW_STATE_DIR: stateDir }, () => {
+      const parsed = memoryWikiConfigSchema.safeParse?.(undefined);
+      expect(parsed).toMatchObject({
+        success: true,
+        data: { vault: { path: path.join(stateDir, "wiki", "main") } },
+      });
+    });
   });
 
-  it("expands ~/ paths and preserves explicit modes", () => {
-    const config = resolveMemoryWikiConfig(
-      {
-        vaultMode: "bridge",
-        vault: {
-          path: "~/vaults/wiki",
-          renderMode: "obsidian",
-        },
-      },
+  it("uses the wiki root before appending the single configured agent", () => {
+    const base = resolveMemoryWikiConfig(
+      { vault: { scope: "agent" } },
       { homedir: "/Users/tester" },
     );
-
-    expect(config.vaultMode).toBe("bridge");
-    expect(config.vault.path).toBe(path.join("/Users/tester", "vaults", "wiki"));
-    expect(config.vault.renderMode).toBe("obsidian");
+    const resolved = resolveMemoryWikiAgentConfig({
+      config: base,
+      appConfig: { agents: { entries: { support: {} } } },
+    });
+    expect(
+      resolveMemoryWikiConfig({ vault: { path: "~/vaults/wiki" } }, { homedir: "/Users/tester" })
+        .vault.path,
+    ).toBe(path.join("/Users/tester", "vaults", "wiki"));
+    const expectedRoot = path.join("/Users/tester", ".openclaw", "wiki");
+    expect(base.vault.path).toBe(expectedRoot);
+    expect(resolved.vault.path).toBe(path.join(expectedRoot, "support"));
   });
 
-  it("normalizes the bridge artifact toggle", () => {
-    const canonical = resolveMemoryWikiConfig({
-      bridge: {
-        readMemoryArtifacts: false,
+  it.each([
+    [{ vaultMode: "unsafe-local", vault: { scope: "agent" } }, ["vaultMode"]],
+    [
+      { vault: { scope: "agent" }, obsidian: { useOfficialCli: true } },
+      ["obsidian", "useOfficialCli"],
+    ],
+  ] as const)("rejects incompatible agent-scoped config %j", (config, issuePath) => {
+    expect(memoryWikiConfigSchema.safeParse?.(config)).toMatchObject({
+      success: false,
+      error: {
+        issues: expect.arrayContaining([expect.objectContaining({ path: issuePath })]),
       },
     });
-
-    expect(canonical.bridge.readMemoryArtifacts).toBe(false);
-  });
-});
-
-describe("memory-wiki manifest config schema", () => {
-  it("accepts the documented config shape", () => {
-    const validate = compileManifestConfigSchema();
-    const config = {
-      vaultMode: "unsafe-local",
-      vault: {
-        path: "~/wiki",
-        renderMode: "obsidian",
-      },
-      obsidian: {
-        enabled: true,
-        useOfficialCli: true,
-      },
-      bridge: {
-        enabled: true,
-        readMemoryArtifacts: true,
-        followMemoryEvents: true,
-      },
-      unsafeLocal: {
-        allowPrivateMemoryCoreAccess: true,
-        paths: ["extensions/memory-core/src"],
-      },
-      search: {
-        backend: "shared",
-        corpus: "all",
-      },
-      context: {
-        includeCompiledDigestPrompt: true,
-      },
-    };
-
-    expect(validate(config)).toBe(true);
+    expect(validateManifestConfig(config)).toBe(false);
   });
 });

@@ -1,23 +1,23 @@
-// Msteams helper module supports graph messages helpers behavior.
 import { beforeEach, vi } from "vitest";
 
 const graphMessagesMockState = vi.hoisted(() => ({
   resolveGraphToken: vi.fn(),
   fetchGraphJson: vi.fn(),
+  fetchAllGraphPages: vi.fn(),
   fetchGraphAbsoluteUrl: vi.fn(),
-  postGraphJson: vi.fn(),
-  postGraphBetaJson: vi.fn(),
+  mutateGraphJson: vi.fn(),
   deleteGraphRequest: vi.fn(),
   findPreferredDmByUserId: vi.fn(),
 }));
 
-vi.mock("./graph.js", () => {
+vi.mock("./graph.js", async (importOriginal) => {
   return {
+    ...(await importOriginal<typeof import("./graph.js")>()),
     resolveGraphToken: graphMessagesMockState.resolveGraphToken,
     fetchGraphJson: graphMessagesMockState.fetchGraphJson,
+    fetchAllGraphPages: graphMessagesMockState.fetchAllGraphPages,
     fetchGraphAbsoluteUrl: graphMessagesMockState.fetchGraphAbsoluteUrl,
-    postGraphJson: graphMessagesMockState.postGraphJson,
-    postGraphBetaJson: graphMessagesMockState.postGraphBetaJson,
+    mutateGraphJson: graphMessagesMockState.mutateGraphJson,
     deleteGraphRequest: graphMessagesMockState.deleteGraphRequest,
     escapeOData: vi.fn((value: string) => value.replaceAll("'", "''")),
   };

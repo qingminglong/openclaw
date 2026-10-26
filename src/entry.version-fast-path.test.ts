@@ -1,86 +1,100 @@
-// Tests version fast-path output before the full entrypoint loads.
-import { describe, expect, it, vi } from "vitest";
+import "./test-utils/prepare-compiled-subprocesses.js";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { createDeferred } from "../test/helpers/promise.js";
+// Warm diagnostics before test deadlines, after compiled-subprocess preparation.
+import "./cli/dotenv.js";
 import { tryHandleRootVersionFastPath } from "./entry.version-fast-path.js";
+import { resolveCommitHash } from "./infra/git-commit.js";
+import { resetLogger, setLoggerOverride } from "./logging.js";
+import "./logging/json-console-line.js";
 
-vi.mock("./cli/argv.js", () => ({
-  isRootHelpInvocation: () => false,
-  isRootVersionInvocation: (argv: string[]) => argv.includes("--version"),
+vi.mock("./version.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./version.js")>()),
+  VERSION: "9.9.9-test",
 }));
 
-vi.mock("./cli/container-target.js", () => ({
-  parseCliContainerArgs: (argv: string[]) => ({ ok: true, container: null, argv }),
-  resolveCliContainerTarget: (argv: string[], env: NodeJS.ProcessEnv = process.env) =>
-    argv.includes("--container") ? "demo" : (env.OPENCLAW_CONTAINER ?? null),
+vi.mock("./infra/git-commit.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./infra/git-commit.js")>()),
+  resolveCommitHash: vi.fn(),
 }));
 
-async function flushVersionFastPath() {
-  await Promise.resolve();
-  await Promise.resolve();
-}
+const exit = vi.fn<typeof process.exit>();
+const output = vi.fn<typeof console.log>();
+const previousExitCode = process.exitCode;
+const argv = ["node", "openclaw", "--version"];
 
-describe("entry root version fast path", () => {
-  it("prints version output and skips host handling when container-targeted", async () => {
-    const output = vi.fn();
-    const exit = vi.fn();
-    const resolveVersion = vi.fn<
-      () => Promise<{
-        VERSION: string;
-        resolveCommitHash: (params: { moduleUrl: string }) => string | null;
-      }>
-    >(async () => ({
-      VERSION: "9.9.9-test",
-      resolveCommitHash: vi.fn(() => "abc1234"),
-    }));
-
-    expect(
-      tryHandleRootVersionFastPath(["node", "openclaw", "--version"], {
-        output,
-        exit,
-        resolveVersion,
-      }),
-    ).toBe(true);
-    await flushVersionFastPath();
-    expect(output).toHaveBeenCalledWith("OpenClaw 9.9.9-test (abc1234)");
-    expect(exit).toHaveBeenCalledWith(0);
-
-    output.mockClear();
-    exit.mockClear();
-    resolveVersion.mockResolvedValueOnce({
-      VERSION: "9.9.9-test",
-      resolveCommitHash: vi.fn(() => null),
-    });
-
-    expect(
-      tryHandleRootVersionFastPath(["node", "openclaw", "--version"], {
-        output,
-        exit,
-        resolveVersion,
-      }),
-    ).toBe(true);
-    await flushVersionFastPath();
-    expect(output).toHaveBeenCalledWith("OpenClaw 9.9.9-test");
-    expect(exit).toHaveBeenCalledWith(0);
-
-    output.mockClear();
-    exit.mockClear();
-    expect(
-      tryHandleRootVersionFastPath(["node", "openclaw", "--container", "demo", "--version"], {
-        output,
-        exit,
-        resolveVersion,
-      }),
-    ).toBe(false);
-    expect(resolveVersion).toHaveBeenCalledTimes(2);
-    expect(output).not.toHaveBeenCalled();
-    expect(exit).not.toHaveBeenCalled();
-
-    expect(
-      tryHandleRootVersionFastPath(["node", "openclaw", "--version"], {
-        env: { OPENCLAW_CONTAINER: "demo" },
-        output,
-        exit,
-        resolveVersion,
-      }),
-    ).toBe(false);
-  });
+beforeEach(() => {
+  process.exitCode = undefined;
+  vi.stubEnv("OPENCLAW_CONTAINER", undefined);
+  vi.spyOn(process, "exit").mockImplementation(exit);
+  vi.spyOn(console, "log").mockImplementation(output.mockReset());
 });
+
+afterEach(() => {
+  const nativeExitCalls = exit.mock.calls.length;
+  process.exitCode = previousExitCode;
+  vi.restoreAllMocks();
+  vi.clearAllMocks();
+  vi.unstubAllEnvs();
+  resetLogger();
+  expect(nativeExitCalls).toBe(0);
+});
+
+it.each([
+  { commit: "abc1234", expected: "OpenClaw 9.9.9-test (abc1234)" },
+  { commit: null, expected: "OpenClaw 9.9.9-test" },
+])("prints version output with commit $commit", async ({ commit, expected }) => {
+  const printed = createDeferred();
+  output.mockImplementation(() => printed.resolve());
+  vi.mocked(resolveCommitHash).mockReturnValue(commit);
+
+  expect(tryHandleRootVersionFastPath(argv)).toBe(true);
+  await printed.promise;
+
+  expect(output).toHaveBeenCalledWith(expected);
+  expect(process.exitCode).toBe(0);
+});
+
+it("skips host handling when container-targeted", () => {
+  expect(
+    tryHandleRootVersionFastPath(["node", "openclaw", "--container", "demo", "--version"]),
+  ).toBe(false);
+
+  vi.stubEnv("OPENCLAW_CONTAINER", "demo");
+  expect(tryHandleRootVersionFastPath(argv)).toBe(false);
+  expect(resolveCommitHash).not.toHaveBeenCalled();
+  expect(output).not.toHaveBeenCalled();
+});
+
+it.each(["pretty", "json"] as const)(
+  "reports %s version-resolution errors",
+  async (consoleStyle) => {
+    const printed = createDeferred();
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => {
+      printed.resolve();
+      return true;
+    });
+    vi.mocked(resolveCommitHash).mockImplementation(() => {
+      const error = new Error("version resolution failed");
+      // Bun can materialize a collected stack with a bare header and no message.
+      error.stack = "Error\n    at resolveCommitHash (git-commit.js:1:1)";
+      throw error;
+    });
+    setLoggerOverride({ level: "silent", consoleLevel: "info", consoleStyle });
+
+    expect(tryHandleRootVersionFastPath(argv)).toBe(true);
+    await printed.promise;
+
+    expect(process.exitCode).toBe(1);
+    expect(output).not.toHaveBeenCalled();
+    const line = stderr.mock.calls.map(([value]) => String(value)).join("");
+    if (consoleStyle === "json") {
+      expect(JSON.parse(line)).toMatchObject({
+        level: "error",
+        message: expect.stringContaining("version resolution failed"),
+      });
+    } else {
+      expect(line).toContain("version resolution failed");
+    }
+  },
+);

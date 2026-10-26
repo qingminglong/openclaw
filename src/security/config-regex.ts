@@ -1,9 +1,5 @@
 // Defines config regexes used by security validation.
-import {
-  compileSafeRegexDetailed,
-  type SafeRegexCompileResult,
-  type SafeRegexRejectReason,
-} from "./safe-regex.js";
+import { compileSafeRegexDetailed, type SafeRegexRejectReason } from "./safe-regex.js";
 
 /** Reject reasons that should be surfaced for user-configured regex patterns. */
 export type ConfigRegexRejectReason = Exclude<SafeRegexRejectReason, "empty">;
@@ -12,7 +8,7 @@ export type ConfigRegexRejectReason = Exclude<SafeRegexRejectReason, "empty">;
  * Result for one config regex pattern.
  * Empty patterns return null from the compiler; invalid or unsafe patterns return a rejected shape.
  */
-export type CompiledConfigRegex =
+type CompiledConfigRegex =
   | {
       regex: RegExp;
       pattern: string;
@@ -25,13 +21,6 @@ export type CompiledConfigRegex =
       flags: string;
       reason: ConfigRegexRejectReason;
     };
-
-function normalizeRejectReason(result: SafeRegexCompileResult): ConfigRegexRejectReason | null {
-  if (result.reason === null || result.reason === "empty") {
-    return null;
-  }
-  return result.reason;
-}
 
 /**
  * Compile a single user-configured regex with the shared safe-regex guardrails.
@@ -47,7 +36,7 @@ export function compileConfigRegex(pattern: string, flags = ""): CompiledConfigR
     regex: result.regex,
     pattern: result.source,
     flags: result.flags,
-    reason: normalizeRejectReason(result),
+    reason: result.reason,
   } as CompiledConfigRegex;
 }
 
@@ -55,17 +44,7 @@ export function compileConfigRegex(pattern: string, flags = ""): CompiledConfigR
  * Compile a list of user-configured regex patterns, separating usable regexes from diagnostics.
  * Callers can keep operating with safe entries while reporting rejected unsafe patterns once.
  */
-export function compileConfigRegexes(
-  patterns: string[],
-  flags = "",
-): {
-  regexes: RegExp[];
-  rejected: Array<{
-    pattern: string;
-    flags: string;
-    reason: ConfigRegexRejectReason;
-  }>;
-} {
+export function compileConfigRegexes(patterns: string[], flags = "") {
   const regexes: RegExp[] = [];
   const rejected: Array<{
     pattern: string;

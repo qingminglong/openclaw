@@ -1,7 +1,7 @@
-// Operator approval runtime token.
-// Uses an existing shared socket token when available, with a process-local fallback.
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { loadExecApprovals } from "../infra/exec-approvals.js";
+// Uses an existing local socket token when available, with a process-local fallback.
+import { createHmac, randomBytes } from "node:crypto";
+import { readExecApprovalsSocket } from "../infra/exec-approvals-socket.js";
+import { safeEqualSecret } from "../security/secret-equal.js";
 
 const APPROVAL_RUNTIME_TOKEN_CONTEXT = "openclaw:gateway-approval-runtime-token:v1";
 
@@ -13,46 +13,42 @@ function deriveApprovalRuntimeToken(socketToken: string): string {
     .digest("base64url");
 }
 
-function readSharedApprovalRuntimeToken(): string | null {
-  const token = loadExecApprovals().socket?.token?.trim();
+async function readSharedApprovalRuntimeToken(): Promise<string | null> {
+  const token = (await readExecApprovalsSocket())?.socket_token?.trim();
   return token ? deriveApprovalRuntimeToken(token) : null;
 }
 
-function tokenMatches(token: string, expected: string | null | undefined): boolean {
-  if (!expected) {
-    return false;
-  }
-  const tokenBytes = Buffer.from(token);
-  const expectedBytes = Buffer.from(expected);
-  // timingSafeEqual requires equal lengths; keep length rejection explicit instead of catching.
-  return tokenBytes.length === expectedBytes.length && timingSafeEqual(tokenBytes, expectedBytes);
-}
-
-/**
- * Returns the token used to authorize local operator-approval clients.
- */
-export function getOperatorApprovalRuntimeToken(): string {
-  const sharedToken = readSharedApprovalRuntimeToken();
-  if (sharedToken) {
-    return sharedToken;
-  }
+function getFallbackApprovalRuntimeToken(): string {
   fallbackApprovalRuntimeToken ??= randomBytes(32).toString("base64url");
   return fallbackApprovalRuntimeToken;
 }
 
 /**
+ * Returns the token used to authorize local operator-approval clients.
+ */
+export async function getOperatorApprovalRuntimeToken(): Promise<string> {
+  const sharedToken = await readSharedApprovalRuntimeToken();
+  if (sharedToken) {
+    return sharedToken;
+  }
+  return getFallbackApprovalRuntimeToken();
+}
+
+/**
  * Validates a presented loopback approval token without accepting empty or partial matches.
  */
-export function isOperatorApprovalRuntimeToken(value: string | null | undefined): boolean {
+export async function isOperatorApprovalRuntimeToken(
+  value: string | null | undefined,
+): Promise<boolean> {
   const token = value?.trim();
   if (!token) {
     return false;
   }
-  const sharedToken = readSharedApprovalRuntimeToken();
-  if (tokenMatches(token, sharedToken)) {
+  const sharedToken = await readSharedApprovalRuntimeToken();
+  if (safeEqualSecret(token, sharedToken)) {
     return true;
   }
   const fallbackToken =
-    fallbackApprovalRuntimeToken ?? (sharedToken ? null : getOperatorApprovalRuntimeToken());
-  return tokenMatches(token, fallbackToken);
+    fallbackApprovalRuntimeToken ?? (sharedToken ? null : getFallbackApprovalRuntimeToken());
+  return safeEqualSecret(token, fallbackToken);
 }

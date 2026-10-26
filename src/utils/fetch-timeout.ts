@@ -1,4 +1,5 @@
-// Fetch timeout helpers wrap fetch calls with timeout and abort behavior.
+import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolveSafeTimeoutDelayMs } from "./timer-delay.js";
 
@@ -39,20 +40,24 @@ function sanitizeTimeoutLogUrl(rawUrl: string | undefined): string | undefined {
     parsed.password = "";
     parsed.search = "";
     parsed.hash = "";
-    const value = parsed.toString();
-    return value.length > LOG_URL_MAX_CHARS ? `${value.slice(0, LOG_URL_MAX_CHARS)}...` : value;
+    const value = redactSensitiveUrlLikeString(parsed.toString());
+    return value.length > LOG_URL_MAX_CHARS
+      ? `${truncateUtf16Safe(value, LOG_URL_MAX_CHARS)}...`
+      : value;
   } catch {
     const withoutQueryOrHash = trimmed.split(URL_SECRET_SUFFIX_PATTERN, 1)[0] ?? "";
-    const cleaned = withoutQueryOrHash
-      .replace(/[\r\n\u2028\u2029]+/g, " ")
-      .replace(/\p{Cc}+/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const cleaned = redactSensitiveUrlLikeString(
+      withoutQueryOrHash
+        .replace(/[\r\n\u2028\u2029]+/g, " ")
+        .replace(/\p{Cc}+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
     if (!cleaned) {
       return undefined;
     }
     return cleaned.length > LOG_URL_MAX_CHARS
-      ? `${cleaned.slice(0, LOG_URL_MAX_CHARS)}...`
+      ? `${truncateUtf16Safe(cleaned, LOG_URL_MAX_CHARS)}...`
       : cleaned;
   }
 }
@@ -63,8 +68,9 @@ function abortDueToTimeout(
   startedAtMs: number,
   operation?: string,
   url?: string,
+  combinedSignal?: AbortSignal,
 ) {
-  if (controller.signal.aborted) {
+  if (combinedSignal?.aborted ?? controller.signal.aborted) {
     return;
   }
   const sanitizedUrl = sanitizeTimeoutLogUrl(url);
@@ -107,15 +113,15 @@ export function buildTimeoutAbortSignal(params: TimeoutAbortSignalParams): {
   cleanup: () => void;
   refresh: () => void;
 } {
-  const { timeoutMs, signal } = params;
-  if (!timeoutMs && !signal) {
-    return { signal: undefined, cleanup: () => {}, refresh: () => {} };
-  }
+  const { timeoutMs, signal: parentSignal } = params;
   if (!timeoutMs) {
-    return { signal, cleanup: () => {}, refresh: () => {} };
+    return { signal: parentSignal, cleanup: () => {}, refresh: () => {} };
   }
 
   const controller = new AbortController();
+  const signal = parentSignal
+    ? AbortSignal.any([parentSignal, controller.signal])
+    : controller.signal;
   const normalizedTimeoutMs = resolveSafeTimeoutDelayMs(timeoutMs);
   let active = true;
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -128,59 +134,37 @@ export function buildTimeoutAbortSignal(params: TimeoutAbortSignalParams): {
       Date.now(),
       params.operation,
       params.url,
+      signal,
     );
   };
   scheduleTimeout();
-  const onAbort = bindAbortRelay(controller);
-  if (signal) {
-    if (signal.aborted) {
-      controller.abort();
-    } else {
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-  }
 
   return {
-    signal: controller.signal,
+    signal,
     refresh: () => {
-      if (!active || controller.signal.aborted) {
+      if (!active || signal.aborted) {
         return;
       }
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
+      clearTimeout(timeoutId);
       scheduleTimeout();
     },
     cleanup: () => {
       active = false;
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
-      if (signal) {
-        signal.removeEventListener("abort", onAbort);
-      }
+      clearTimeout(timeoutId);
     },
   };
 }
 
-/**
- * Fetch wrapper that adds timeout support via AbortController.
- *
- * @param url - The URL to fetch
- * @param init - RequestInit options (headers, method, body, etc.)
- * @param timeoutMs - Timeout in milliseconds
- * @param fetchFn - The fetch implementation to use (defaults to global fetch)
- * @returns The fetch Response
- * @throws AbortError if the request times out
- */
 export async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
+  // The wrapper timeout ends at headers; caller cancellation still follows the response body.
   const { signal, cleanup } = buildTimeoutAbortSignal({
     timeoutMs: Math.max(1, timeoutMs),
+    signal: init.signal ?? undefined,
     operation: "fetchWithTimeout",
     url,
   });

@@ -1,77 +1,125 @@
-/** Configuration defaults and env parsing for the node-host runner. */
+/** Canonical shared-SQLite configuration for the node-host runner. */
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
+import fs from "node:fs";
 import path from "node:path";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { resolveStateDir } from "../config/paths.js";
-import { writeJson } from "../infra/json-files.js";
+import { logInfo } from "../logger.js";
+import { executeExistingOpenClawStateRead } from "../state/openclaw-state-db-readonly.js";
+import {
+  normalizeGatewayConfig,
+  normalizeNodeHostCommands,
+  normalizeStoredNodeHostConfig,
+  type NodeHostConfig,
+  type NodeHostGatewayConfig,
+} from "./config-shared.js";
+import { NodeWorkerJournalWorker } from "./node-worker-journal-worker.js";
 
-/**
- * Persistent node-host identity/config file helpers.
- *
- * Node hosts keep a stable node id and optional Gateway connection metadata in
- * the state directory so reconnects and plugin node commands can identify the host.
- */
-/** Gateway endpoint metadata persisted with node-host config. */
-export type NodeHostGatewayConfig = {
-  host?: string;
-  port?: number;
-  tls?: boolean;
-  tlsFingerprint?: string;
-};
+export type { NodeHostConfig, NodeHostGatewayConfig } from "./config-shared.js";
 
-type NodeHostConfig = {
-  version: 1;
-  nodeId: string;
-  token?: string;
-  displayName?: string;
-  gateway?: NodeHostGatewayConfig;
-};
+export const NODE_HOST_CONFIG_KEY = "nodeHost.config";
+export const LEGACY_NODE_HOST_CONFIG_FILE = "node.json";
+export const LEGACY_NODE_HOST_CONFIG_CLAIM_SUFFIX = ".doctor-importing";
 
-const NODE_HOST_FILE = "node.json";
-
-function resolveNodeHostConfigPath(): string {
-  return path.join(resolveStateDir(), NODE_HOST_FILE);
-}
-
-function normalizeConfig(config: Partial<NodeHostConfig> | null): NodeHostConfig {
-  const base: NodeHostConfig = {
-    version: 1,
-    nodeId: "",
-    token: config?.token,
-    displayName: config?.displayName,
-    gateway: config?.gateway,
-  };
-  if (config?.version === 1 && typeof config.nodeId === "string") {
-    base.nodeId = config.nodeId.trim();
-  }
-  if (!base.nodeId) {
-    base.nodeId = crypto.randomUUID();
-  }
-  return base;
-}
-
-/** Load and normalize the node-host config, or null when no readable config exists. */
-export async function loadNodeHostConfig(): Promise<NodeHostConfig | null> {
-  const filePath = resolveNodeHostConfigPath();
+function legacyPathMayExist(filePath: string): boolean {
   try {
-    const raw = await fs.readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw) as Partial<NodeHostConfig>;
-    return normalizeConfig(parsed);
-  } catch {
+    fs.lstatSync(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw new Error(`unable to verify retired node-host state path ${filePath}`, {
+      cause: error,
+    });
+  }
+}
+
+/** Runtime must not choose between canonical SQLite state and a retired file store. */
+function assertNodeHostLegacyStateMigrated(env: NodeJS.ProcessEnv = process.env): void {
+  const sourcePath = path.join(resolveStateDir(env), LEGACY_NODE_HOST_CONFIG_FILE);
+  const claimPath = `${sourcePath}${LEGACY_NODE_HOST_CONFIG_CLAIM_SUFFIX}`;
+  if (!legacyPathMayExist(sourcePath) && !legacyPathMayExist(claimPath)) {
+    return;
+  }
+  throw new Error(
+    `retired node-host state remains at ${sourcePath}; stop the node host and run \`openclaw doctor --fix\``,
+  );
+}
+
+/** Read canonical node-host state without creating a store or joining its writable lifecycle. */
+export async function loadNodeHostConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<NodeHostConfig | null> {
+  const selectedEnv = { ...env, OPENCLAW_STATE_DIR: resolveStateDir(env) };
+  assertNodeHostLegacyStateMigrated(selectedEnv);
+  const reply = await executeExistingOpenClawStateRead(
+    { env: selectedEnv },
+    {
+      type: NODE_HOST_CONFIG_KEY,
+    },
+  );
+  if (!reply) {
     return null;
   }
+  const stored = reply.row;
+  if (!stored) {
+    return null;
+  }
+  const value: unknown = JSON.parse(stored.value_json);
+  if (!Number.isSafeInteger(stored.updated_at_ms) || stored.updated_at_ms < 0) {
+    throw new Error("invalid node-host SQLite row: updated_at_ms must be a non-negative integer");
+  }
+  return normalizeStoredNodeHostConfig(value);
 }
 
-/** Save node-host config with private file permissions. */
-export async function saveNodeHostConfig(config: NodeHostConfig): Promise<void> {
-  const filePath = resolveNodeHostConfigPath();
-  await writeJson(filePath, config, { mode: 0o600 });
-}
+/**
+ * Atomically create or replace the complete node-host snapshot.
+ * Candidate facts are prepared before BEGIN; the transaction rereads the authoritative row.
+ */
+export async function configureNodeHost(params: {
+  nodeId?: string;
+  displayName?: string;
+  fallbackDisplayName: string;
+  gateway: NodeHostGatewayConfig;
+  env?: NodeJS.ProcessEnv;
+  candidateNodeId?: string;
+  installedAppsSharing?: boolean;
+  commands?: string[];
+  allCommands?: boolean;
+}): Promise<NodeHostConfig> {
+  const env = params.env ?? process.env;
+  assertNodeHostLegacyStateMigrated(env);
+  const explicitNodeId = normalizeOptionalString(params.nodeId);
+  const explicitDisplayName = normalizeOptionalString(params.displayName);
+  const fallbackDisplayName = normalizeOptionalString(params.fallbackDisplayName);
+  const candidateNodeId = params.candidateNodeId?.trim() || crypto.randomUUID();
+  const gateway = normalizeGatewayConfig(params.gateway);
+  const commands =
+    params.commands === undefined ? undefined : normalizeNodeHostCommands(params.commands);
 
-/** Load or create a node-host config with a stable generated node id. */
-export async function ensureNodeHostConfig(): Promise<NodeHostConfig> {
-  const existing = await loadNodeHostConfig();
-  const normalized = normalizeConfig(existing);
-  await saveNodeHostConfig(normalized);
-  return normalized;
+  const worker = new NodeWorkerJournalWorker({ env });
+  const { config, clearedCommands } = await worker.execute({
+    type: "nodeWorker.configure",
+    input: [
+      {
+        explicitNodeId,
+        explicitDisplayName,
+        fallbackDisplayName,
+        candidateNodeId,
+        gateway,
+        installedAppsSharing: params.installedAppsSharing,
+        commands,
+        allCommands: params.allCommands,
+        updatedAtMs: Date.now(),
+      },
+    ],
+  });
+
+  if (clearedCommands) {
+    logInfo(
+      "node-host: cleared saved command allowlist; advertising the full default command surface",
+    );
+  }
+  return config;
 }

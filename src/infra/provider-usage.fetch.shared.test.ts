@@ -1,151 +1,85 @@
-// Covers shared provider usage fetch parsing and error snapshots.
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { withFetchPreconnect } from "../test-utils/fetch-mock.js";
-import {
-  buildUsageErrorSnapshot,
-  buildUsageHttpErrorSnapshot,
-  discardUsageResponseBody,
-  fetchJson,
-  parseFiniteNumber,
-} from "./provider-usage.fetch.shared.js";
+import { fetchJson, fetchUsageJson, readUsageJson } from "./provider-usage.fetch.shared.js";
 
-function requireFetchCall(
-  mock: ReturnType<typeof vi.fn>,
-): [URL | RequestInfo, RequestInit | undefined] {
-  const [call] = mock.mock.calls;
-  if (!call) {
-    throw new Error("expected fetch call");
-  }
-  return call as [URL | RequestInfo, RequestInit | undefined];
-}
+const url = "https://example.com/usage";
+const responseFetch = (response: Response) => withFetchPreconnect(async () => response);
+const streamResponse = (source: UnderlyingSource<Uint8Array>) =>
+  new Response(new ReadableStream<Uint8Array>(source));
+const request = (fetchFn: typeof fetch, init: RequestInit = {}, timeout = 1000) =>
+  fetchJson(url, init, timeout, fetchFn);
 
-describe("provider usage fetch shared helpers", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
+afterEach(() => vi.restoreAllMocks());
+
+it.each(["deadline", "caller"] as const)("keeps %s cancellation after headers", async (source) => {
+  const deadline = new AbortController();
+  const caller = new AbortController();
+  vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+  const reason = new Error("cancelled while reading");
+  const fetchFn = withFetchPreconnect(
+    async (_input: URL | RequestInfo, { signal }: RequestInit = {}) =>
+      streamResponse({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("{"));
+          signal?.addEventListener("abort", () => controller.error(signal.reason), {
+            once: true,
+          });
+        },
+      }),
+  );
+  const response = await request(fetchFn, { signal: caller.signal });
+  const rejected = expect(response.text()).rejects.toBe(reason);
+  (source === "deadline" ? deadline : caller).abort(reason);
+  await rejected;
+});
+
+it("caps oversized request timeouts before scheduling", async () => {
+  const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(new AbortController().signal);
+  await request(responseFetch(new Response("{}")), {}, MAX_TIMER_TIMEOUT_MS + 1_000_000);
+  expect(timeout).toHaveBeenCalledWith(MAX_TIMER_TIMEOUT_MS);
+});
+
+it("cancels non-OK bodies and reports configured token expiration", async () => {
+  const response = new Response("unread", { status: 403 });
+  const cancel = vi.spyOn(response.body!, "cancel").mockResolvedValue(undefined);
+  const result = await fetchUsageJson({
+    provider: "openai",
+    url,
+    init: {},
+    timeoutMs: 1000,
+    fetchFn: responseFetch(response),
+    tokenExpiredStatuses: [401, 403],
   });
-
-  it("builds a provider error snapshot", () => {
-    expect(buildUsageErrorSnapshot("zai", "API error")).toEqual({
-      provider: "zai",
-      displayName: "z.ai",
-      windows: [],
-      error: "API error",
-    });
-  });
-
-  it.each([
-    { value: 12, expected: 12 },
-    { value: "12.5", expected: 12.5 },
-    { value: "12.5 credits", expected: undefined },
-    { value: "not-a-number", expected: undefined },
-  ])("parses finite numbers for %j", ({ value, expected }) => {
-    expect(parseFiniteNumber(value)).toBe(expected);
-  });
-
-  it("forwards request init and clears the timeout on success", async () => {
-    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
-    const fetchFnMock = vi.fn(
-      async (_input: URL | RequestInfo, init?: RequestInit) =>
-        new Response(JSON.stringify({ aborted: init?.signal?.aborted ?? false }), { status: 200 }),
-    );
-    const fetchFn = withFetchPreconnect(fetchFnMock);
-
-    const response = await fetchJson(
-      "https://example.com/usage",
-      {
-        method: "POST",
-        headers: { authorization: "Bearer test" },
-      },
-      1_000,
-      fetchFn,
-    );
-
-    expect(fetchFnMock).toHaveBeenCalledOnce();
-    const [input, init] = requireFetchCall(fetchFnMock);
-    expect(input).toBe("https://example.com/usage");
-    expect(init?.method).toBe("POST");
-    expect(init?.headers).toEqual({ authorization: "Bearer test" });
-    expect(init?.signal).toBeInstanceOf(AbortSignal);
-    await expect(response.json()).resolves.toEqual({ aborted: false });
-    expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it("aborts timed out requests and clears the timer on rejection", async () => {
-    vi.useFakeTimers();
-    try {
-      const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
-      const fetchFnMock = vi.fn(
-        (_input: URL | RequestInfo, init?: RequestInit) =>
-          new Promise<Response>((_, reject) => {
-            init?.signal?.addEventListener("abort", () => reject(new Error("aborted by timeout")), {
-              once: true,
-            });
-          }),
-      );
-      const fetchFn = withFetchPreconnect(fetchFnMock);
-      const responsePromise = fetchJson("https://example.com/usage", {}, 10, fetchFn);
-      const rejection = expect(responsePromise).rejects.toThrow("aborted by timeout");
-
-      await vi.advanceTimersByTimeAsync(10);
-      await rejection;
-      expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("caps oversized request timeouts before scheduling", async () => {
-    const timeoutSpy = vi
-      .spyOn(globalThis, "setTimeout")
-      .mockReturnValue(1 as unknown as ReturnType<typeof setTimeout>);
-    vi.spyOn(globalThis, "clearTimeout").mockImplementation(() => undefined);
-    const fetchFnMock = vi.fn(async () => new Response("{}", { status: 200 }));
-    const fetchFn = withFetchPreconnect(fetchFnMock);
-
-    await fetchJson("https://example.com/usage", {}, MAX_TIMER_TIMEOUT_MS + 1_000_000, fetchFn);
-
-    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
-  });
-
-  it("cancels unread response bodies when discarding usage responses", async () => {
-    const response = new Response("not needed", { status: 429 });
-    const cancel = vi.spyOn(response.body!, "cancel").mockResolvedValue(undefined);
-
-    await discardUsageResponseBody(response);
-
-    expect(cancel).toHaveBeenCalledOnce();
-  });
-
-  it("maps configured status codes to token expired", () => {
-    const snapshot = buildUsageHttpErrorSnapshot({
+  expect(result).toEqual({
+    ok: false,
+    snapshot: {
       provider: "openai",
-      status: 401,
-      tokenExpiredStatuses: [401, 403],
-    });
-
-    expect(snapshot.error).toBe("Token expired");
-    expect(snapshot.provider).toBe("openai");
-    expect(snapshot.windows).toHaveLength(0);
+      displayName: "OpenAI",
+      windows: [],
+      error: "Token expired",
+    },
   });
+  expect(cancel).toHaveBeenCalledOnce();
+});
 
-  it("includes trimmed API error messages in HTTP errors", () => {
-    const snapshot = buildUsageHttpErrorSnapshot({
+it("bounds response bytes and cancels an oversized stream", async () => {
+  let pulls = 0;
+  const cancel = vi.fn(async () => undefined);
+  const response = streamResponse({
+    pull(controller) {
+      pulls += 1;
+      controller.enqueue(new Uint8Array(pulls === 1 ? 16 * 1024 * 1024 + 1 : 1));
+    },
+    cancel,
+  });
+  expect(await readUsageJson("anthropic", response)).toEqual({
+    ok: false,
+    snapshot: expect.objectContaining({
       provider: "anthropic",
-      status: 403,
-      message: " missing scope ",
-    });
-
-    expect(snapshot.error).toBe("HTTP 403: missing scope");
+      error: "Malformed usage response",
+    }),
   });
-
-  it("omits empty HTTP error message suffixes", () => {
-    const snapshot = buildUsageHttpErrorSnapshot({
-      provider: "anthropic",
-      status: 429,
-      message: "   ",
-    });
-
-    expect(snapshot.error).toBe("HTTP 429");
-  });
+  expect(pulls).toBeLessThanOrEqual(2);
+  expect(cancel).toHaveBeenCalledOnce();
 });

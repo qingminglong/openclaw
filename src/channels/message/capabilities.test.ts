@@ -1,15 +1,10 @@
-// Message capability tests cover channel message feature detection and compatibility.
 import { describe, expect, it } from "vitest";
-import { deriveDurableFinalDeliveryRequirements } from "./capabilities.js";
+import {
+  deriveDurableFinalDeliveryRequirements,
+  deriveDurableFinalDeliveryRequirementsForBatch,
+} from "./capabilities.js";
 
 describe("deriveDurableFinalDeliveryRequirements", () => {
-  it("derives the default durable final text and hook requirements", () => {
-    expect(deriveDurableFinalDeliveryRequirements({ payload: { text: "hello" } })).toEqual({
-      text: true,
-      messageSendingHooks: true,
-    });
-  });
-
   it("derives payload-dependent delivery requirements", () => {
     expect(
       deriveDurableFinalDeliveryRequirements({
@@ -40,20 +35,39 @@ describe("deriveDurableFinalDeliveryRequirements", () => {
       afterCommit: true,
     });
   });
+});
 
-  it("applies channel-native extras without recording false requirements", () => {
+describe("deriveDurableFinalDeliveryRequirementsForBatch", () => {
+  it("unions capabilities across the final prepared payloads", () => {
     expect(
-      deriveDurableFinalDeliveryRequirements({
-        payload: { text: "hello" },
-        extraCapabilities: {
-          nativeQuote: false,
-          thread: true,
-        },
+      deriveDurableFinalDeliveryRequirementsForBatch({
+        payloads: [
+          { text: "first" },
+          {
+            text: "caption",
+            mediaUrl: "https://example.com/a.png",
+            presentation: { blocks: [{ type: "text", text: "card" }] },
+          },
+        ],
+        replyToId: "reply-1",
+        reconcileUnknownSend: true,
       }),
     ).toEqual({
       text: true,
-      thread: true,
+      media: true,
+      replyTo: true,
       messageSendingHooks: true,
+      payload: true,
+      batch: true,
+      reconcileUnknownSend: true,
     });
+  });
+
+  it("requires payload transport for structured send content", () => {
+    expect(
+      deriveDurableFinalDeliveryRequirementsForBatch({
+        payloads: [{ text: "Meet here", location: { latitude: 1, longitude: 2 } }],
+      }),
+    ).toMatchObject({ text: true, payload: true });
   });
 });

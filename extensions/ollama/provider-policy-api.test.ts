@@ -1,73 +1,49 @@
-// Ollama tests cover provider policy api plugin behavior.
-import type { ModelDefinitionConfig } from "openclaw/plugin-sdk/provider-model-types";
 import { describe, expect, it } from "vitest";
-import { normalizeConfig, resolveThinkingProfile } from "./provider-policy-api.js";
+import { createModel } from "./model.test-support.js";
+import {
+  normalizeConfig,
+  resolveThinkingProfile,
+  resolveToolSearchMode,
+} from "./provider-policy-api.js";
 import { OLLAMA_DEFAULT_BASE_URL } from "./src/defaults.js";
 
-function createModel(id: string, name: string): ModelDefinitionConfig {
-  return {
-    id,
-    name,
-    reasoning: false,
-    input: ["text"],
-    cost: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-    },
-    contextWindow: 128_000,
-    maxTokens: 8_192,
-  };
-}
-
 describe("ollama provider policy public artifact", () => {
-  it("injects defaults so implicit discovery can run before validation", () => {
-    expect(
-      normalizeConfig({
+  it.each([
+    ["qwen3.5:9b", "http://model-host.internal:11434", "tools"],
+    ["kimi-k2.5", "https://ollama.com/v1", false],
+  ] as const)("selects Tool Search for %s at %s", (modelId, baseUrl, expected) => {
+    expect(resolveToolSearchMode({ provider: "ollama", modelId, baseUrl, api: "ollama" })).toBe(
+      expected,
+    );
+  });
+  const explicit = {
+    baseUrl: "http://ollama.internal:11434",
+    models: [createModel("llama3.2", "Llama 3.2")],
+  };
+  it.each([
+    ["ollama", {}, { baseUrl: OLLAMA_DEFAULT_BASE_URL, models: [] }],
+    ["ollama", explicit, structuredClone(explicit)],
+    ["openai", {}, {}],
+  ] as const)("normalizes %s configuration %j", (provider, providerConfig, expected) => {
+    expect(normalizeConfig({ provider, providerConfig })).toStrictEqual(expected);
+  });
+
+  it.each([
+    [{ provider: "ollama-cloud", modelId: "glm-5.3" }, "off low medium high max"],
+    [
+      {
         provider: "ollama",
-        providerConfig: {},
-      }),
-    ).toStrictEqual({
-      baseUrl: OLLAMA_DEFAULT_BASE_URL,
-      models: [],
-    });
-  });
-
-  it("preserves explicit Ollama config values", () => {
-    const models = [createModel("llama3.2", "Llama 3.2")];
-
-    expect(
-      normalizeConfig({
-        provider: "ollama",
-        providerConfig: {
-          baseUrl: "http://ollama.internal:11434",
-          models,
-        },
-      }),
-    ).toStrictEqual({
-      baseUrl: "http://ollama.internal:11434",
-      models,
-    });
-  });
-
-  it("ignores other providers", () => {
-    expect(
-      normalizeConfig({
-        provider: "openai",
-        providerConfig: {},
-      }),
-    ).toStrictEqual({});
-  });
-
-  it("exposes max thinking for reasoning-capable models without full plugin activation", () => {
-    expect(resolveThinkingProfile({ reasoning: true })).toEqual({
-      levels: [{ id: "off" }, { id: "low" }, { id: "medium" }, { id: "high" }, { id: "max" }],
-      defaultLevel: "off",
-    });
-    expect(resolveThinkingProfile({ reasoning: false })).toEqual({
-      levels: [{ id: "off" }],
-      defaultLevel: "off",
-    });
+        modelId: "custom-thinking-model",
+        api: undefined,
+        reasoning: true,
+        thinkingLevelMap: { minimal: "minimal", xhigh: "xhigh" },
+      },
+      "off minimal low medium high xhigh max",
+    ],
+    [{ provider: "ollama-cloud", modelId: "minimax-m2.7" }, "off"],
+  ] as const)("resolves thinking levels for %j", (context, expected) => {
+    expect(resolveThinkingProfile(context).levels).toEqual(
+      expected.split(" ").map((id) => ({ id })),
+    );
   });
 });

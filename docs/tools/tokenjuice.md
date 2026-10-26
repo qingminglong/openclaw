@@ -22,7 +22,7 @@ trims the output before it goes back into the active harness session.
 Install once:
 
 ```bash
-openclaw plugins install clawhub:@openclaw/tokenjuice
+openclaw plugins install @openclaw/tokenjuice
 ```
 
 Then enable it:
@@ -55,7 +55,7 @@ If you prefer editing config directly:
 
 - Compacts noisy `exec` and `bash` results before they are fed back into the session.
 - Keeps the original command execution untouched.
-- Preserves exact file-content reads and other commands that tokenjuice should leave raw.
+- Applies a safe-inventory policy: exact file-content reads stay raw, standalone repository-inventory commands can compact, and unsafe mixed command sequences stay raw.
 - Stays opt-in: disable the plugin if you want verbatim output everywhere.
 
 ## Verify it is working

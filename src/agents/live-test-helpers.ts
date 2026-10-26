@@ -1,35 +1,31 @@
 /**
  * Shared helpers for live provider tests and timeout-wrapped completions.
  */
-import { isTruthyEnvValue } from "../infra/env.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
+import type { OpenClawConfig } from "../config/types.js";
 import { completeSimple } from "../llm/stream.js";
 import type { Api, Model } from "../llm/types.js";
+import { configFor, modelDefinition } from "./model-auth.fixtures.test-support.js";
 
-// Shared live-test helpers. Live lanes opt in via env flags and use guarded
-// model calls so missing credentials skip cleanly instead of hanging tests.
-const LIVE_OK_PROMPT = "Reply with the word ok.";
+export {
+  createSingleUserPromptMessage,
+  extractNonEmptyAssistantText,
+  isLiveProfileKeyModeEnabled,
+  isLiveTestEnabled,
+  readLiveTestConfig,
+} from "./live-test-config.js";
 
-/** Return whether live tests are enabled by standard or caller-specific env flags. */
-export function isLiveTestEnabled(
-  extraEnvVars: readonly string[] = [],
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  return [...extraEnvVars, "LIVE", "OPENCLAW_LIVE_TEST"].some((name) =>
-    isTruthyEnvValue(env[name]),
-  );
-}
+export type CompleteSimpleContent<TApi extends Api = Api> = Awaited<
+  ReturnType<typeof completeSimple<TApi>>
+>["content"];
 
-/** Return whether live tests must prefer profile credentials over env keys. */
-export function isLiveProfileKeyModeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return isTruthyEnvValue(env.OPENCLAW_LIVE_REQUIRE_PROFILE_KEYS);
-}
-
-/** Return whether a provider requires profile credentials in the current live mode. */
-export function requiresLiveProfileCredential(
-  provider: string,
-  requireProfileKeys: boolean,
-): boolean {
-  return requireProfileKeys || provider === "openai";
+/** Retain the fixture config through admission, reads, and owned runtime cleanup. */
+export function useLiveTestRuntimeConfig(config: OpenClawConfig): Disposable {
+  setRuntimeConfigSnapshot(config);
+  return { [Symbol.dispose]: clearRuntimeConfigSnapshot };
 }
 
 /** Resolve whether profile or env credentials should be tried first. */
@@ -37,39 +33,8 @@ export function resolveLiveCredentialPrecedence(
   provider: string,
   requireProfileKeys: boolean,
 ): "profile-first" | "env-first" {
-  return requiresLiveProfileCredential(provider, requireProfileKeys)
-    ? "profile-first"
-    : "env-first";
+  return requireProfileKeys || provider === "openai" ? "profile-first" : "env-first";
 }
-
-/** Build a single user-message prompt for simple live model probes. */
-export function createSingleUserPromptMessage(content = LIVE_OK_PROMPT) {
-  return [
-    {
-      role: "user" as const,
-      content,
-      timestamp: Date.now(),
-    },
-  ];
-}
-
-/** Extract non-empty assistant text from content blocks. */
-export function extractNonEmptyAssistantText(
-  content: Array<{
-    type?: string;
-    text?: string;
-  }>,
-) {
-  return content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text?.trim() ?? "")
-    .filter(Boolean)
-    .join(" ");
-}
-
-export type CompleteSimpleContent<TApi extends Api = Api> = Awaited<
-  ReturnType<typeof completeSimple<TApi>>
->["content"];
 
 /** Write a namespaced live-test progress line to stderr. */
 export function logLiveProgress(message: string): void {
@@ -82,12 +47,14 @@ export async function completeSimpleWithTimeout<TApi extends Api>(
   context: Parameters<typeof completeSimple<TApi>>[1],
   options: Parameters<typeof completeSimple<TApi>>[2],
   timeoutMs: number,
+  timeoutMessage = `model call timed out after ${timeoutMs}ms`,
 ): Promise<Awaited<ReturnType<typeof completeSimple<TApi>>>> {
   const controller = new AbortController();
   const abortTimer = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
   abortTimer.unref?.();
+  let hardTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       completeSimple(model, context, {
@@ -95,13 +62,44 @@ export async function completeSimpleWithTimeout<TApi extends Api>(
         signal: controller.signal,
       }),
       new Promise<never>((_, reject) => {
-        const hardTimer = setTimeout(() => {
-          reject(new Error(`model call timed out after ${timeoutMs}ms`));
+        hardTimer = setTimeout(() => {
+          reject(new Error(timeoutMessage));
         }, timeoutMs);
         hardTimer.unref?.();
       }),
     ]);
   } finally {
     clearTimeout(abortTimer);
+    clearTimeout(hardTimer);
   }
+}
+
+export function createLiveResponsesConfig(
+  modelId: string,
+  workspaceDir: string,
+  maxTokens: number,
+): Pick<OpenClawConfig, "models" | "agents"> {
+  return {
+    ...configFor("openai", "https://api.openai.com/v1", {
+      api: "openai-responses",
+      auth: "api-key",
+      timeoutSeconds: 90,
+      models: [modelDefinition(modelId, { contextWindow: 200_000, maxTokens })],
+    }),
+    agents: {
+      entries: { main: { workspace: workspaceDir } },
+      defaults: {
+        skipBootstrap: true,
+        models: { [`openai/${modelId}`]: { params: { transport: "sse" } } },
+      },
+    },
+  };
+}
+
+export function extractLiveResponseText(content: CompleteSimpleContent): string {
+  return content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text.trim())
+    .join(" ")
+    .trim();
 }

@@ -1,136 +1,66 @@
-// Minimax provider module implements model/runtime integration.
-import type {
-  fetchProviderDownloadResponse,
-  fetchProviderOperationResponse,
-  resolveProviderHttpRequestConfig,
-} from "openclaw/plugin-sdk/provider-http";
-import { afterEach, vi, type Mock } from "vitest";
+import { getProviderHttpMocks } from "openclaw/plugin-sdk/provider-http-test-mocks";
+import { beforeEach, expect } from "vitest";
 
-type ResolveProviderHttpRequestConfigParams = Parameters<
-  typeof resolveProviderHttpRequestConfig
->[0];
-type FetchProviderOperationResponseParams = Parameters<typeof fetchProviderOperationResponse>[0];
-type FetchProviderDownloadResponseParams = Parameters<typeof fetchProviderDownloadResponse>[0];
+export {
+  getProviderHttpMocks as getMinimaxProviderHttpMocks,
+  installProviderHttpMockCleanup as installMinimaxProviderHttpMockCleanup,
+} from "openclaw/plugin-sdk/provider-http-test-mocks";
 
-type ResolveProviderHttpRequestConfigResult = {
-  baseUrl: string;
-  allowPrivateNetwork: boolean;
-  headers: Headers;
-  dispatcherPolicy: undefined;
-};
+const minimaxProviderHttpMocks = getProviderHttpMocks();
 
-type AnyMock = Mock<(...args: any[]) => any>;
-
-interface MinimaxProviderHttpMocks {
-  resolveApiKeyForProviderMock: Mock<() => Promise<{ apiKey: string }>>;
-  postJsonRequestMock: AnyMock;
-  fetchWithTimeoutMock: AnyMock;
-  fetchProviderOperationResponseMock: AnyMock;
-  fetchProviderDownloadResponseMock: AnyMock;
-  assertOkOrThrowHttpErrorMock: Mock<(response: Response, label: string) => Promise<void>>;
-  resolveProviderHttpRequestConfigMock: Mock<
-    (params: ResolveProviderHttpRequestConfigParams) => ResolveProviderHttpRequestConfigResult
-  >;
-}
-
-const minimaxProviderHttpMocks = vi.hoisted(() => ({
-  resolveApiKeyForProviderMock: vi.fn(async () => ({ apiKey: "provider-key" })),
-  postJsonRequestMock: vi.fn(),
-  fetchWithTimeoutMock: vi.fn(),
-  fetchProviderOperationResponseMock: vi.fn(),
-  fetchProviderDownloadResponseMock: vi.fn(),
-  assertOkOrThrowHttpErrorMock: vi.fn(async (_response: Response, _label: string) => {}),
-  resolveProviderHttpRequestConfigMock: vi.fn((params: ResolveProviderHttpRequestConfigParams) => ({
-    baseUrl: params.baseUrl ?? params.defaultBaseUrl,
-    allowPrivateNetwork: false,
-    headers: new Headers(params.defaultHeaders),
-    dispatcherPolicy: undefined,
-  })),
-}));
-
-function resolveMockProviderTimeoutMs(
-  timeoutMs: FetchProviderOperationResponseParams["timeoutMs"],
-) {
-  return typeof timeoutMs === "function" ? timeoutMs() : (timeoutMs ?? 60_000);
-}
-
-minimaxProviderHttpMocks.fetchProviderOperationResponseMock.mockImplementation(
-  async (params: FetchProviderOperationResponseParams) => {
-    const response = await minimaxProviderHttpMocks.fetchWithTimeoutMock(
-      params.url,
-      params.init ?? {},
-      resolveMockProviderTimeoutMs(params.timeoutMs),
-      params.fetchFn,
-    );
-    if (params.requestFailedMessage) {
-      await minimaxProviderHttpMocks.assertOkOrThrowHttpErrorMock(
-        response,
-        params.requestFailedMessage,
-      );
+beforeEach(() => {
+  minimaxProviderHttpMocks.resolveProviderHttpRequestConfigMock.mockImplementation((params) => {
+    const headers = new Headers(omitNullRequestHeaders(params.defaultHeaders));
+    for (const [key, value] of Object.entries(params.request?.headers ?? {})) {
+      if (value === null) {
+        headers.delete(key);
+      } else {
+        headers.set(key, value);
+      }
     }
-    return response;
-  },
-);
+    return {
+      baseUrl: params.baseUrl ?? params.defaultBaseUrl,
+      allowPrivateNetwork:
+        (params.allowPrivateNetwork ?? params.request?.allowPrivateNetwork) === true,
+      headers,
+      dispatcherPolicy: undefined,
+    };
+  });
+});
 
-minimaxProviderHttpMocks.fetchProviderDownloadResponseMock.mockImplementation(
-  async (params: FetchProviderDownloadResponseParams) => {
-    const response = await minimaxProviderHttpMocks.fetchWithTimeoutMock(
-      params.url,
-      params.init ?? {},
-      resolveMockProviderTimeoutMs(params.timeoutMs),
-      params.fetchFn,
-    );
-    await minimaxProviderHttpMocks.assertOkOrThrowHttpErrorMock(
-      response,
-      params.requestFailedMessage,
-    );
-    return response;
-  },
-);
-
-vi.mock("openclaw/plugin-sdk/provider-auth-runtime", () => ({
-  resolveApiKeyForProvider: minimaxProviderHttpMocks.resolveApiKeyForProviderMock,
-}));
-
-vi.mock("openclaw/plugin-sdk/provider-http", () => ({
-  assertOkOrThrowHttpError: minimaxProviderHttpMocks.assertOkOrThrowHttpErrorMock,
-  createProviderOperationDeadline: ({
-    label,
-    timeoutMs,
-  }: {
-    label: string;
-    timeoutMs?: number;
-  }) => ({
-    label,
-    timeoutMs,
-  }),
-  createProviderOperationTimeoutResolver:
-    ({ defaultTimeoutMs }: { defaultTimeoutMs: number }) =>
-    () =>
-      defaultTimeoutMs,
-  fetchProviderDownloadResponse: minimaxProviderHttpMocks.fetchProviderDownloadResponseMock,
-  fetchProviderOperationResponse: minimaxProviderHttpMocks.fetchProviderOperationResponseMock,
-  fetchWithTimeout: minimaxProviderHttpMocks.fetchWithTimeoutMock,
-  postJsonRequest: minimaxProviderHttpMocks.postJsonRequestMock,
-  resolveProviderOperationTimeoutMs: ({ defaultTimeoutMs }: { defaultTimeoutMs: number }) =>
-    defaultTimeoutMs,
-  resolveProviderHttpRequestConfig: minimaxProviderHttpMocks.resolveProviderHttpRequestConfigMock,
-  waitProviderOperationPollInterval: async () => {},
-}));
-
-export function getMinimaxProviderHttpMocks(): MinimaxProviderHttpMocks {
-  return minimaxProviderHttpMocks;
+export function mockCallArg(
+  mock: { mock: { calls: unknown[][] } },
+  index = 0,
+): Record<string, unknown> {
+  const call = mock.mock.calls[index];
+  if (!call) {
+    throw new Error(`expected mock call ${index}`);
+  }
+  return call[0] as Record<string, unknown>;
 }
 
-export function installMinimaxProviderHttpMockCleanup(): void {
-  afterEach(() => {
-    minimaxProviderHttpMocks.resolveApiKeyForProviderMock.mockClear();
-    minimaxProviderHttpMocks.postJsonRequestMock.mockReset();
-    minimaxProviderHttpMocks.fetchWithTimeoutMock.mockReset();
-    minimaxProviderHttpMocks.fetchProviderOperationResponseMock.mockClear();
-    minimaxProviderHttpMocks.fetchProviderDownloadResponseMock.mockClear();
-    minimaxProviderHttpMocks.assertOkOrThrowHttpErrorMock.mockClear();
-    minimaxProviderHttpMocks.resolveProviderHttpRequestConfigMock.mockClear();
+export function expectMinimaxGuardedFetchCall(index: number, url: string) {
+  const call = minimaxProviderHttpMocks.fetchWithTimeoutGuardedMock.mock.calls[index];
+  if (!call) {
+    throw new Error(`expected MiniMax guarded fetch call ${index + 1}`);
+  }
+  const [actualUrl, init, timeoutMs, fetchFn, options] = call;
+  expect(actualUrl).toBe(url);
+  expect((init as RequestInit | undefined)?.method).toBe("GET");
+  expect(Number.isInteger(timeoutMs)).toBe(true);
+  expect(timeoutMs).toBeGreaterThan(0);
+  expect(fetchFn).toBe(fetch);
+  return {
+    init: init as RequestInit,
+    options: options as Record<string, unknown> | undefined,
+  };
+}
+
+export function expectAllowPrivateNetworkPolicy(
+  options: Record<string, unknown> | undefined,
+): void {
+  expect(options).toEqual({
+    ssrfPolicy: { allowPrivateNetwork: true },
   });
 }
 
@@ -141,3 +71,4 @@ export function loadMinimaxMusicGenerationProviderModule() {
 export function loadMinimaxVideoGenerationProviderModule() {
   return import("./video-generation-provider.js");
 }
+import { omitNullRequestHeaders } from "openclaw/plugin-sdk/provider-request-headers";

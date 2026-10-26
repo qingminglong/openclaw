@@ -20,7 +20,6 @@ async function main() {
     {
       gateway: {
         controlUi: {
-          allowInsecureAuth: true,
           enabled: false,
         },
         http: {
@@ -31,21 +30,7 @@ async function main() {
           },
         },
       },
-      agents: {
-        defaults: {
-          heartbeat: {
-            every: "0m",
-          },
-          memorySearch: {
-            enabled: false,
-            sync: {
-              onSearch: false,
-              onSessionStart: false,
-              watch: false,
-            },
-          },
-        },
-      },
+      memory: { search: { enabled: false } },
       plugins: {
         slots: {
           memory: "none",

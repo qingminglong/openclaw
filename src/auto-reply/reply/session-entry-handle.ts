@@ -1,42 +1,66 @@
-// Narrow mutable handle for the active reply session entry.
 import type { SessionEntry } from "../../config/sessions.js";
 
 export type ReplySessionEntryHandle = {
+  clearCurrent(): void;
   get(sessionKey: string): SessionEntry | undefined;
   getCurrent(): SessionEntry | undefined;
-  patchCurrent(patch: Partial<SessionEntry>): SessionEntry | undefined;
   replaceCurrent(entry: SessionEntry): void;
-  set(sessionKey: string, entry: SessionEntry): void;
   toCompatSessionStore(): Record<string, SessionEntry>;
 };
 
+export function publishReplySessionEntry(
+  params: {
+    sessionEntryHandle?: ReplySessionEntryHandle;
+    sessionStore?: Record<string, SessionEntry>;
+    sessionKey?: string;
+  },
+  entry: SessionEntry | undefined,
+): void {
+  if (entry) {
+    if (params.sessionEntryHandle) {
+      params.sessionEntryHandle.replaceCurrent(entry);
+    } else if (params.sessionStore && params.sessionKey) {
+      params.sessionStore[params.sessionKey] = entry;
+    }
+  } else {
+    params.sessionEntryHandle?.clearCurrent();
+    if (params.sessionStore && params.sessionKey) {
+      delete params.sessionStore[params.sessionKey];
+    }
+  }
+}
+
 export function createReplySessionEntryHandle(params: {
-  sessionEntry: SessionEntry;
-  sessionKey: string;
+  sessionEntry?: SessionEntry;
+  sessionKey?: string;
   sessionStore?: Record<string, SessionEntry>;
 }): ReplySessionEntryHandle {
-  const entries = params.sessionStore ?? { [params.sessionKey]: params.sessionEntry };
+  const { sessionKey, sessionStore } = params;
+  const entries = sessionStore ?? {};
   let currentEntry = params.sessionEntry;
-  entries[params.sessionKey] = currentEntry;
-
-  return {
-    get: (sessionKey) => entries[sessionKey],
-    getCurrent: () => currentEntry,
-    patchCurrent: (patch) => {
-      currentEntry = { ...currentEntry, ...patch };
-      entries[params.sessionKey] = currentEntry;
-      return currentEntry;
-    },
-    replaceCurrent: (entry) => {
-      currentEntry = entry;
-      entries[params.sessionKey] = entry;
-    },
-    set: (sessionKey, entry) => {
+  if (sessionKey) {
+    if (currentEntry) {
+      entries[sessionKey] = currentEntry;
+    } else {
+      delete entries[sessionKey];
+    }
+  }
+  const replaceCurrent = (entry: SessionEntry): void => {
+    currentEntry = entry;
+    if (sessionKey) {
       entries[sessionKey] = entry;
-      if (sessionKey === params.sessionKey) {
-        currentEntry = entry;
+    }
+  };
+  return {
+    clearCurrent: () => {
+      currentEntry = undefined;
+      if (sessionKey) {
+        delete entries[sessionKey];
       }
     },
+    get: (key) => entries[key],
+    getCurrent: () => (sessionKey ? entries[sessionKey] : currentEntry),
+    replaceCurrent,
     toCompatSessionStore: () => entries,
   };
 }

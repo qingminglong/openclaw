@@ -1,76 +1,90 @@
 // Googlechat tests cover doctor contract plugin behavior.
 import { describe, expect, it } from "vitest";
-import { normalizeCompatibilityConfig } from "./doctor-contract.js";
+import { legacyConfigRules, normalizeCompatibilityConfig } from "./doctor-contract.js";
+import { collectGoogleChatMutableAllowlistWarnings } from "./doctor.js";
 
 describe("googlechat doctor contract", () => {
-  it("removes legacy streamMode keys", () => {
+  it.each([
+    {
+      label: "space sender",
+      config: { groups: { "spaces/team": { users: ["carol@example.com"] } } },
+      expectedPath: "channels.googlechat.groups.spaces/team.users: carol@example.com",
+    },
+  ])("warns for mutable $label allowlist entries", ({ config, expectedPath }) => {
+    const warnings = collectGoogleChatMutableAllowlistWarnings({
+      cfg: { channels: { googlechat: config } },
+    });
+
+    expect(warnings).toContain(`- ${expectedPath}`);
+  });
+
+  it("removes retired reaction flags", () => {
+    const result = normalizeCompatibilityConfig({
+      cfg: {
+        channels: {
+          googlechat: {
+            actions: { reactions: true },
+            accounts: { work: { actions: { reactions: false } } },
+          },
+        },
+      } as never,
+    });
+    expect(result.config.channels?.googlechat).toEqual({ accounts: { work: {} } });
+    expect(result.changes).toEqual([
+      "Removed channels.googlechat.actions.reactions (Google Chat does not support reactions).",
+      "Removed channels.googlechat.accounts.work.actions.reactions (Google Chat does not support reactions).",
+    ]);
+  });
+  it("detects and promotes legacy nested DM access at root and account scope", () => {
+    const dmRules = legacyConfigRules.filter((rule) => rule.message.includes("dm.policy"));
+    expect(dmRules[0]?.match?.({ dm: { policy: "allowlist" } }, {})).toBe(true);
+    expect(dmRules[1]?.match?.({ work: { dm: { allowFrom: ["users/work"] } } }, {})).toBe(true);
+
+    const result = normalizeCompatibilityConfig({
+      cfg: {
+        channels: {
+          googlechat: {
+            dm: { enabled: false, policy: "allowlist", allowFrom: ["users/root"] },
+            accounts: { work: { dm: { policy: "open", allowFrom: ["*"] } } },
+          },
+        },
+      } as never,
+    });
+
+    expect(result.config.channels?.googlechat).toEqual({
+      dm: { enabled: false },
+      dmPolicy: "allowlist",
+      allowFrom: ["users/root"],
+      accounts: { work: { dmPolicy: "open", allowFrom: ["*"] } },
+    });
+  });
+
+  it("moves flat delivery aliases at root and account level with root seeding", () => {
     const result = normalizeCompatibilityConfig({
       cfg: {
         channels: {
           googlechat: {
             streamMode: "append",
+            chunkMode: "newline",
             accounts: {
-              work: {
-                streamMode: "replace",
-              },
+              work: { blockStreaming: true },
             },
           },
         },
       } as never,
     });
 
-    expect(result.changes).toEqual([
-      "Removed channels.googlechat.streamMode (legacy key no longer used).",
-      "Removed channels.googlechat.accounts.work.streamMode (legacy key no longer used).",
-    ]);
-    expect(result.config.channels?.googlechat).toEqual({
-      accounts: {
-        work: {},
-      },
-    });
-  });
+    const googlechat = result.config.channels?.googlechat as unknown as Record<string, unknown>;
+    expect(googlechat.streamMode).toBeUndefined();
+    expect(googlechat.streaming).toEqual({ chunkMode: "newline" });
+    expect(googlechat.chunkMode).toBeUndefined();
+    const work = (googlechat.accounts as Record<string, Record<string, unknown>>).work;
+    // Google Chat's account merge replaces root streaming wholesale, so the
+    // migrated account object carries the inherited root chunk mode.
+    expect(work?.streaming).toEqual({ chunkMode: "newline", block: { enabled: true } });
+    expect(work?.blockStreaming).toBeUndefined();
 
-  it("moves legacy group allow toggles into enabled", () => {
-    const result = normalizeCompatibilityConfig({
-      cfg: {
-        channels: {
-          googlechat: {
-            groups: {
-              "spaces/aaa": {
-                allow: false,
-              },
-              "spaces/bbb": {
-                allow: true,
-                enabled: false,
-              },
-            },
-            accounts: {
-              work: {
-                groups: {
-                  "spaces/ccc": {
-                    allow: true,
-                  },
-                },
-              },
-            },
-          },
-        },
-      } as never,
-    });
-
-    expect(result.changes).toEqual([
-      "Moved channels.googlechat.groups.spaces/aaa.allow → channels.googlechat.groups.spaces/aaa.enabled.",
-      "Removed channels.googlechat.groups.spaces/bbb.allow (channels.googlechat.groups.spaces/bbb.enabled already set).",
-      "Moved channels.googlechat.accounts.work.groups.spaces/ccc.allow → channels.googlechat.accounts.work.groups.spaces/ccc.enabled.",
-    ]);
-    expect(result.config.channels?.googlechat?.groups?.["spaces/aaa"]).toEqual({
-      enabled: false,
-    });
-    expect(result.config.channels?.googlechat?.groups?.["spaces/bbb"]).toEqual({
-      enabled: false,
-    });
-    expect(result.config.channels?.googlechat?.accounts?.work?.groups?.["spaces/ccc"]).toEqual({
-      enabled: true,
-    });
+    const second = normalizeCompatibilityConfig({ cfg: result.config });
+    expect(second.changes).toEqual([]);
   });
 });

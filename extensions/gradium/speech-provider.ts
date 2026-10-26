@@ -1,78 +1,158 @@
-// Gradium provider module implements model/runtime integration.
 import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
 import type {
-  SpeechDirectiveTokenParseContext,
   SpeechProviderConfig,
   SpeechProviderPlugin,
+  SpeechSynthesisRequest,
+  SpeechTelephonySynthesisRequest,
 } from "openclaw/plugin-sdk/speech";
-import { asObject, trimToUndefined } from "openclaw/plugin-sdk/speech";
-import { DEFAULT_GRADIUM_VOICE_ID, GRADIUM_VOICES, normalizeGradiumBaseUrl } from "./shared.js";
-import { gradiumTTS } from "./tts.js";
+import {
+  createSpeechDirectiveParser,
+  resolveSpeechProviderApiKey,
+} from "openclaw/plugin-sdk/speech-provider";
+import {
+  asOptionalRecord,
+  normalizeOptionalString as trimToUndefined,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 
-const DEFAULT_GENERATED_AUDIO_MAX_BYTES = 16 * 1024 * 1024;
+const DEFAULT_GRADIUM_BASE_URL = "https://api.gradium.ai";
+const GRADIUM_API_HOSTNAME = "api.gradium.ai";
+const DEFAULT_GRADIUM_VOICE_ID = "YTpq7expH9539ERJ";
 
-type GradiumProviderConfig = {
-  apiKey?: string;
-  baseUrl: string;
-  voiceId: string;
-};
+const GRADIUM_VOICES = [
+  { id: "YTpq7expH9539ERJ", name: "Emma" },
+  { id: "LFZvm12tW_z0xfGo", name: "Kent" },
+  { id: "Eu9iL_CYe8N-Gkx_", name: "Tiffany" },
+  { id: "2H4HY2CBNyJHBCrP", name: "Christina" },
+  { id: "jtEKaLYNn6iif5PR", name: "Sydney" },
+  { id: "KWJiFWu2O9nMPYcR", name: "John" },
+  { id: "3jUdJyOi9pgbxBTK", name: "Arthur" },
+] as const;
 
-function normalizeGradiumProviderConfig(rawConfig: Record<string, unknown>): GradiumProviderConfig {
-  const providers = asObject(rawConfig.providers);
-  const raw = asObject(providers?.gradium) ?? asObject(rawConfig.gradium);
+function normalizeGradiumBaseUrl(baseUrl?: string): string {
+  const raw = baseUrl?.trim() || DEFAULT_GRADIUM_BASE_URL;
+  const url = URL.parse(raw);
+  if (!url) {
+    throw new Error("Gradium baseUrl must be a valid https URL");
+  }
+
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+
+  if (url.protocol !== "https:") {
+    throw new Error("Gradium baseUrl must use https");
+  }
+  if (url.hostname.toLowerCase() !== GRADIUM_API_HOSTNAME) {
+    throw new Error("Gradium baseUrl must target api.gradium.ai");
+  }
+
+  return url.toString().replace(/\/+$/, "");
+}
+
+function normalizeGradiumProviderConfig(rawConfig: Record<string, unknown>) {
+  const providers = asOptionalRecord(rawConfig.providers);
+  const raw = asOptionalRecord(providers?.gradium);
   return {
     apiKey: normalizeResolvedSecretInputString({
       value: raw?.apiKey,
-      path: "messages.tts.providers.gradium.apiKey",
+      path: "tts.providers.gradium.apiKey",
     }),
     baseUrl: normalizeGradiumBaseUrl(trimToUndefined(raw?.baseUrl)),
     voiceId: trimToUndefined(raw?.voiceId) ?? DEFAULT_GRADIUM_VOICE_ID,
   };
 }
 
-function readGradiumProviderConfig(config: SpeechProviderConfig): GradiumProviderConfig {
-  const defaults = normalizeGradiumProviderConfig({});
-  return {
-    apiKey: trimToUndefined(config.apiKey) ?? defaults.apiKey,
-    baseUrl: normalizeGradiumBaseUrl(trimToUndefined(config.baseUrl) ?? defaults.baseUrl),
-    voiceId: trimToUndefined(config.voiceId) ?? defaults.voiceId,
-  };
+function readGradiumProviderConfig(config: SpeechProviderConfig) {
+  return normalizeGradiumProviderConfig({
+    providers: { gradium: { ...config, apiKey: trimToUndefined(config.apiKey) } },
+  });
 }
 
-function resolveGeneratedAudioMaxBytes(req: {
-  cfg: { agents?: { defaults?: { mediaMaxMb?: number } } };
-}): number {
-  const configured = req.cfg.agents?.defaults?.mediaMaxMb;
-  if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
-    return Math.floor(configured * 1024 * 1024);
-  }
-  return DEFAULT_GENERATED_AUDIO_MAX_BYTES;
+function resolveGradiumApiKey(configApiKey: unknown): string | undefined {
+  return resolveSpeechProviderApiKey(trimToUndefined(configApiKey), process.env.GRADIUM_API_KEY);
 }
 
-function parseDirectiveToken(ctx: SpeechDirectiveTokenParseContext): {
-  handled: boolean;
-  overrides?: Record<string, unknown>;
-  warnings?: string[];
-} {
-  switch (ctx.key) {
-    case "voice":
-    case "voice_id":
-    case "voiceid":
-    case "gradium_voice":
-    case "gradiumvoice":
-      if (!ctx.policy.allowVoice) {
-        return { handled: true };
-      }
-      return {
-        handled: true,
-        overrides: { ...ctx.currentOverrides, voiceId: ctx.value },
-      };
-    default:
-      return { handled: false };
+async function synthesizeGradium(
+  req: SpeechSynthesisRequest | SpeechTelephonySynthesisRequest,
+  outputFormat: "wav" | "opus" | "ulaw_8000",
+): Promise<Buffer> {
+  const config = readGradiumProviderConfig(req.providerConfig);
+  const apiKey = resolveGradiumApiKey(config.apiKey);
+  if (!apiKey) {
+    throw new Error("Gradium API key missing");
+  }
+  const { resolveGeneratedMediaMaxBytes } =
+    await import("openclaw/plugin-sdk/media-generation-runtime");
+  const text = req.text;
+  const voiceId = trimToUndefined(req.providerOverrides?.voiceId) ?? config.voiceId;
+  const timeoutMs = req.timeoutMs;
+  const maxBytes = resolveGeneratedMediaMaxBytes(req.cfg, "audio");
+  const url = `${config.baseUrl}/api/post/speech/tts`;
+  const { assertOkOrThrowProviderError, readProviderBinaryResponse } =
+    await import("openclaw/plugin-sdk/provider-http");
+  const { fetchWithSsrFGuard } = await import("openclaw/plugin-sdk/ssrf-runtime");
+
+  const { response, release } = await fetchWithSsrFGuard({
+    url,
+    init: {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text,
+        voice_id: voiceId,
+        only_audio: true,
+        output_format: outputFormat,
+        json_config: JSON.stringify({ padding_bonus: 0 }),
+      }),
+    },
+    timeoutMs,
+    requireHttps: true,
+    // Keep the transport boundary independent from config normalization so a
+    // future validator relaxation cannot silently widen credential egress.
+    policy: { hostnameAllowlist: [GRADIUM_API_HOSTNAME] },
+    auditContext: "gradium.tts",
+  });
+
+  try {
+    await assertOkOrThrowProviderError(response, "Gradium API error", {
+      requestHeaders: { "x-api-key": apiKey },
+    });
+
+    return await readProviderBinaryResponse(response, "Gradium API error", "audio", {
+      maxBytes,
+      onOverflow: ({ maxBytes: maxBytesLocal }) =>
+        new Error(`Gradium TTS audio response exceeds ${maxBytesLocal} bytes`),
+    });
+  } finally {
+    await release();
   }
 }
+
+function isGradiumProviderConfigured(config: SpeechProviderConfig): boolean {
+  const apiKey = resolveGradiumApiKey(config.apiKey);
+  if (!apiKey) {
+    return false;
+  }
+  try {
+    normalizeGradiumBaseUrl(trimToUndefined(config.baseUrl));
+    return true;
+  } catch {
+    // Provider selection is a predicate; synthesis reports the precise URL error.
+    return false;
+  }
+}
+
+const parseDirectiveToken = createSpeechDirectiveParser({
+  voiceId: ["allowVoice", ["voice", "voice_id", "voiceid", "gradium_voice", "gradiumvoice"]],
+});
 
 export function buildGradiumSpeechProvider(): SpeechProviderPlugin {
+  const isConfigured: NonNullable<SpeechProviderPlugin["isConfigured"]> = ({ providerConfig }) =>
+    isGradiumProviderConfigured(providerConfig);
   return {
     id: "gradium",
     label: "Gradium",
@@ -81,26 +161,13 @@ export function buildGradiumSpeechProvider(): SpeechProviderPlugin {
     resolveConfig: ({ rawConfig }) => normalizeGradiumProviderConfig(rawConfig),
     parseDirectiveToken,
     listVoices: async () => GRADIUM_VOICES.map((v) => ({ id: v.id, name: v.name })),
-    isConfigured: ({ providerConfig }) =>
-      Boolean(readGradiumProviderConfig(providerConfig).apiKey || process.env.GRADIUM_API_KEY),
+    // Retained for synchronous SDK consumers through 2026-12-31.
+    isConfigured,
+    isConfiguredAsync: async (ctx) => isConfigured(ctx),
     synthesize: async (req) => {
-      const config = readGradiumProviderConfig(req.providerConfig);
-      const overrides = req.providerOverrides ?? {};
-      const apiKey = config.apiKey || process.env.GRADIUM_API_KEY;
-      if (!apiKey) {
-        throw new Error("Gradium API key missing");
-      }
       const wantsVoiceNote = req.target === "voice-note";
       const outputFormat = wantsVoiceNote ? "opus" : "wav";
-      const audioBuffer = await gradiumTTS({
-        text: req.text,
-        apiKey,
-        baseUrl: config.baseUrl,
-        voiceId: trimToUndefined(overrides.voiceId) ?? config.voiceId,
-        outputFormat,
-        timeoutMs: req.timeoutMs,
-        maxBytes: resolveGeneratedAudioMaxBytes(req),
-      });
+      const audioBuffer = await synthesizeGradium(req, outputFormat);
       return {
         audioBuffer,
         outputFormat,
@@ -108,25 +175,10 @@ export function buildGradiumSpeechProvider(): SpeechProviderPlugin {
         voiceCompatible: wantsVoiceNote,
       };
     },
-    synthesizeTelephony: async (req) => {
-      const config = readGradiumProviderConfig(req.providerConfig);
-      const overrides = req.providerOverrides ?? {};
-      const apiKey = config.apiKey || process.env.GRADIUM_API_KEY;
-      if (!apiKey) {
-        throw new Error("Gradium API key missing");
-      }
-      const outputFormat = "ulaw_8000";
-      const sampleRate = 8_000;
-      const audioBuffer = await gradiumTTS({
-        text: req.text,
-        apiKey,
-        baseUrl: config.baseUrl,
-        voiceId: trimToUndefined(overrides.voiceId) ?? config.voiceId,
-        outputFormat,
-        timeoutMs: req.timeoutMs,
-        maxBytes: resolveGeneratedAudioMaxBytes(req),
-      });
-      return { audioBuffer, outputFormat, sampleRate };
-    },
+    synthesizeTelephony: async (req) => ({
+      audioBuffer: await synthesizeGradium(req, "ulaw_8000"),
+      outputFormat: "ulaw_8000",
+      sampleRate: 8_000,
+    }),
   };
 }

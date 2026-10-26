@@ -1,139 +1,114 @@
-// Coverage for provider-runtime extra parameter handoff and transport filtering.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLlmStreamSimpleMock } from "../../../test/helpers/agents/llm-stream-simple-mock.js";
-import type { Model } from "../../llm/types.js";
-import {
-  testing as extraParamsTesting,
-  resolveAgentTransportOverride,
-  resolveExplicitSettingsTransport,
-} from "./extra-params.js";
-import { runExtraParamsCase } from "./extra-params.test-support.js";
+import { createKilocodeWrapper } from "../../llm/providers/stream-wrappers/proxy.js";
+import type { Model, SimpleStreamOptions } from "../../llm/types.js";
+import { captureEnv } from "../../test-utils/env.js";
+import type { StreamFn } from "../runtime/index.js";
+import { attachToolAllowlistIntersection } from "../tool-policy.js";
+import { resolveAgentTransportOverride, resolveExplicitSettingsTransport } from "./extra-params.js";
+import { runExtraParamsCase, testing as extraParamsTesting } from "./extra-params.test-support.js";
 
 vi.mock("../../llm/stream.js", () => createLlmStreamSimpleMock());
 
-beforeEach(() => {
-  extraParamsTesting.setProviderRuntimeDepsForTest({
-    prepareProviderExtraParams: ({ context }) => context.extraParams,
-    resolveProviderExtraParamsForTransport: () => undefined,
-    wrapProviderStreamFn: ({ provider, context }) => {
-      if (provider !== "local-provider" || context.thinkingLevel !== "off") {
-        return context.streamFn;
-      }
-      // Local-provider plugin owns the exact payload spelling for thinking-off;
-      // core only hands the intent through this wrapper seam.
-      const baseStreamFn = context.streamFn;
-      if (!baseStreamFn) {
-        return undefined;
-      }
-      return (model, streamContext, options) =>
-        baseStreamFn(model, streamContext, {
-          ...options,
-          onPayload: (payload, payloadModel) => {
-            if (payload && typeof payload === "object") {
-              (payload as Record<string, unknown>).think = false;
-            }
-            return options?.onPayload?.(payload, payloadModel);
-          },
-        });
-    },
-  });
-});
-
-afterEach(() => {
-  extraParamsTesting.resetProviderRuntimeDepsForTest();
-});
-
 describe("extra-params: provider runtime handoff", () => {
-  it("keeps unsupported upstream transport values out of OpenClaw runtime hooks", () => {
-    // Upstream transports can name modes OpenClaw does not own; unresolved values
-    // must be filtered before plugin runtime hooks receive them.
-    const settingsManager = {
-      getGlobalSettings: () => ({}),
-      getProjectSettings: () => ({}),
-    };
-
-    expect(
-      resolveAgentTransportOverride({
-        settingsManager,
-        effectiveExtraParams: { transport: "websocket-cached" },
-      }),
-    ).toBeUndefined();
-    expect(
-      resolveExplicitSettingsTransport({
-        settingsManager: {
-          getGlobalSettings: () => ({ transport: "auto" }),
-          getProjectSettings: () => ({}),
+  afterEach(() => extraParamsTesting.resetProviderRuntimeDepsForTest());
+  it.each([
+    { label: "default", allowlist: undefined, expected: true },
+    { label: "disabled tools", allowlist: undefined, webSearchEnabled: false, expected: false },
+    { label: "no tools", allowlist: [], expected: false },
+    { label: "explicit search", allowlist: ["web_search"], expected: true },
+    {
+      label: "intersected wildcard",
+      allowlist: attachToolAllowlistIntersection(["*", "message"], [["*"], ["message"]]),
+      expected: false,
+    },
+  ])(
+    "keeps $label authority on the actual provider payload",
+    ({ allowlist: runtimeToolAllowlist, webSearchEnabled, expected }) => {
+      const payload: { tools: Array<Record<string, unknown>> } = {
+        tools: [{ type: "function", name: "message" }],
+      };
+      extraParamsTesting.setProviderRuntimeDepsForTest({
+        prepareProviderExtraParams: ({ context }) => context.extraParams,
+        resolveProviderExtraParamsForTransport: () => undefined,
+        wrapProviderStreamFn: ({ context }) => {
+          const underlying = context.streamFn;
+          if (!underlying || context.nativeWebSearchAllowedByToolPolicy === false) {
+            return underlying;
+          }
+          return (model, streamContext, options) =>
+            underlying(model, streamContext, {
+              ...options,
+              onPayload: (request, requestModel) => {
+                (request as typeof payload).tools.push({ type: "web_search" });
+                return options?.onPayload?.(request, requestModel);
+              },
+            });
         },
-        sessionTransport: "websocket-cached",
-      }),
-    ).toBeUndefined();
-  });
-
-  it("passes thinking-off intent through the provider runtime wrapper seam", () => {
-    const payload = runExtraParamsCase({
-      applyProvider: "local-provider",
-      applyModelId: "local-model:9b",
-      model: {
-        api: "openai-completions",
-        provider: "local-provider",
-        id: "local-model:9b",
-      } as unknown as Model<"openai-completions">,
-      thinkingLevel: "off",
-      payload: {
-        model: "local-model:9b",
-        messages: [],
-        stream: true,
-        options: {
-          num_ctx: 65536,
-        },
-      },
-    }).payload as Record<string, unknown>;
-
-    // think must be top-level, not nested under options; provider runtimes own
-    // this wire-format distinction.
-    expect(payload.think).toBe(false);
-    expect((payload.options as Record<string, unknown>).think).toBeUndefined();
-  });
-
-  it("does not apply the plugin wrapper for other providers", () => {
-    const payload = runExtraParamsCase({
-      applyProvider: "openai",
-      applyModelId: "gpt-5.4",
-      model: {
-        api: "openai-completions",
+      });
+      const model = {
+        api: "openai-responses",
         provider: "openai",
         id: "gpt-5.4",
-      } as unknown as Model<"openai-completions">,
-      thinkingLevel: "off",
-      payload: {
-        model: "gpt-5.4",
-        messages: [],
-      },
-    }).payload as Record<string, unknown>;
+        baseUrl: "https://api.openai.com/v1",
+      } as Model<"openai-responses">;
 
-    expect(payload.think).toBeUndefined();
-  });
-
-  it("does not apply the plugin wrapper when thinkingLevel is not off", () => {
-    const payload = runExtraParamsCase({
-      applyProvider: "local-provider",
-      applyModelId: "local-model:9b",
-      model: {
-        api: "openai-completions",
-        provider: "local-provider",
-        id: "local-model:9b",
-      } as unknown as Model<"openai-completions">,
-      thinkingLevel: "high",
-      payload: {
-        model: "local-model:9b",
-        messages: [],
-        stream: true,
-        options: {
-          num_ctx: 65536,
+      runExtraParamsCase({
+        agentId: "main",
+        model,
+        runtimeModel: model,
+        payload,
+        policyOptions: {
+          nativeWebSearchPolicyContext: { runtimeToolAllowlist, webSearchEnabled },
         },
-      },
-    }).payload as Record<string, unknown>;
+      });
 
-    expect(payload.think).toBeUndefined();
+      expect(payload.tools.some((tool) => tool.type === "web_search")).toBe(expected);
+    },
+  );
+});
+
+it("supports cached WebSockets and filters unknown upstream transport values", () => {
+  const settingsManager = { getGlobalSettings: () => ({}) };
+  const override = (transport: string) =>
+    resolveAgentTransportOverride({
+      settingsManager,
+      effectiveExtraParams: { transport },
+    });
+  expect(override("websocket-cached")).toBe("websocket-cached");
+  expect(override("webtransport")).toBeUndefined();
+  expect(
+    resolveExplicitSettingsTransport({
+      settingsManager: { getGlobalSettings: () => ({ transport: "auto" }) },
+      sessionTransport: "websocket-cached",
+    }),
+  ).toBe("websocket-cached");
+});
+
+describe("extra-params: Kilocode wrapper", () => {
+  const envSnapshot = captureEnv(["KILOCODE_FEATURE"]);
+
+  afterEach(() => envSnapshot.restore());
+
+  it("cannot be overridden by caller headers", () => {
+    delete process.env.KILOCODE_FEATURE;
+
+    let headers: SimpleStreamOptions["headers"];
+    const stream = createKilocodeWrapper((_model, _context, options) => {
+      headers = options?.headers;
+      options?.onPayload?.({}, _model);
+      return {} as ReturnType<StreamFn>;
+    }, "high");
+    void stream(
+      {
+        api: "openai-completions",
+        provider: "kilocode",
+        id: "anthropic/claude-sonnet-4",
+      } as Model<"openai-completions">,
+      { messages: [] },
+      { headers: { "X-KILOCODE-FEATURE": "should-be-overwritten" } },
+    );
+
+    expect(headers?.["X-KILOCODE-FEATURE"]).toBe("openclaw");
   });
 });

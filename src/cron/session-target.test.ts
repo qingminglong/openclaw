@@ -14,28 +14,19 @@ describe("cron session target helpers", () => {
     );
   });
 
-  it("preserves opaque persistent session targets with native separators", () => {
-    expect(
-      resolveCronSessionTargetSessionKey(
-        "session: agent:main:dingtalk:group:cid3tmd4xb19xjfk/wogxwy2a== ",
-      ),
-    ).toBe("agent:main:dingtalk:group:cid3tmd4xb19xjfk/wogxwy2a==");
-    expect(resolveCronSessionTargetSessionKey("session:..\\outside")).toBe("..\\outside");
-  });
-
   it("rejects null bytes in persistent session targets", () => {
     expect(() => resolveCronSessionTargetSessionKey("session:bad\0id")).toThrow(
       "invalid cron sessionTarget session id",
     );
   });
 
-  it("resolves current targets to the creator session key", () => {
+  it("preserves current targets when a creator session key exists", () => {
     expect(
       resolveCronCurrentSessionTarget({
         sessionTarget: "current",
         sessionKey: " agent:main:dingtalk:group:cid3tmd4xb19xjfk/wogxwy2a== ",
       }),
-    ).toBe("session:agent:main:dingtalk:group:cid3tmd4xb19xjfk/wogxwy2a==");
+    ).toBe("current");
   });
 
   it("falls back current targets to isolated without a creator session key", () => {

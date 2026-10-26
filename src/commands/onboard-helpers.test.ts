@@ -1,45 +1,72 @@
-// Onboard helper tests cover workspace setup, control UI links, and gateway reachability probes.
 import * as fs from "node:fs";
-import fsPromises from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RuntimeEnv } from "../runtime.js";
+import { ConnectErrorDetailCodes } from "../../packages/gateway-protocol/src/connect-error-details.js";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { openUrl } from "../infra/browser-open.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { withMockedPlatform } from "../test-utils/vitest-spies.js";
 import {
   formatControlUiSshHint,
   handleReset,
-  moveToTrash,
   normalizeGatewayTokenInput,
-  openUrl,
+  probeGatewayConfiguredModel,
   probeGatewayReachable,
-  resolveBrowserOpenCommand,
+  resolveAdvertisedControlUiLinks,
   resolveControlUiLinks,
+  resolveLocalControlUiProbeLinks,
   summarizeExistingConfig,
   validateGatewayPasswordInput,
   waitForGatewayReachable,
 } from "./onboard-helpers.js";
+import { createThrowingTestRuntime } from "./test-runtime-config-helpers.js";
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const localProbe = { url: "ws://127.0.0.1:18789" };
+const remoteUrl = "wss://gateway.example.com:18789";
+const probeAuth = { token: undefined, password: undefined };
+const probeFailure = (error: string, code: string, gatewayReached = false) => ({
+  ok: false,
+  error,
+  gatewayReached,
+  connectErrorDetails: { code },
+});
 
 const mocks = vi.hoisted(() => ({
+  removeAgentSessions: vi.fn(async () => {}),
   movePathToTrash: vi.fn(async (targetPath: string) => `${targetPath}.trashed`),
-  runCommandWithTimeout: vi.fn<
-    (
-      argv: string[],
-      options?: { timeoutMs?: number; windowsVerbatimArguments?: boolean },
-    ) => Promise<{ stdout: string; stderr: string; code: number; signal: null; killed: boolean }>
-  >(async () => ({
-    stdout: "",
-    stderr: "",
-    code: 0,
-    signal: null,
-    killed: false,
-  })),
+  runCommandWithTimeout: vi.fn<typeof import("../process/exec.js").runCommandWithTimeout>(
+    async () => ({
+      stdout: "",
+      stderr: "",
+      code: 0,
+      signal: null,
+      killed: false,
+      termination: "exit",
+    }),
+  ),
   pickPrimaryTailnetIPv4: vi.fn<() => string | undefined>(() => undefined),
+  resolveAdvertisedLanHostCore: vi.fn<() => Promise<string | null>>(async () => null),
   probeGateway: vi.fn(),
+  deleteWorkspaceState: vi.fn(),
+  prepareWorkspaceStateDeletion: vi.fn((workspaceDir: string) => ({ workspaceDir })),
+  prepareLegacyWorkspaceStateReset: vi.fn(() => ({ candidates: [] })),
+  removeLegacyWorkspaceStateForReset: vi.fn(
+    async (): Promise<{ removedPaths: string[]; warnings: string[] }> => ({
+      removedPaths: [],
+      warnings: [],
+    }),
+  ),
 }));
 
-vi.mock("../infra/fs-safe.js", () => ({
+vi.mock("./cleanup-utils.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./cleanup-utils.js")>()),
+  removeAgentSessions: mocks.removeAgentSessions,
+}));
+
+vi.mock("../infra/fs-safe.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../infra/fs-safe.js")>()),
   movePathToTrash: mocks.movePathToTrash,
 }));
 
@@ -51,371 +78,256 @@ vi.mock("../infra/tailnet.js", () => ({
   pickPrimaryTailnetIPv4: mocks.pickPrimaryTailnetIPv4,
 }));
 
+vi.mock("../infra/advertised-lan-host.js", () => ({
+  resolveAdvertisedLanHostCore: mocks.resolveAdvertisedLanHostCore,
+}));
+
 vi.mock("../gateway/probe.js", () => ({
   probeGateway: mocks.probeGateway,
 }));
 
+vi.mock("../agents/workspace-state-store.js", async () => ({
+  ...(await vi.importActual<typeof import("../agents/workspace-state-store.js")>(
+    "../agents/workspace-state-store.js",
+  )),
+  deleteWorkspaceState: mocks.deleteWorkspaceState,
+  prepareWorkspaceStateDeletion: mocks.prepareWorkspaceStateDeletion,
+}));
+
+vi.mock("../agents/workspace-legacy-state.js", async () => ({
+  ...(await vi.importActual<typeof import("../agents/workspace-legacy-state.js")>(
+    "../agents/workspace-legacy-state.js",
+  )),
+  prepareLegacyWorkspaceStateReset: mocks.prepareLegacyWorkspaceStateReset,
+  removeLegacyWorkspaceStateForReset: mocks.removeLegacyWorkspaceStateForReset,
+}));
+
 afterEach(() => {
+  mocks.probeGateway.mockReset();
+  mocks.removeAgentSessions.mockReset().mockResolvedValue(undefined);
   vi.clearAllMocks();
+  mocks.movePathToTrash.mockReset();
+  mocks.movePathToTrash.mockImplementation(async (targetPath: string) => `${targetPath}.trashed`);
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
 });
-
-type RunCommandCall = [
-  argv: string[],
-  options?: { timeoutMs?: number; windowsVerbatimArguments?: boolean },
-];
-
-function requireFirstRunCommandCall(): RunCommandCall {
-  const [call] = mocks.runCommandWithTimeout.mock.calls;
-  if (!call) {
-    throw new Error("expected browser open command call");
-  }
-  return call as RunCommandCall;
-}
 
 function expectedTrashSourcePath(targetPath: string): string {
   return path.join(fs.realpathSync(path.dirname(targetPath)), path.basename(targetPath));
 }
 
+function expectNoResetEffects() {
+  expect(mocks.movePathToTrash).not.toHaveBeenCalled();
+  expect(mocks.deleteWorkspaceState).not.toHaveBeenCalled();
+}
+
+function openWindowsUrl(url: string) {
+  vi.stubEnv("VITEST", "");
+  vi.stubEnv("NODE_ENV", "development");
+  vi.stubEnv("SystemRoot", "C:\\Windows");
+  return withMockedPlatform("win32", () => openUrl(url));
+}
+
+function resetFixture(profile?: string) {
+  const homeDir = tempDirs.make("openclaw-reset-");
+  const stateDir = path.join(homeDir, profile ? `.openclaw-${profile}` : ".openclaw");
+  const configPath = path.join(stateDir, "openclaw.json");
+  const workspaceDir = path.join(stateDir, "workspace");
+  const credentialsDir = path.join(stateDir, "credentials");
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  if (profile) {
+    fs.mkdirSync(credentialsDir, { recursive: true });
+    fs.writeFileSync(configPath, "{}\n");
+  }
+  const runtime = createThrowingTestRuntime();
+  const run = (scope: Parameters<typeof handleReset>[0] = "full", workspace = workspaceDir) =>
+    withEnvAsync(
+      {
+        HOME: homeDir,
+        OPENCLAW_HOME: homeDir,
+        OPENCLAW_PROFILE: profile,
+        OPENCLAW_STATE_DIR: stateDir,
+        OPENCLAW_CONFIG_PATH: configPath,
+      },
+      () => handleReset(scope, workspace, runtime),
+    );
+  return { homeDir, stateDir, configPath, workspaceDir, credentialsDir, runtime, run };
+}
+
 describe("handleReset", () => {
+  it("rejects full-reset workspaces that contain the active onboarding lock", async () => {
+    const { homeDir, stateDir, configPath, run } = resetFixture();
+    const migrationDir = path.join(stateDir, "migration");
+    const migrationAlias = path.join(homeDir, "migration-alias");
+    fs.mkdirSync(migrationDir, { recursive: true });
+    fs.writeFileSync(configPath, "{}\n");
+    fs.symlinkSync(migrationDir, migrationAlias, process.platform === "win32" ? "junction" : "dir");
+
+    for (const workspaceDir of [
+      homeDir,
+      stateDir,
+      migrationDir,
+      migrationAlias,
+      path.join(migrationDir, "onboarding.lock-target.lock"),
+      path.join(migrationAlias, "onboarding.lock-target.lock"),
+    ]) {
+      await expect(run("full", workspaceDir)).rejects.toThrow(
+        "overlaps the active onboarding lock directory",
+      );
+    }
+
+    expectNoResetEffects();
+  });
+
   it("uses active profile paths for destructive reset targets", async () => {
-    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-reset-profile-"));
-    const profileStateDir = path.join(homeDir, ".openclaw-work");
-    const defaultStateDir = path.join(homeDir, ".openclaw");
-    const profileConfigPath = path.join(profileStateDir, "openclaw.json");
-    const profileCredentialsDir = path.join(profileStateDir, "credentials");
-    const profileSessionsDir = path.join(profileStateDir, "agents", "main", "sessions");
-    const workspaceDir = path.join(profileStateDir, "workspace");
-    const workspaceAttestationPath = `${workspaceDir}.attested`;
-    const defaultCredentialsDir = path.join(defaultStateDir, "credentials");
-
-    fs.mkdirSync(profileCredentialsDir, { recursive: true });
-    fs.mkdirSync(profileSessionsDir, { recursive: true });
-    fs.mkdirSync(workspaceDir, { recursive: true });
+    const { homeDir, stateDir, configPath, credentialsDir, workspaceDir, run } =
+      resetFixture("work");
+    const defaultCredentialsDir = path.join(homeDir, ".openclaw", "credentials");
+    for (const agent of ["main", "ops"]) {
+      fs.mkdirSync(path.join(stateDir, "agents", agent, "sessions"), { recursive: true });
+    }
     fs.mkdirSync(defaultCredentialsDir, { recursive: true });
-    fs.writeFileSync(profileConfigPath, "{}\n");
-    fs.writeFileSync(
-      workspaceAttestationPath,
-      `openclaw-workspace-attestation:v1\n${new Date().toISOString()}\n`,
-    );
-
-    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
-    const expectedTrashedPaths = [
-      profileConfigPath,
-      profileCredentialsDir,
-      profileSessionsDir,
-      workspaceDir,
-      workspaceAttestationPath,
-    ].map(expectedTrashSourcePath);
-    const expectedDefaultCredentialsDir = expectedTrashSourcePath(defaultCredentialsDir);
-
-    try {
-      await withEnvAsync(
-        {
-          HOME: homeDir,
-          OPENCLAW_HOME: homeDir,
-          OPENCLAW_PROFILE: "work",
-          OPENCLAW_STATE_DIR: profileStateDir,
-          OPENCLAW_CONFIG_PATH: profileConfigPath,
-        },
-        async () => await handleReset("full", workspaceDir, runtime),
-      );
-    } finally {
-      fs.rmSync(homeDir, { recursive: true, force: true });
-    }
+    await run();
 
     const trashedPaths = mocks.movePathToTrash.mock.calls.map(([targetPath]) => targetPath);
-    expect(trashedPaths).toEqual(expectedTrashedPaths);
-    expect(trashedPaths).not.toContain(expectedDefaultCredentialsDir);
+    expect(trashedPaths).toEqual(
+      [configPath, credentialsDir, workspaceDir].map(expectedTrashSourcePath),
+    );
+    expect(trashedPaths).not.toContain(expectedTrashSourcePath(defaultCredentialsDir));
+    expect(mocks.deleteWorkspaceState).toHaveBeenCalledWith({ workspaceDir });
   });
 
-  it("does not trash an unowned sibling attestation path during full reset", async () => {
-    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-reset-profile-"));
-    const profileStateDir = path.join(homeDir, ".openclaw-work");
-    const profileConfigPath = path.join(profileStateDir, "openclaw.json");
-    const profileCredentialsDir = path.join(profileStateDir, "credentials");
-    const profileSessionsDir = path.join(profileStateDir, "agents", "main", "sessions");
-    const workspaceDir = path.join(profileStateDir, "workspace");
-    const workspaceAttestationPath = `${workspaceDir}.attested`;
+  it("rejects a config-only reset when the existing config cannot be trashed", async () => {
+    const { configPath, runtime, run } = resetFixture();
+    fs.writeFileSync(configPath, "{}\n");
+    mocks.movePathToTrash.mockRejectedValueOnce(new Error("trash unavailable"));
+    await expect(run("config", "unused")).rejects.toThrow(configPath);
 
-    fs.mkdirSync(profileCredentialsDir, { recursive: true });
-    fs.mkdirSync(profileSessionsDir, { recursive: true });
+    expect(runtime.log).toHaveBeenCalledWith(
+      expect.stringMatching(/Failed to move to Trash \(manual delete\): .*openclaw\.json$/),
+    );
+  });
+
+  it("preserves config and workspace when canonical session reset fails", async () => {
+    const { stateDir, run } = resetFixture();
+    const workspaceDir = path.join(stateDir, "agents");
     fs.mkdirSync(workspaceDir, { recursive: true });
-    fs.writeFileSync(profileConfigPath, "{}\n");
-    fs.writeFileSync(workspaceAttestationPath, "external data\n");
+    const inspectError = Object.assign(new Error("permission denied"), { code: "EACCES" });
+    mocks.removeAgentSessions.mockRejectedValueOnce(inspectError);
+    await expect(run("full", workspaceDir)).rejects.toBe(inspectError);
 
-    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
-    const unownedAttestationTrashPath = expectedTrashSourcePath(workspaceAttestationPath);
-
-    try {
-      await withEnvAsync(
-        {
-          HOME: homeDir,
-          OPENCLAW_HOME: homeDir,
-          OPENCLAW_PROFILE: "work",
-          OPENCLAW_STATE_DIR: profileStateDir,
-          OPENCLAW_CONFIG_PATH: profileConfigPath,
-        },
-        async () => await handleReset("full", workspaceDir, runtime),
-      );
-    } finally {
-      fs.rmSync(homeDir, { recursive: true, force: true });
-    }
-
-    const trashedPaths = mocks.movePathToTrash.mock.calls.map(([targetPath]) => targetPath);
-    expect(trashedPaths).not.toContain(unownedAttestationTrashPath);
+    expectNoResetEffects();
   });
 
-  it.skipIf(process.platform === "win32")(
-    "does not abort full reset for an unreadable legacy attestation path",
-    async () => {
-      const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-reset-profile-"));
-      const profileStateDir = path.join(homeDir, ".openclaw-work");
-      const profileConfigPath = path.join(profileStateDir, "openclaw.json");
-      const profileCredentialsDir = path.join(profileStateDir, "credentials");
-      const profileSessionsDir = path.join(profileStateDir, "agents", "main", "sessions");
-      const workspaceDir = path.join(profileStateDir, "workspace");
-      const workspaceAttestationPath = `${workspaceDir}.attested`;
+  it("fails closed after attempting workspace state cleanup when retired state remains", async () => {
+    const { workspaceDir, runtime, run } = resetFixture();
+    const warning = `Could not remove retired workspace state at ${workspaceDir}.attested`;
+    mocks.removeLegacyWorkspaceStateForReset.mockResolvedValueOnce({
+      removedPaths: [],
+      warnings: [warning],
+    });
+    await expect(run()).rejects.toThrow(warning);
 
-      fs.mkdirSync(profileCredentialsDir, { recursive: true });
-      fs.mkdirSync(profileSessionsDir, { recursive: true });
-      fs.mkdirSync(workspaceDir, { recursive: true });
-      fs.writeFileSync(profileConfigPath, "{}\n");
-      fs.writeFileSync(workspaceAttestationPath, "external data\n", { mode: 0o000 });
-      fs.chmodSync(workspaceAttestationPath, 0o000);
+    expect(mocks.deleteWorkspaceState).toHaveBeenCalledWith({ workspaceDir });
+    expect(runtime.log).toHaveBeenCalledWith(warning);
+  });
 
-      const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
-      const unreadableAttestationTrashPath = expectedTrashSourcePath(workspaceAttestationPath);
+  it("reports rejected retired and workspace state cleanup after attempting both", async () => {
+    const { workspaceDir, run } = resetFixture();
+    mocks.removeLegacyWorkspaceStateForReset.mockRejectedValueOnce(
+      new Error("retired state unavailable"),
+    );
+    mocks.deleteWorkspaceState.mockRejectedValueOnce(new Error("state database unavailable"));
 
-      try {
-        await withEnvAsync(
-          {
-            HOME: homeDir,
-            OPENCLAW_HOME: homeDir,
-            OPENCLAW_PROFILE: "work",
-            OPENCLAW_STATE_DIR: profileStateDir,
-            OPENCLAW_CONFIG_PATH: profileConfigPath,
-          },
-          async () => {
-            await expect(handleReset("full", workspaceDir, runtime)).resolves.toBeUndefined();
-          },
-        );
-      } finally {
-        fs.chmodSync(workspaceAttestationPath, 0o600);
-        fs.rmSync(homeDir, { recursive: true, force: true });
+    const reset = run();
+
+    await expect(reset).rejects.toThrow(`${workspaceDir} (retired workspace state)`);
+    await expect(reset).rejects.toThrow(`${workspaceDir} (workspace state)`);
+    expect(mocks.deleteWorkspaceState).toHaveBeenCalledWith({ workspaceDir });
+  });
+
+  it("retains workspace state when workspace removal fails", async () => {
+    const { stateDir, workspaceDir, runtime, run } = resetFixture("work");
+    fs.mkdirSync(path.join(stateDir, "agents", "main", "sessions"), { recursive: true });
+    mocks.movePathToTrash.mockImplementation(async (targetPath) => {
+      if (targetPath === expectedTrashSourcePath(workspaceDir)) {
+        throw new Error("trash unavailable");
       }
-
-      const trashedPaths = mocks.movePathToTrash.mock.calls.map(([targetPath]) => targetPath);
-      expect(trashedPaths).not.toContain(unreadableAttestationTrashPath);
-    },
-  );
-});
-
-describe("moveToTrash", () => {
-  it("uses fs-safe trash instead of resolving a PATH trash command", async () => {
-    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-trash-helper-"));
-    const targetPath = path.join(testRoot, "target");
-    fs.mkdirSync(targetPath, { recursive: true });
-    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
-    const sourcePath = expectedTrashSourcePath(targetPath);
-
-    try {
-      await moveToTrash(targetPath, runtime);
-    } finally {
-      fs.rmSync(testRoot, { recursive: true, force: true });
-    }
-
-    expect(mocks.movePathToTrash).toHaveBeenCalledWith(sourcePath, {
-      allowedRoots: [path.dirname(sourcePath)],
+      return `${targetPath}.trashed`;
     });
-    expect(mocks.runCommandWithTimeout).not.toHaveBeenCalled();
-    expect(runtime.log).toHaveBeenCalledWith(`Moved to Trash: ${targetPath}`);
-  });
 
-  it("allows fs-safe trash to move a symlink whose target resolves outside the parent", async () => {
-    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-trash-symlink-"));
-    const targetPath = path.join(testRoot, "target-link");
-    const outsideTarget = path.join(os.tmpdir(), "openclaw-trash-symlink-target");
-    fs.writeFileSync(targetPath, "link placeholder");
-    vi.spyOn(fsPromises, "lstat").mockResolvedValue({
-      isSymbolicLink: () => true,
-    } as fs.Stats);
-    vi.spyOn(fsPromises, "realpath").mockImplementation(async (candidate) =>
-      String(candidate) === path.dirname(targetPath) ? path.dirname(targetPath) : outsideTarget,
+    await expect(run()).rejects.toThrow(workspaceDir);
+
+    expect(mocks.deleteWorkspaceState).not.toHaveBeenCalled();
+    expect(runtime.log).toHaveBeenCalledWith(
+      expect.stringMatching(/Failed to move to Trash \(manual delete\): .*workspace$/),
     );
-    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
-
-    try {
-      await moveToTrash(targetPath, runtime);
-    } finally {
-      fs.rmSync(testRoot, { recursive: true, force: true });
-    }
-
-    expect(mocks.movePathToTrash).toHaveBeenCalledWith(targetPath, {
-      allowedRoots: [path.dirname(targetPath), path.dirname(outsideTarget)],
-    });
-  });
-
-  it("canonicalizes a symlinked parent before calling fs-safe trash", async () => {
-    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-trash-parent-link-"));
-    const lexicalParent = path.join(testRoot, "state-link");
-    const realParent = path.join(testRoot, "state-real");
-    const targetPath = path.join(lexicalParent, "openclaw.json");
-    const sourcePath = path.join(realParent, "openclaw.json");
-    fs.mkdirSync(lexicalParent, { recursive: true });
-    fs.writeFileSync(targetPath, "{}\n");
-    vi.spyOn(fsPromises, "realpath").mockImplementation(async (candidate) =>
-      String(candidate) === lexicalParent ? realParent : String(candidate),
-    );
-    vi.spyOn(fsPromises, "lstat").mockResolvedValue({
-      isSymbolicLink: () => false,
-    } as fs.Stats);
-    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
-
-    try {
-      await moveToTrash(targetPath, runtime);
-    } finally {
-      fs.rmSync(testRoot, { recursive: true, force: true });
-    }
-
-    expect(mocks.movePathToTrash).toHaveBeenCalledWith(sourcePath, {
-      allowedRoots: [realParent],
-    });
   });
 });
 
 describe("openUrl", () => {
   it("passes OAuth URLs to Windows FileProtocolHandler without cmd parsing", async () => {
-    vi.stubEnv("VITEST", "");
-    vi.stubEnv("NODE_ENV", "");
-    vi.stubEnv("SystemRoot", "C:\\Windows");
-    vi.stubEnv("NODE_ENV", "development");
-    const rundll32 = path.win32.join("C:\\Windows", "System32", "rundll32.exe");
-
     const url =
       "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&response_type=code&redirect_uri=http%3A%2F%2Flocalhost";
-
-    await withMockedPlatform("win32", async () => {
-      const ok = await openUrl(url);
-      expect(ok).toBe(true);
-
-      expect(mocks.runCommandWithTimeout).toHaveBeenCalledTimes(1);
-      const [argv, options] = requireFirstRunCommandCall();
-      expect(argv).toEqual([rundll32, "url.dll,FileProtocolHandler", url]);
-      expect(options?.timeoutMs).toBe(5_000);
-      expect(options?.windowsVerbatimArguments).toBeUndefined();
-    });
+    expect(await openWindowsUrl(url)).toBe(true);
+    expect(mocks.runCommandWithTimeout).toHaveBeenCalledExactlyOnceWith(
+      [
+        path.win32.join("C:\\Windows", "System32", "rundll32.exe"),
+        "url.dll,FileProtocolHandler",
+        url,
+      ],
+      { timeoutMs: 5_000 },
+    );
   });
 
   it("does not pass non-http URLs to the OS browser handler", async () => {
-    vi.stubEnv("VITEST", "");
-    vi.stubEnv("NODE_ENV", "development");
-
-    await withMockedPlatform("win32", async () => {
-      const ok = await openUrl("file://C:/Users/test/secrets.txt");
-
-      expect(ok).toBe(false);
-      expect(mocks.runCommandWithTimeout).not.toHaveBeenCalled();
-    });
+    expect(await openWindowsUrl("file://C:/Users/test/secrets.txt")).toBe(false);
+    expect(mocks.runCommandWithTimeout).not.toHaveBeenCalled();
   });
 });
 
-describe("resolveBrowserOpenCommand", () => {
-  it("uses trusted rundll32 on win32", async () => {
-    vi.stubEnv("SystemRoot", "C:\\Windows");
-    const rundll32 = path.win32.join("C:\\Windows", "System32", "rundll32.exe");
-
-    await withMockedPlatform("win32", async () => {
-      const resolved = await resolveBrowserOpenCommand();
-      expect(resolved.argv).toEqual([rundll32, "url.dll,FileProtocolHandler"]);
-      expect(resolved.command).toBe(rundll32);
-    });
-  });
-});
-
-describe("formatControlUiSshHint", () => {
-  it("includes the IPv4-only BYOH note and workaround", () => {
-    const hint = formatControlUiSshHint({ port: 18789 });
-    expect(hint).toContain("BYOH note: lan, tailnet, and custom bind are currently IPv4-only.");
-    expect(hint).toContain(
-      "If your host is IPv6-only, use an IPv4 sidecar or proxy in front of the Gateway.",
+it.each([
+  [false, "/control", "http://localhost:18789/control/"],
+  [true, undefined, "https://localhost:18789/"],
+] as const)(
+  "formats the SSH hint with TLS=%s and base path %s",
+  (tlsEnabled, basePath, expectedUrl) => {
+    expect(formatControlUiSshHint({ port: 18789, basePath, tlsEnabled })).toContain(
+      `Then open:\n${expectedUrl}`,
     );
-  });
-});
-
-describe("probeGatewayReachable", () => {
-  it("uses a hello-only probe for onboarding reachability", async () => {
-    mocks.probeGateway.mockResolvedValueOnce({
-      ok: true,
-      url: "ws://127.0.0.1:18789",
-      connectLatencyMs: 42,
-      error: null,
-      close: null,
-      health: null,
-      status: null,
-      presence: null,
-      configSnapshot: null,
-    });
-
-    const result = await probeGatewayReachable({
-      url: "ws://127.0.0.1:18789",
-      token: "tok_test",
-      timeoutMs: 2500,
-    });
-
-    expect(result).toEqual({ ok: true });
-    expect(mocks.probeGateway).toHaveBeenCalledWith({
-      url: "ws://127.0.0.1:18789",
-      timeoutMs: 2500,
-      auth: {
-        token: "tok_test",
-        password: undefined,
-      },
-      detailLevel: "none",
-    });
-  });
-
-  it("returns the probe error detail on failure", async () => {
-    mocks.probeGateway.mockResolvedValueOnce({
-      ok: false,
-      url: "ws://127.0.0.1:18789",
-      connectLatencyMs: null,
-      error: "connect failed: timeout",
-      close: null,
-      health: null,
-      status: null,
-      presence: null,
-      configSnapshot: null,
-    });
-
-    const result = await probeGatewayReachable({
-      url: "ws://127.0.0.1:18789",
-    });
-
-    expect(result).toEqual({
-      ok: false,
-      detail: "connect failed: timeout",
-    });
-  });
-});
+  },
+);
 
 describe("waitForGatewayReachable", () => {
+  it("cancels the pending retry timer when readiness is abandoned", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.probeGateway.mockResolvedValue({ ok: false, error: "not ready" });
+      const controller = new AbortController();
+      const waiting = waitForGatewayReachable({
+        url: "ws://127.0.0.1:18789",
+        deadlineMs: 60_000,
+        pollMs: 30_000,
+        signal: controller.signal,
+      });
+      const cancelled = expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort();
+      await cancelled;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps oversized poll intervals within the overall deadline", async () => {
     mocks.probeGateway.mockResolvedValue({
       ok: false,
-      url: "ws://127.0.0.1:18789",
-      connectLatencyMs: null,
       error: "connect failed: timeout",
-      close: null,
-      health: null,
-      status: null,
-      presence: null,
-      configSnapshot: null,
     });
 
     const result = await waitForGatewayReachable({
-      url: "ws://127.0.0.1:18789",
+      ...localProbe,
       deadlineMs: 5,
       pollMs: Number.MAX_SAFE_INTEGER,
       probeTimeoutMs: 1,
@@ -425,176 +337,187 @@ describe("waitForGatewayReachable", () => {
   });
 });
 
-describe("summarizeExistingConfig", () => {
-  it("collapses gateway fields into a friendly remote summary", () => {
-    expect(
-      summarizeExistingConfig({
-        agents: { defaults: { model: { primary: "openai/gpt-5.4" } } },
-        gateway: {
-          mode: "remote",
-          port: 18789,
-          bind: "lan",
-          remote: { url: "ws://192.168.0.202:18789" },
-        },
-      }),
-    ).toBe("Model: openai/gpt-5.4\nGateway: remote via LAN at ws://192.168.0.202:18789");
-  });
-
-  it("uses the port when no remote gateway URL is configured", () => {
-    expect(
-      summarizeExistingConfig({
-        gateway: {
-          mode: "local",
-          port: 18789,
-          bind: "loopback",
-        },
-      }),
-    ).toBe("Gateway: local via loopback on :18789");
-  });
-
-  it("does not show a stale remote URL as active for local gateway mode", () => {
-    expect(
-      summarizeExistingConfig({
-        gateway: {
-          mode: "local",
-          port: 18789,
-          bind: "loopback",
-          remote: { url: "ws://192.168.0.202:18789" },
-        },
-      }),
-    ).toBe("Gateway: local via loopback on :18789");
-  });
-
-  it("surfaces missing remote URL instead of falling back to port for remote mode", () => {
-    expect(
-      summarizeExistingConfig({
-        gateway: {
-          mode: "remote",
-          port: 18789,
-          bind: "lan",
-        },
-      }),
-    ).toBe("Gateway: remote via LAN (missing remote URL)");
-  });
+it.each([
+  [
+    "remote",
+    "lan",
+    "ws://192.168.0.202:18789",
+    "openai/gpt-5.4",
+    "Model: openai/gpt-5.4\nGateway: remote via LAN at ws://192.168.0.202:18789",
+  ],
+  [
+    "local",
+    "loopback",
+    "ws://192.168.0.202:18789",
+    undefined,
+    "Gateway: local via loopback on :18789",
+  ],
+  ["remote", "lan", undefined, undefined, "Gateway: remote via LAN (missing remote URL)"],
+] as const)("summarizes %s via %s with remote URL %s", (mode, bind, url, model, expected) => {
+  expect(
+    summarizeExistingConfig({
+      agents: { defaults: { model: model ? { primary: model } : undefined } },
+      gateway: { mode, bind, port: 18789, remote: url ? { url } : undefined },
+    }),
+  ).toBe(expected);
 });
 
 describe("resolveControlUiLinks", () => {
-  it("uses customBindHost for custom bind", () => {
-    const links = resolveControlUiLinks({
-      port: 18789,
-      bind: "custom",
-      customBindHost: "192.168.1.100",
-    });
-    expect(links.httpUrl).toBe("http://192.168.1.100:18789/");
-    expect(links.wsUrl).toBe("ws://192.168.1.100:18789");
-  });
-
-  it("uses secure schemes when gateway TLS is enabled", () => {
-    const links = resolveControlUiLinks({
-      port: 18789,
-      bind: "custom",
-      customBindHost: "192.168.1.100",
-      tlsEnabled: true,
-    });
-    expect(links.httpUrl).toBe("https://192.168.1.100:18789/");
-    expect(links.wsUrl).toBe("wss://192.168.1.100:18789");
-  });
-
-  it("falls back to loopback for invalid customBindHost", () => {
-    const links = resolveControlUiLinks({
-      port: 18789,
-      bind: "custom",
-      customBindHost: "192.168.001.100",
-    });
-    expect(links.httpUrl).toBe("http://127.0.0.1:18789/");
-    expect(links.wsUrl).toBe("ws://127.0.0.1:18789");
-  });
-
   it("uses tailnet IP for tailnet bind", () => {
     mocks.pickPrimaryTailnetIPv4.mockReturnValueOnce("100.64.0.9");
-    const links = resolveControlUiLinks({
-      port: 18789,
-      bind: "tailnet",
+    expect(resolveControlUiLinks({ port: 18789, bind: "tailnet" })).toEqual({
+      httpUrl: "http://100.64.0.9:18789/",
+      wsUrl: "ws://100.64.0.9:18789",
     });
-    expect(links.httpUrl).toBe("http://100.64.0.9:18789/");
-    expect(links.wsUrl).toBe("ws://100.64.0.9:18789");
   });
 
-  it("keeps loopback for auto even when tailnet is present", () => {
+  it("uses route-aware advertised LAN host for display links", async () => {
+    mocks.resolveAdvertisedLanHostCore.mockResolvedValueOnce("10.211.55.3");
+
+    expect(await resolveAdvertisedControlUiLinks({ port: 18789, bind: "lan" })).toEqual({
+      httpUrl: "http://10.211.55.3:18789/",
+      wsUrl: "ws://10.211.55.3:18789",
+    });
+  });
+
+  it("keeps co-located tailnet probes on loopback", () => {
     mocks.pickPrimaryTailnetIPv4.mockReturnValueOnce("100.64.0.9");
-    const links = resolveControlUiLinks({
-      port: 18789,
-      bind: "auto",
-    });
-    expect(links.httpUrl).toBe("http://127.0.0.1:18789/");
-    expect(links.wsUrl).toBe("ws://127.0.0.1:18789");
-  });
-
-  it("falls back to loopback for tailnet bind when interface discovery throws", () => {
-    mocks.pickPrimaryTailnetIPv4.mockImplementationOnce(() => {
-      throw new Error("uv_interface_addresses failed");
-    });
-
-    const links = resolveControlUiLinks({
+    const links = resolveLocalControlUiProbeLinks({
       port: 18789,
       bind: "tailnet",
+      customBindHost: "192.0.2.10",
+      tlsEnabled: true,
+      basePath: "/dashboard",
     });
 
-    expect(links.httpUrl).toBe("http://127.0.0.1:18789/");
-    expect(links.wsUrl).toBe("ws://127.0.0.1:18789");
-  });
-
-  it("falls back to loopback for LAN bind when interface discovery throws", () => {
-    vi.spyOn(os, "networkInterfaces").mockImplementationOnce(() => {
-      throw new Error("uv_interface_addresses failed");
-    });
-
-    const links = resolveControlUiLinks({
-      port: 18789,
-      bind: "lan",
-    });
-
-    expect(links.httpUrl).toBe("http://127.0.0.1:18789/");
-    expect(links.wsUrl).toBe("ws://127.0.0.1:18789");
+    expect(links.httpUrl).toBe("https://127.0.0.1:18789/dashboard/");
+    expect(links.wsUrl).toBe("wss://127.0.0.1:18789/dashboard");
+    expect(mocks.resolveAdvertisedLanHostCore).not.toHaveBeenCalled();
   });
 });
 
-describe("normalizeGatewayTokenInput", () => {
-  it("returns empty string for undefined or null", () => {
-    expect(normalizeGatewayTokenInput(undefined)).toBe("");
-    expect(normalizeGatewayTokenInput(null)).toBe("");
-  });
-
-  it("trims string input", () => {
-    expect(normalizeGatewayTokenInput("  token  ")).toBe("token");
-  });
-
-  it("returns empty string for non-string input", () => {
-    expect(normalizeGatewayTokenInput(123)).toBe("");
-  });
-
-  it('rejects literal string coercion artifacts ("undefined"/"null")', () => {
-    expect(normalizeGatewayTokenInput("undefined")).toBe("");
-    expect(normalizeGatewayTokenInput("null")).toBe("");
-  });
+it.each([
+  [["  token  "], "token"],
+  [["undefined", "null"], ""],
+] as const)("normalizes token inputs %j", (inputs, expected) => {
+  inputs.forEach((input) => expect(normalizeGatewayTokenInput(input)).toBe(expected));
 });
 
-describe("validateGatewayPasswordInput", () => {
-  it("requires a non-empty password", () => {
-    expect(validateGatewayPasswordInput("")).toBe("Required");
-    expect(validateGatewayPasswordInput("   ")).toBe("Required");
+it.each([
+  [["", "   "], "Required"],
+  [["undefined", "null"], 'Cannot be the literal string "undefined" or "null"'],
+  [[" secret "], undefined],
+] as const)("validates password inputs %j", (inputs, expected) => {
+  inputs.forEach((input) => expect(validateGatewayPasswordInput(input)).toBe(expected));
+});
+
+describe("probeGatewayReachable", () => {
+  it("forwards remote trust through polling", async () => {
+    mocks.probeGateway.mockResolvedValueOnce({ ok: true, configSnapshot: null });
+    const options = {
+      url: remoteUrl,
+      config: {
+        gateway: {
+          mode: "remote",
+          remote: {
+            url: remoteUrl,
+            edgeAuth: { "X-Edge-Auth": "test-secret" },
+            tlsFingerprint: "ab".repeat(32),
+          },
+        },
+      } satisfies OpenClawConfig,
+      originScopedDeviceAuth: true,
+    };
+    await expect(waitForGatewayReachable(options)).resolves.toEqual({ ok: true });
+    expect(mocks.probeGateway).toHaveBeenCalledWith(expect.objectContaining(options));
   });
 
-  it("rejects literal string coercion artifacts", () => {
-    expect(validateGatewayPasswordInput("undefined")).toBe(
-      'Cannot be the literal string "undefined" or "null"',
-    );
-    expect(validateGatewayPasswordInput("null")).toBe(
-      'Cannot be the literal string "undefined" or "null"',
+  it("bounds thrown probe errors without splitting UTF-16", async () => {
+    const detail = `${"x".repeat(118)}…`;
+    mocks.probeGateway.mockRejectedValue(new Error(`${"x".repeat(118)}🚀tail\nignored`));
+    expect(await probeGatewayReachable(localProbe)).toEqual({ ok: false, detail });
+    expect(await probeGatewayConfiguredModel(localProbe)).toBe("unreachable");
+  });
+
+  it.each([
+    ["TLS fingerprint", { tlsFingerprint: "sha256:11:22:33:44" }, 1500],
+    ["preauth handshake budget", { preauthHandshakeTimeoutMs: 30_000 }, 30_000],
+  ] as const)(
+    "forwards the configured %s to the Gateway probe",
+    async (_name, options, timeoutMs) => {
+      mocks.probeGateway.mockResolvedValueOnce({ ok: true, configSnapshot: null });
+      await expect(probeGatewayReachable({ url: remoteUrl, ...options })).resolves.toEqual({
+        ok: true,
+      });
+      expect(mocks.probeGateway).toHaveBeenCalledWith({
+        url: remoteUrl,
+        timeoutMs,
+        auth: probeAuth,
+        ...options,
+        detailLevel: "none",
+      });
+    },
+  );
+
+  it("classifies configured and missing default-agent models from config-only probes", async () => {
+    mocks.probeGateway
+      .mockResolvedValueOnce({
+        ok: true,
+        gatewayReached: true,
+        configSnapshot: {
+          valid: true,
+          config: { agents: { entries: { work: { model: "openai/gpt-5.5" } } } },
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        gatewayReached: true,
+        configSnapshot: { valid: true, config: { gateway: { mode: "local" } } },
+      });
+
+    await expect(probeGatewayConfiguredModel(localProbe)).resolves.toBe("configured");
+    await expect(
+      probeGatewayConfiguredModel({
+        ...localProbe,
+        originScopedDeviceAuth: true,
+      }),
+    ).resolves.toBe("missing-configured-model");
+    expect(mocks.probeGateway).toHaveBeenLastCalledWith(
+      expect.objectContaining({ detailLevel: "config", originScopedDeviceAuth: true }),
     );
   });
 
-  it("accepts a normal password", () => {
-    expect(validateGatewayPasswordInput(" secret ")).toBeUndefined();
+  it.each([
+    [
+      "typed pairing failure",
+      probeFailure("device pairing required", ConnectErrorDetailCodes.PAIRING_REQUIRED, true),
+      "reachable-unverified",
+    ],
+    [
+      "unrecognized connect error",
+      probeFailure("foreign protocol error", "NOT_AN_OPENCLAW_CONNECT_ERROR"),
+      "unreachable",
+    ],
+    [
+      "config without handshake evidence",
+      {
+        ok: true,
+        error: null,
+        server: { version: "foreign-server", connId: null },
+        configSnapshot: {
+          valid: true,
+          config: { agents: { defaults: { model: "openai/foreign-model" } } },
+        },
+      },
+      "unreachable",
+    ],
+    [
+      "invalid config",
+      { ok: true, gatewayReached: true, configSnapshot: { valid: false } },
+      "reachable-unverified",
+    ],
+  ])("classifies %s", async (_name, result, expected) => {
+    mocks.probeGateway.mockResolvedValueOnce(result);
+    await expect(probeGatewayConfiguredModel(localProbe)).resolves.toEqual(expected);
   });
 });

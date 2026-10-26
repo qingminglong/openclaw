@@ -1,4 +1,3 @@
-// Diagnostic phase helpers measure named phases and emit timing diagnostics.
 import { performance } from "node:perf_hooks";
 import {
   areDiagnosticsEnabledForProcess,
@@ -6,8 +5,9 @@ import {
   type DiagnosticPhaseDetails,
   type DiagnosticPhaseSnapshot,
 } from "../infra/diagnostic-events.js";
+import { runWithMainThreadTask } from "../infra/main-thread-stall.js";
+import { roundDiagnosticMetric as roundMetric } from "./diagnostic-metric.js";
 
-// Tracks nested diagnostic phases for recent-phase snapshots and optional event emission.
 const RECENT_PHASE_CAPACITY = 40;
 
 type ActiveDiagnosticPhase = {
@@ -21,14 +21,6 @@ type ActiveDiagnosticPhase = {
 let activePhaseStack: ActiveDiagnosticPhase[] = [];
 let recentPhases: DiagnosticPhaseSnapshot[] = [];
 
-function roundMetric(value: number, digits = 1): number {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-  const factor = 10 ** digits;
-  return Math.round(value * factor) / factor;
-}
-
 function pushRecentPhase(snapshot: DiagnosticPhaseSnapshot): void {
   recentPhases.push(snapshot);
   if (recentPhases.length > RECENT_PHASE_CAPACITY) {
@@ -40,23 +32,13 @@ export function getCurrentDiagnosticPhase(): string | undefined {
   return activePhaseStack.at(-1)?.name;
 }
 
-function resolveRecentPhaseLimit(limit: number): number | null {
-  if (!Number.isFinite(limit) || limit <= 0) {
-    return null;
-  }
-  return Math.floor(limit);
+export function getRecentDiagnosticPhases(completedAfter: number): DiagnosticPhaseSnapshot[] {
+  return recentPhases
+    .filter((phase) => phase.endedAt !== undefined && phase.endedAt >= completedAfter)
+    .slice(-6);
 }
 
-export function getRecentDiagnosticPhases(limit = 8): DiagnosticPhaseSnapshot[] {
-  const resolved = resolveRecentPhaseLimit(limit);
-  if (resolved === null) {
-    return [];
-  }
-  return recentPhases.slice(-resolved).map((phase) => Object.assign({}, phase));
-}
-
-/** Records a completed phase in memory and emits it when diagnostics are enabled. */
-export function recordDiagnosticPhase(snapshot: DiagnosticPhaseSnapshot): void {
+function recordDiagnosticPhase(snapshot: DiagnosticPhaseSnapshot): void {
   pushRecentPhase(snapshot);
   if (!areDiagnosticsEnabledForProcess()) {
     return;
@@ -82,7 +64,7 @@ export async function withDiagnosticPhase<T>(
   };
   activePhaseStack.push(active);
   try {
-    return await run();
+    return await runWithMainThreadTask(name, run);
   } finally {
     // Remove by identity so nested or overlapping phases do not corrupt the active stack.
     const endedAt = Date.now();
@@ -106,7 +88,7 @@ export async function withDiagnosticPhase<T>(
   }
 }
 
-/** Clears phase history and active stack for isolated tests. */
+/** @internal Test-support reset; see diagnostic.test-support.ts. */
 export function resetDiagnosticPhasesForTest(): void {
   activePhaseStack = [];
   recentPhases = [];

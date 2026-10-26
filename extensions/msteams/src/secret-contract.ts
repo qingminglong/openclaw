@@ -1,47 +1,90 @@
-// Msteams plugin module implements secret contract behavior.
 import {
   collectSecretInputAssignment,
-  getChannelRecord,
+  createChannelSecretTargetRegistryEntries,
+  getChannelSurface,
+  hasOwnProperty,
   type ResolverContext,
   type SecretDefaults,
 } from "openclaw/plugin-sdk/channel-secret-basic-runtime";
+import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/setup";
 
-export const secretTargetRegistryEntries: import("openclaw/plugin-sdk/channel-secret-basic-runtime").SecretTargetRegistryEntry[] =
-  [
-    {
-      id: "channels.msteams.appPassword",
-      targetType: "channels.msteams.appPassword",
-      configFile: "openclaw.json",
-      pathPattern: "channels.msteams.appPassword",
-      secretShape: "secret_input",
-      expectedResolvedValue: "string",
-      includeInPlan: true,
-      includeInConfigure: true,
-      includeInAudit: true,
-    },
-  ];
+export const secretTargetRegistryEntries = createChannelSecretTargetRegistryEntries({
+  channelKey: "msteams",
+  account: ["appPassword"],
+  channel: ["appPassword"],
+});
 
 export function collectRuntimeConfigAssignments(params: {
   config: { channels?: Record<string, unknown> };
   defaults?: SecretDefaults;
   context: ResolverContext;
 }): void {
-  const msteams = getChannelRecord(params.config, "msteams");
-  if (!msteams) {
+  const resolved = getChannelSurface(params.config, "msteams");
+  if (!resolved) {
     return;
   }
+  const { channel: msteams, surface } = resolved;
+  const explicitDefault = surface.hasExplicitAccounts
+    ? surface.accounts.find(({ accountId }) => normalizeAccountId(accountId) === DEFAULT_ACCOUNT_ID)
+    : undefined;
+  const defaultEnabled = explicitDefault?.enabled ?? surface.channelEnabled;
+
   collectSecretInputAssignment({
     value: msteams.appPassword,
     path: "channels.msteams.appPassword",
     expected: "string",
     defaults: params.defaults,
     context: params.context,
-    active: msteams.enabled !== false,
-    inactiveReason: "Microsoft Teams channel is disabled.",
+    active:
+      defaultEnabled &&
+      (isConfiguredIdentityField(msteams.appId) || isConfiguredIdentityField(msteams.appPassword)),
+    inactiveReason: "no enabled account inherits this top-level Microsoft Teams appPassword.",
+    owner: {
+      ownerKind: "account",
+      ownerId: "msteams:default",
+      requiredForGateway: false,
+      disposition: "isolate",
+      contract: msteams,
+    },
     apply: (value) => {
       msteams.appPassword = value;
     },
   });
+
+  if (!surface.hasExplicitAccounts) {
+    return;
+  }
+  for (const { accountId, account, enabled } of surface.accounts) {
+    if (!hasOwnProperty(account, "appPassword")) {
+      continue;
+    }
+    collectSecretInputAssignment({
+      value: account.appPassword,
+      path: `channels.msteams.accounts.${accountId}.appPassword`,
+      expected: "string",
+      defaults: params.defaults,
+      context: params.context,
+      active: enabled,
+      inactiveReason: "Microsoft Teams account is disabled.",
+      owner: {
+        ownerKind: "account",
+        ownerId: `msteams:${normalizeAccountId(accountId)}`,
+        requiredForGateway: false,
+        disposition: "isolate",
+        contract: account,
+      },
+      apply: (value) => {
+        account.appPassword = value;
+      },
+    });
+  }
+}
+
+function isConfiguredIdentityField(value: unknown): boolean {
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  return value !== undefined && value !== null;
 }
 
 export const channelSecrets = {

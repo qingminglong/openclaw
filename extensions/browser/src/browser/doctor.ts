@@ -1,15 +1,10 @@
-/**
- * Browser doctor report builder.
- *
- * Turns BrowserStatus into profile-aware diagnostic checks and fix hints for
- * CLI, tool, and HTTP doctor responses.
- */
+import chromeExtensionManifest from "../../chrome-extension/manifest.json" with { type: "json" };
+import { formatBrowserGraphicsSummary } from "./chrome.graphics.js";
 import type { BrowserStatus, BrowserTransport } from "./client.types.js";
 
 type BrowserDoctorCheckStatus = "pass" | "warn" | "fail" | "info";
 
-/** One browser doctor check result. */
-export type BrowserDoctorCheck = {
+type BrowserDoctorCheck = {
   id: string;
   label: string;
   status: BrowserDoctorCheckStatus;
@@ -17,7 +12,6 @@ export type BrowserDoctorCheck = {
   fixHint?: string;
 };
 
-/** Browser doctor report returned by browser-control clients. */
 export type BrowserDoctorReport = {
   ok: boolean;
   profile: string;
@@ -26,16 +20,27 @@ export type BrowserDoctorReport = {
   status: BrowserStatus;
 };
 
-/** Build a browser doctor report from a status response and environment facts. */
+function isChromeExtensionVersion(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const components = value.split(".");
+  return (
+    components.length <= 4 &&
+    components.every(
+      (component) => /^(?:0|[1-9]\d{0,4})$/.test(component) && Number(component) <= 65_535,
+    ) &&
+    components.some((component) => component !== "0")
+  );
+}
+
 export function buildBrowserDoctorReport(params: {
   status: BrowserStatus;
-  platform?: NodeJS.Platform;
-  env?: NodeJS.ProcessEnv;
-  uid?: number;
+  extensionVersion?: string;
 }): BrowserDoctorReport {
   const status = params.status;
   const checks: BrowserDoctorCheck[] = [];
-  const transport: BrowserTransport = status.transport === "chrome-mcp" ? "chrome-mcp" : "cdp";
+  const transport: BrowserTransport = status.transport ?? "cdp";
 
   checks.push({
     id: "plugin-enabled",
@@ -67,6 +72,45 @@ export function buildBrowserDoctorReport(params: {
               "Keep the matching Chromium browser running, enable remote debugging in chrome://inspect, and accept the attach prompt.",
           }),
     });
+  } else if (transport === "extension") {
+    checks.push({
+      id: "extension-relay",
+      label: "Chrome extension relay",
+      status: status.running ? "pass" : "fail",
+      summary: status.running
+        ? "OpenClaw Chrome extension is connected"
+        : "OpenClaw Chrome extension is not connected",
+      ...(status.running
+        ? {}
+        : {
+            fixHint:
+              "Install the OpenClaw Chrome extension (openclaw browser extension path), run openclaw browser extension pair, and paste the pairing string into the extension popup.",
+          }),
+    });
+
+    const runningVersion = isChromeExtensionVersion(params.extensionVersion)
+      ? params.extensionVersion
+      : undefined;
+    const bundledVersion = chromeExtensionManifest.version;
+    // Chrome treats absent version components as zero, so trailing zeroes do not indicate drift.
+    const mismatch = Boolean(
+      runningVersion &&
+      runningVersion.replace(/(?:\.0)+$/, "") !== bundledVersion.replace(/(?:\.0)+$/, ""),
+    );
+    checks.push({
+      id: "extension-version",
+      label: "Chrome extension version",
+      status: !runningVersion ? "info" : mismatch ? "warn" : "pass",
+      summary: runningVersion
+        ? `running ${runningVersion}; bundled ${bundledVersion} (${mismatch ? "mismatch" : "match"})`
+        : "version data unavailable",
+      ...(mismatch
+        ? {
+            fixHint:
+              "Reload the OpenClaw extension from chrome://extensions. If the versions still differ, fully quit and reopen Chrome.",
+          }
+        : {}),
+    });
   } else {
     checks.push({
       id: "managed-executable",
@@ -82,17 +126,14 @@ export function buildBrowserDoctorReport(params: {
         : { fixHint: "Install Chrome/Chromium/Brave/Edge or set browser.executablePath." }),
     });
 
-    const platform = params.platform ?? process.platform;
-    const env = params.env ?? process.env;
-    const uid = params.uid ?? process.getuid?.();
-    const missingDisplay =
-      platform === "linux" && !status.headless && !env.DISPLAY && !env.WAYLAND_DISPLAY;
-    if (status.headlessSource === "linux-display-fallback") {
+    const hasDisplay = process.env.DISPLAY || process.env.WAYLAND_DISPLAY;
+    const missingDisplay = process.platform === "linux" && !status.headless && !hasDisplay;
+    if (status.headless && status.headlessSource === "default") {
       checks.push({
         id: "headless-mode",
         label: "Headless mode",
         status: "pass",
-        summary: "Linux no-display fallback selected headless mode",
+        summary: "Managed browsers use headless mode by default",
       });
     }
     if (missingDisplay) {
@@ -105,7 +146,7 @@ export function buildBrowserDoctorReport(params: {
           "Use a desktop session, Xvfb, set OPENCLAW_BROWSER_HEADLESS=1, or remove the headed override.",
       });
     }
-    if (platform === "linux" && uid === 0 && !status.noSandbox) {
+    if (process.platform === "linux" && process.getuid?.() === 0 && !status.noSandbox) {
       checks.push({
         id: "linux-sandbox",
         label: "Linux sandbox",
@@ -144,6 +185,21 @@ export function buildBrowserDoctorReport(params: {
         ? {}
         : { fixHint: "Check Chrome launch logs, stale locks, proxy env, and port conflicts." }),
     });
+
+    if (status.graphics) {
+      const graphicsStatus =
+        status.graphics.status === "unavailable"
+          ? "warn"
+          : status.graphics.acceleration === "hardware"
+            ? "pass"
+            : "info";
+      checks.push({
+        id: "graphics",
+        label: "Graphics",
+        status: graphicsStatus,
+        summary: formatBrowserGraphicsSummary(status.graphics),
+      });
+    }
   }
 
   return {

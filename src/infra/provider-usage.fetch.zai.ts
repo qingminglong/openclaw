@@ -1,38 +1,25 @@
-// Fetches and normalizes Z.ai provider usage records.
+import { asDateTimestampMs, asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
-  buildUsageHttpErrorSnapshot,
-  discardUsageResponseBody,
-  fetchJson,
-  readUsageJson,
+  buildUsageErrorSnapshot,
+  fetchUsageJson,
+  parseUsageResetAt,
 } from "./provider-usage.fetch.shared.js";
 import { clampPercent, PROVIDER_LABELS } from "./provider-usage.shared.js";
 import type { ProviderUsageSnapshot, UsageWindow } from "./provider-usage.types.js";
 
-type ZaiUsageResponse = {
-  success?: boolean;
-  code?: number;
-  msg?: string;
-  data?: {
-    planName?: string;
-    plan?: string;
-    limits?: Array<{
-      type?: string;
-      percentage?: number;
-      unit?: number;
-      number?: number;
-      nextResetTime?: string;
-    }>;
-  };
-};
+const WINDOW_UNITS: Partial<Record<number, string>> = { 1: "d", 3: "h", 5: "mo", 6: "w" };
 
 export async function fetchZaiUsage(
   apiKey: string,
   timeoutMs: number,
   fetchFn: typeof fetch,
 ): Promise<ProviderUsageSnapshot> {
-  const res = await fetchJson(
-    "https://api.z.ai/api/monitor/usage/quota/limit",
-    {
+  const parsed = await fetchUsageJson({
+    provider: "zai",
+    url: "https://api.z.ai/api/monitor/usage/quota/limit",
+    init: {
       method: "GET",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -41,66 +28,42 @@ export async function fetchZaiUsage(
     },
     timeoutMs,
     fetchFn,
-  );
-
-  if (!res.ok) {
-    await discardUsageResponseBody(res);
-    return buildUsageHttpErrorSnapshot({
-      provider: "zai",
-      status: res.status,
-    });
-  }
-
-  const parsed = await readUsageJson("zai", res);
+  });
   if (!parsed.ok) {
     return parsed.snapshot;
   }
-  const data = parsed.data as ZaiUsageResponse;
-  if (!data.success || data.code !== 200) {
-    const errorMessage = typeof data.msg === "string" ? data.msg.trim() : "";
-    return {
-      provider: "zai",
-      displayName: PROVIDER_LABELS.zai,
-      windows: [],
-      error: errorMessage || "API error",
-    };
+  const usage = isRecord(parsed.data) ? parsed.data : undefined;
+  if (usage?.success !== true || asFiniteNumber(usage.code) !== 200) {
+    return buildUsageErrorSnapshot("zai", normalizeOptionalString(usage?.msg) || "API error");
   }
 
+  const data = isRecord(usage.data) ? usage.data : {};
+  const limits = Array.isArray(data.limits) ? data.limits : [];
   const windows: UsageWindow[] = [];
-  const limits = data.data?.limits || [];
-
   for (const limit of limits) {
-    const percent = clampPercent(limit.percentage || 0);
-    const nextReset = limit.nextResetTime ? new Date(limit.nextResetTime).getTime() : undefined;
-    let windowLabel = "Limit";
-    if (limit.unit === 1) {
-      windowLabel = `${limit.number}d`;
-    } else if (limit.unit === 3) {
-      windowLabel = `${limit.number}h`;
-    } else if (limit.unit === 5) {
-      windowLabel = `${limit.number}m`;
+    if (!isRecord(limit)) {
+      continue;
     }
+    const type = normalizeOptionalString(limit.type);
+    const number = asFiniteNumber(limit.number);
+    const suffix = WINDOW_UNITS[asFiniteNumber(limit.unit) ?? 0];
+    const windowLabel = suffix && number !== undefined ? `${number}${suffix}` : "Limit";
 
-    if (limit.type === "TOKENS_LIMIT") {
+    if (type === "TOKENS_LIMIT" || type === "TIME_LIMIT") {
       windows.push({
-        label: `Tokens (${windowLabel})`,
-        usedPercent: percent,
-        resetAt: nextReset,
-      });
-    } else if (limit.type === "TIME_LIMIT") {
-      windows.push({
-        label: "Monthly",
-        usedPercent: percent,
-        resetAt: nextReset,
+        label: type === "TOKENS_LIMIT" ? `Tokens (${windowLabel})` : "Monthly",
+        usedPercent: clampPercent(asFiniteNumber(limit.percentage) ?? 0),
+        resetAt:
+          asDateTimestampMs(limit.nextResetTime) ??
+          parseUsageResetAt(normalizeOptionalString(limit.nextResetTime)),
       });
     }
   }
 
-  const planName = data.data?.planName || data.data?.plan || undefined;
   return {
     provider: "zai",
     displayName: PROVIDER_LABELS.zai,
     windows,
-    plan: planName,
+    plan: normalizeOptionalString(data.planName) ?? normalizeOptionalString(data.plan),
   };
 }

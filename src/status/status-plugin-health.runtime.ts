@@ -4,7 +4,10 @@ import { resolveReadOnlyChannelPluginsForConfig } from "../channels/plugins/read
 // ordinary status tests do not eagerly load plugin registry internals.
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { listContextEngineQuarantines } from "../context-engine/registry.js";
-import { getActiveRuntimePluginRegistry } from "../plugins/active-runtime-registry.js";
+import {
+  getActiveRuntimePluginRegistry,
+  listLoadedRuntimePluginIds,
+} from "../plugins/active-runtime-registry.js";
 import {
   dedupeChannelPluginFailures,
   dedupePluginDiagnostics,
@@ -16,45 +19,28 @@ import type {
   PluginCompatibilityHealthNotice,
   PluginDiagnosticRecord,
   PluginHealthRecord,
-  RuntimeToolQuarantineRecord,
   StatusPluginHealthSnapshot,
 } from "./status-plugin-health.js";
 
-// The normalize* helpers project registry records onto the snapshot types while
-// omitting absent fields entirely, so snapshot merges never see explicitly
-// undefined values and test fixtures stay minimal.
+// Project only health fields, omitting absent values from registry records.
 function normalizeSnapshotPlugin(plugin: PluginHealthRecord): PluginHealthRecord {
-  const normalized: PluginHealthRecord = { id: plugin.id };
-  if (plugin.status !== undefined) {
-    normalized.status = plugin.status;
-  }
-  if (plugin.enabled !== undefined) {
-    normalized.enabled = plugin.enabled;
-  }
-  if (plugin.error !== undefined) {
-    normalized.error = plugin.error;
-  }
-  if (plugin.dependencyStatus !== undefined) {
-    normalized.dependencyStatus = plugin.dependencyStatus;
-  }
-  if (plugin.failurePhase !== undefined) {
-    normalized.failurePhase = plugin.failurePhase;
-  }
-  return normalized;
+  return {
+    id: plugin.id,
+    ...(plugin.status !== undefined ? { status: plugin.status } : {}),
+    ...(plugin.enabled !== undefined ? { enabled: plugin.enabled } : {}),
+    ...(plugin.error !== undefined ? { error: plugin.error } : {}),
+    ...(plugin.dependencyStatus !== undefined ? { dependencyStatus: plugin.dependencyStatus } : {}),
+    ...(plugin.failurePhase !== undefined ? { failurePhase: plugin.failurePhase } : {}),
+  };
 }
 
 function normalizeDiagnostic(diagnostic: PluginDiagnosticRecord): PluginDiagnosticRecord {
-  const normalized: PluginDiagnosticRecord = {
+  return {
     level: diagnostic.level,
     message: diagnostic.message,
+    ...(diagnostic.pluginId ? { pluginId: diagnostic.pluginId } : {}),
+    ...(diagnostic.code ? { code: diagnostic.code } : {}),
   };
-  if (diagnostic.pluginId) {
-    normalized.pluginId = diagnostic.pluginId;
-  }
-  if (diagnostic.code) {
-    normalized.code = diagnostic.code;
-  }
-  return normalized;
 }
 
 function normalizeCompatibilityNotice(
@@ -127,47 +113,36 @@ function collectChannelPluginFailures(params: {
   }
 }
 
-function parsePluginOwner(owner: string | undefined): string | undefined {
-  const prefix = "plugin:";
-  if (!owner?.startsWith(prefix)) {
-    return undefined;
-  }
-  const pluginId = owner.slice(prefix.length).trim();
-  return pluginId.length > 0 ? pluginId : undefined;
-}
-
-function filterRuntimeToolQuarantinesForRegistry(params: {
-  quarantines: readonly RuntimeToolQuarantineRecord[];
-  plugins: readonly PluginHealthRecord[];
-}): RuntimeToolQuarantineRecord[] {
-  const loadedPluginIds = new Set(
-    params.plugins
-      .filter((plugin) => plugin.enabled !== false && plugin.status !== "disabled")
-      .map((plugin) => plugin.id),
-  );
-  return params.quarantines.filter((quarantine) => {
-    const pluginId = parsePluginOwner(quarantine.owner);
-    return !pluginId || loadedPluginIds.has(pluginId);
-  });
-}
-
 // Compact status reads only the active registry and persisted health stores;
 // full config-driven channel inspection is reserved for the installed path.
-export function collectRuntimePluginHealthSnapshot(): StatusPluginHealthSnapshot {
+export async function collectRuntimePluginHealthSnapshot(): Promise<StatusPluginHealthSnapshot> {
+  const [contextEngineQuarantines, runtimeToolQuarantines] = await Promise.all([
+    listContextEngineQuarantines(),
+    listPersistedRuntimeToolSchemaQuarantines(),
+  ]);
   const registry = getActiveRuntimePluginRegistry();
   const diagnostics = (registry?.diagnostics ?? []).map(normalizeDiagnostic);
   const plugins = (registry?.plugins ?? []).map(normalizeSnapshotPlugin);
+  const runtimeLoadedPluginIds = listLoadedRuntimePluginIds();
+  const loadedPluginIds = new Set(
+    plugins
+      .filter((plugin) => plugin.enabled !== false && plugin.status !== "disabled")
+      .map((plugin) => plugin.id),
+  );
   return {
     plugins,
     diagnostics,
-    contextEngineQuarantines: listContextEngineQuarantines(),
-    runtimeToolQuarantines: filterRuntimeToolQuarantinesForRegistry({
-      quarantines: listPersistedRuntimeToolSchemaQuarantines(),
-      plugins,
+    contextEngineQuarantines,
+    runtimeToolQuarantines: runtimeToolQuarantines.filter((quarantine) => {
+      const pluginId = quarantine.owner?.startsWith("plugin:")
+        ? quarantine.owner.slice("plugin:".length).trim()
+        : undefined;
+      return !pluginId || loadedPluginIds.has(pluginId);
     }),
     channelPluginFailures: collectChannelPluginFailures({
       diagnostics,
     }),
+    runtimeLoadedPluginIds,
   };
 }
 
@@ -177,7 +152,7 @@ export async function collectInstalledPluginHealthSnapshot(params: {
 }): Promise<StatusPluginHealthSnapshot> {
   const { buildPluginCompatibilityNotices, buildPluginSnapshotReport } =
     await import("../plugins/status.js");
-  const runtime = collectRuntimePluginHealthSnapshot();
+  const runtime = await collectRuntimePluginHealthSnapshot();
   const report = buildPluginSnapshotReport({
     config: params.config,
     workspaceDir: params.workspaceDir,
@@ -199,7 +174,7 @@ export async function collectInstalledPluginHealthSnapshot(params: {
         report: runtimeRegistry,
       }).map(normalizeCompatibilityNotice)
     : [];
-  return mergeStatusPluginHealthSnapshots(
+  const merged = mergeStatusPluginHealthSnapshots(
     {
       plugins: report.plugins.map(normalizeSnapshotPlugin),
       diagnostics: installedDiagnostics,
@@ -213,4 +188,72 @@ export async function collectInstalledPluginHealthSnapshot(params: {
     },
     { ...runtime, compatibilityNotices: runtimeCompatibilityNotices },
   );
+  const shouldRunPluginIds = await resolveShouldRunPluginIds(params);
+  const unregisteredMemoryEmbeddingProviders = await resolveUnregisteredMemoryEmbeddingProviders({
+    config: params.config,
+    registry: runtimeRegistry,
+  });
+  return {
+    ...merged,
+    ...(shouldRunPluginIds ? { shouldRunPluginIds } : {}),
+    ...(unregisteredMemoryEmbeddingProviders ? { unregisteredMemoryEmbeddingProviders } : {}),
+  };
+}
+
+// Detailed status needs a live registry to distinguish unavailable providers from
+// providers not yet loaded. Missing facts or failed resolution produce no signal.
+async function resolveUnregisteredMemoryEmbeddingProviders(params: {
+  config?: OpenClawConfig;
+  registry: ReturnType<typeof getActiveRuntimePluginRegistry>;
+}): Promise<Array<{ configuredId: string; source: "provider" | "fallback" }> | undefined> {
+  if (!params.config || !params.registry) {
+    return undefined;
+  }
+  try {
+    const {
+      collectRegisteredEmbeddingProviderIds,
+      collectUnregisteredConfiguredMemoryEmbeddingProviders,
+    } = await import("../plugins/gateway-startup-plugin-ids.js");
+    const unregistered = collectUnregisteredConfiguredMemoryEmbeddingProviders({
+      config: params.config,
+      registeredProviderIds: collectRegisteredEmbeddingProviderIds(params.registry),
+    });
+    return unregistered.length > 0 ? unregistered : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Keep startup-plan loading off compact status; failed diagnostics never break status.
+async function resolveShouldRunPluginIds(params: {
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+}): Promise<string[] | undefined> {
+  if (!params.config) {
+    return undefined;
+  }
+  try {
+    const { loadGatewayStartupPluginPlan } =
+      await import("../plugins/gateway-startup-plugin-ids.js");
+    const { resolvePluginActivationSourceConfig } =
+      await import("../plugins/activation-source-config.js");
+    const { resolveGatewayStartupPluginActivationConfig } =
+      await import("../gateway/plugin-activation-runtime-config.js");
+    // Reuse Gateway boot's source-config activation and runtime/default merge.
+    const sourceConfig = resolvePluginActivationSourceConfig({ config: params.config });
+    const effectiveConfig = resolveGatewayStartupPluginActivationConfig({
+      runtimeConfig: params.config,
+      activationSourceConfig: sourceConfig,
+      env: process.env,
+    });
+    const plan = loadGatewayStartupPluginPlan({
+      config: effectiveConfig,
+      activationSourceConfig: sourceConfig,
+      env: process.env,
+      ...(params.workspaceDir !== undefined ? { workspaceDir: params.workspaceDir } : {}),
+    });
+    return [...plan.pluginIds];
+  } catch {
+    return undefined;
+  }
 }

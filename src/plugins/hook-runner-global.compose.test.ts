@@ -1,9 +1,4 @@
-/**
- * Composition rules for the global hook runner's live registry view (#91918).
- * These exercise the ownership/precedence/liveness decisions directly with
- * mock registries, complementing the real-load kill-chain coverage in
- * loader.hook-runner-live-view.test.ts.
- */
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getGlobalHookRunnerRegistry } from "./hook-runner-global-state.js";
 import {
@@ -11,169 +6,122 @@ import {
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
 } from "./hook-runner-global.js";
-import { addTestHook, createMockPluginRegistry } from "./hooks.test-helpers.js";
+import { addTestHook, createMockPluginRegistry } from "./hooks.test-fixtures.js";
 import type { PluginRegistry } from "./registry.js";
-import {
-  pinActivePluginChannelRegistry,
-  resetPluginRuntimeStateForTest,
-  setActivePluginRegistry,
-} from "./runtime.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "./runtime.js";
+import { withPluginRuntimeRegistryScope } from "./runtime/gateway-request-scope.js";
 import { createPluginRecord } from "./status.test-helpers.js";
 
-function runner() {
-  const value = getGlobalHookRunner();
-  if (!value) {
-    throw new Error("Expected global hook runner");
-  }
-  return value;
-}
+const context = {
+  agentId: "test-agent",
+  sessionKey: "test-session",
+  toolCallId: "test-call",
+  toolName: "read",
+};
+const runner = () => expectDefined(getGlobalHookRunner(), "global hook runner");
+const runTool = () => runner().runBeforeToolCall({ toolName: "read", params: {} }, context);
+const policyIds = () =>
+  getGlobalHookRunnerRegistry()?.trustedToolPolicies?.map(({ policy }) => policy.id);
 
+function toolRegistry(pluginId: string, withPolicy = false) {
+  const hook = vi.fn();
+  const registry = createMockPluginRegistry([
+    { hookName: "before_tool_call", handler: hook, pluginId },
+  ]);
+  if (withPolicy) {
+    registry.trustedToolPolicies = [
+      {
+        pluginId,
+        pluginName: pluginId,
+        source: "test",
+        policy: { id: `${pluginId}-policy`, description: pluginId, evaluate: () => undefined },
+      },
+    ];
+  }
+  return { hook, registry };
+}
+function initializeRoot(root: PluginRegistry, initial = root) {
+  setActivePluginRegistry(root);
+  initializeGlobalHookRunner(initial);
+}
 afterEach(() => {
   resetGlobalHookRunner();
   resetPluginRuntimeStateForTest();
 });
 
-describe("global hook runner composition (#91918)", () => {
-  it("prefers a loaded registration over a failed scoped reload of the same plugin", () => {
-    const boot = createMockPluginRegistry([
-      { hookName: "before_tool_call", handler: vi.fn(), pluginId: "gate" },
+describe("global hook runner registry selection", () => {
+  it.each(["add", "replace", "failed"] as const)(
+    "overlays request contributions (%s) and restores the process root",
+    async (mode) => {
+      const additive = mode === "add";
+      const { hook: rootHook, registry: root } = toolRegistry(
+        additive ? "root" : "shared",
+        mode !== "replace",
+      );
+      const { hook: scopedHook, registry: scoped } = toolRegistry(
+        additive ? "scoped" : "shared",
+        additive,
+      );
+      if (mode === "failed") {
+        scoped.hooks = [];
+        scoped.typedHooks = [];
+        scoped.plugins = [
+          createPluginRecord({ id: "shared", status: "error", error: "load failed" }),
+        ];
+      }
+      initializeRoot(root);
+      await withPluginRuntimeRegistryScope(scoped, async () => {
+        await runTool();
+        expect(policyIds()).toEqual(
+          additive ? ["root-policy", "scoped-policy"] : mode === "failed" ? ["shared-policy"] : [],
+        );
+      });
+      expect(scopedHook).toHaveBeenCalledTimes(mode === "failed" ? 0 : 1);
+      expect(rootHook).toHaveBeenCalledTimes(mode === "replace" ? 0 : 1);
+      await runTool();
+      expect(rootHook).toHaveBeenCalledTimes(mode === "replace" ? 1 : 2);
+      expect(policyIds()).toEqual(
+        mode === "replace" ? [] : [additive ? "root-policy" : "shared-policy"],
+      );
+    },
+  );
+
+  it("overlays an explicitly initialized SDK registry on the process root", async () => {
+    const { hook: rootToolHook, registry: root } = toolRegistry("shared", true);
+    const rootWriteHook = vi.fn();
+    addTestHook({
+      registry: root,
+      hookName: "before_message_write",
+      handler: rootWriteHook,
+      pluginId: "shared",
+    });
+    const sdkWriteHook = vi.fn(() => ({
+      message: { role: "user", content: "sdk redaction", timestamp: 2 },
+    }));
+    const sdk = createMockPluginRegistry([
+      { hookName: "before_message_write", handler: sdkWriteHook, pluginId: "shared" },
     ]);
-    // Scoped reload where the gate plugin failed to register: record present,
-    // status not loaded, no hooks.
-    const scopedFailure = createMockPluginRegistry([]);
-    scopedFailure.plugins[0].id = "gate";
-    scopedFailure.plugins[0].status = "error";
-
-    setActivePluginRegistry(boot);
-    pinActivePluginChannelRegistry(boot);
-    initializeGlobalHookRunner(boot);
-    expect(runner().hasHooks("before_tool_call")).toBe(true);
-
-    setActivePluginRegistry(scopedFailure);
-    initializeGlobalHookRunner(scopedFailure);
-    // The pinned boot registry still owns the loaded gate, so the fail-closed
-    // tool-call hook is not shadowed by the errored scoped record.
-    expect(runner().hasHooks("before_tool_call")).toBe(true);
-  });
-
-  it("prefers a loaded source that carries the hook over a loaded-but-hookless record", () => {
-    // Pinned boot registry: plugin C loaded WITH a fail-closed tool-call gate.
-    const boot = createMockPluginRegistry([
-      { hookName: "before_tool_call", handler: vi.fn(), pluginId: "C" },
-    ]);
-    // Scoped reload where C is present and loaded but registered no hooks
-    // (e.g. a setup-runtime channel load registers the channel, not api.on).
-    const scopedHookless = createMockPluginRegistry([]);
-    scopedHookless.plugins[0].id = "C";
-    scopedHookless.plugins[0].status = "loaded";
-
-    pinActivePluginChannelRegistry(boot);
-    setActivePluginRegistry(scopedHookless);
-    initializeGlobalHookRunner(scopedHookless);
-    // The hookless scoped record is highest precedence but must not shadow the
-    // pinned registration that actually carries C's gate.
-    expect(runner().hasHooks("before_tool_call")).toBe(true);
-  });
-
-  it("keeps a pinned registry with zero channels visible to hook dispatch", () => {
-    const hookOnlyPinned = createMockPluginRegistry([
-      { hookName: "subagent_ended", handler: vi.fn(), pluginId: "hooky" },
-    ]);
-    const channelActive = createMockPluginRegistry([
-      { hookName: "message_sent", handler: vi.fn(), pluginId: "chan" },
-    ]);
-    // Give the active registry a channel so the channel-presentation selector
-    // would prefer it and evict the zero-channel pinned registry — the raw
-    // live-registry collector must keep the pinned one regardless.
-    (channelActive.channels as unknown[]).push({});
-
-    setActivePluginRegistry(channelActive);
-    pinActivePluginChannelRegistry(hookOnlyPinned);
-    initializeGlobalHookRunner(channelActive);
-
-    expect(runner().hasHooks("subagent_ended")).toBe(true);
-    expect(runner().hasHooks("message_sent")).toBe(true);
-  });
-
-  it("keeps bundled trusted policies before installed policies across live registries", () => {
-    const pinnedBundled = createMockPluginRegistry([
-      { hookName: "before_tool_call", handler: vi.fn(), pluginId: "bundled-policy" },
-    ]);
-    pinnedBundled.plugins = [createPluginRecord({ id: "bundled-policy", origin: "bundled" })];
-    pinnedBundled.trustedToolPolicies = [
-      {
-        pluginId: "bundled-policy",
-        pluginName: "Bundled Policy",
-        origin: "bundled",
-        source: "test",
-        policy: {
-          id: "bundled-first",
-          description: "bundled policy",
-          evaluate: () => undefined,
-        },
-      },
-    ];
-    const activeInstalled = createMockPluginRegistry([]);
-    activeInstalled.plugins = [createPluginRecord({ id: "installed-policy", origin: "workspace" })];
-    activeInstalled.trustedToolPolicies = [
-      {
-        pluginId: "installed-policy",
-        pluginName: "Installed Policy",
-        origin: "workspace",
-        source: "test",
-        policy: {
-          id: "installed-second",
-          description: "installed policy",
-          evaluate: () => undefined,
-        },
-      },
-    ];
-
-    pinActivePluginChannelRegistry(pinnedBundled);
-    setActivePluginRegistry(activeInstalled);
-    initializeGlobalHookRunner(activeInstalled);
-
+    initializeRoot(root, sdk);
     expect(
-      getGlobalHookRunnerRegistry()?.trustedToolPolicies?.map((registration) => [
-        registration.origin,
-        registration.policy.id,
-      ]),
-    ).toEqual([
-      ["bundled", "bundled-first"],
-      ["workspace", "installed-second"],
-    ]);
+      runner().runBeforeMessageWrite(
+        { message: { role: "user", content: "private", timestamp: 1 } },
+        context,
+      ),
+    ).toEqual({ message: { role: "user", content: "sdk redaction", timestamp: 2 } });
+    expect(sdkWriteHook).toHaveBeenCalledOnce();
+    expect(rootWriteHook).not.toHaveBeenCalled();
+    await runTool();
+    expect(rootToolHook).toHaveBeenCalledOnce();
+    expect(policyIds()).toEqual(["shared-policy"]);
   });
 
-  it("lets an explicitly initialized registry win ownership over the active registry", () => {
-    const activeRegistry = createMockPluginRegistry([
-      { hookName: "message_received", handler: vi.fn(), pluginId: "foo" },
+  it("sees hooks added after initialization", () => {
+    const registry = createMockPluginRegistry([
+      { hookName: "message_received", handler: vi.fn(), pluginId: "plugin" },
     ]);
-    const sdkRegistry = createMockPluginRegistry([
-      { hookName: "message_sent", handler: vi.fn(), pluginId: "foo" },
-    ]);
-
-    setActivePluginRegistry(activeRegistry);
-    initializeGlobalHookRunner(sdkRegistry);
-
-    // Last-initialized highest precedence: the SDK registry owns plugin "foo",
-    // so its hook dispatches and the active registry's "foo" hook is shadowed.
-    expect(runner().hasHooks("message_sent")).toBe(true);
-    expect(runner().hasHooks("message_received")).toBe(false);
-  });
-
-  it("dispatches hooks pushed into a registry after initialization", () => {
-    const registry: PluginRegistry = createMockPluginRegistry([
-      { hookName: "message_received", handler: vi.fn(), pluginId: "p" },
-    ]);
-
-    setActivePluginRegistry(registry);
-    initializeGlobalHookRunner(registry);
-    // Read once so any internal caching would have settled.
-    expect(runner().hasHooks("message_received")).toBe(true);
+    initializeRoot(registry);
     expect(runner().hasHooks("message_sent")).toBe(false);
-
-    addTestHook({ registry, pluginId: "p", hookName: "message_sent", handler: vi.fn() });
-    // Live composition: the late registration is visible without re-init.
+    addTestHook({ registry, pluginId: "plugin", hookName: "message_sent", handler: vi.fn() });
     expect(runner().hasHooks("message_sent")).toBe(true);
   });
 });

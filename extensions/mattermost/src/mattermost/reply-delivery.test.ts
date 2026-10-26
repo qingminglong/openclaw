@@ -1,304 +1,235 @@
-// Mattermost tests cover reply delivery plugin behavior.
-import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import type { ChunkMode } from "openclaw/plugin-sdk/reply-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { isChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
+import { createMessageReceiptFromOutboundResults } from "openclaw/plugin-sdk/channel-outbound";
+import type { ChunkMode, ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
+import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
+import { beforeEach, expect, it, vi } from "vitest";
 import type { OpenClawConfig, PluginRuntime } from "../../runtime-api.js";
-import {
-  createMattermostReplyDeliveryBarrier,
-  deliverMattermostReplyPayload,
-} from "./reply-delivery.js";
+import { deliverMattermostReplyPayload } from "./reply-delivery.js";
+import type { MattermostSendResult } from "./send.js";
 
 type DeliverMattermostReplyPayloadParams = Parameters<typeof deliverMattermostReplyPayload>[0];
-type ReplyDeliveryMarkdownTableMode = Parameters<
-  DeliverMattermostReplyPayloadParams["core"]["channel"]["text"]["convertMarkdownTables"]
->[1];
-
+type SendMattermostMessageOptions = Parameters<
+  DeliverMattermostReplyPayloadParams["sendMessage"]
+>[2];
 function createReplyDeliveryCore(): DeliverMattermostReplyPayloadParams["core"] {
   return {
     channel: {
       text: {
-        chunkByNewline: vi.fn((text: string) => [text]),
-        chunkMarkdownText: vi.fn((text: string) => [text]),
         convertMarkdownTables: vi.fn((text: string) => text),
-        chunkText: vi.fn((text: string) => [text]),
-        chunkTextWithMode: vi.fn((text: string) => [text]),
-        resolveMarkdownTableMode: vi.fn<() => ReplyDeliveryMarkdownTableMode>(() => "off"),
         resolveChunkMode: vi.fn<() => ChunkMode>(() => "length"),
-        resolveTextChunkLimit: vi.fn(
-          (
-            _cfg?: OpenClawConfig,
-            _provider?: string,
-            _accountId?: string | null,
-            opts?: { fallbackLimit?: number },
-          ) => opts?.fallbackLimit ?? 4000,
-        ),
-        hasControlCommand: vi.fn(() => false),
         chunkMarkdownTextWithMode: vi.fn((text: string) => [text]),
       },
     },
   } as unknown as PluginRuntime;
 }
 
-describe("createMattermostReplyDeliveryBarrier", () => {
-  it("extends while direct deliveries or DM resolution remain unsettled", async () => {
-    const barrier = createMattermostReplyDeliveryBarrier({ isDirect: true });
-    const policy = barrier.resolveTimeoutPolicy({
-      queuedCounts: { tool: 1, block: 0, final: 1 },
-      humanDelayBudgetMs: 0,
-    });
-    expect(policy?.maxTimeoutMs).toBe(420_000);
-    expect(policy?.shouldExtend()).toBe(true);
+function createSendMessageMock() {
+  let sendCount = 0;
+  return vi.fn(
+    async (
+      _to: string,
+      content: string,
+      opts: SendMattermostMessageOptions,
+    ): Promise<MattermostSendResult> => {
+      const messageId = `post-${++sendCount}`;
+      return sendResult(
+        messageId,
+        content.trim(),
+        "buttons" in opts && Array.isArray(opts.buttons) && opts.buttons.length ? "card" : "text",
+      );
+    },
+  );
+}
 
-    let resolveResolution: () => void = () => {};
-    const resolution = new Promise<void>((resolve) => {
-      resolveResolution = resolve;
-    });
-    barrier.trackDmChannelResolution(resolution);
-    expect(policy?.shouldExtend()).toBe(true);
+function sendResult(
+  messageId: string,
+  content: string,
+  kind: "text" | "card" = "text",
+): MattermostSendResult {
+  return {
+    messageId,
+    channelId: "channel-1",
+    content,
+    receipt: createMessageReceiptFromOutboundResults({
+      results: [{ channel: "mattermost", messageId, channelId: "channel-1" }],
+      kind,
+    }),
+  };
+}
 
-    resolveResolution();
-    await resolution;
-    await Promise.resolve();
-    expect(policy?.shouldExtend()).toBe(true);
-
-    barrier.markDeliverySettled();
-    expect(policy?.shouldExtend()).toBe(true);
-
-    barrier.markDeliverySettled();
-    expect(policy?.shouldExtend()).toBe(false);
-  });
-
-  it("stays extended between failed retries until queued deliveries settle", async () => {
-    const barrier = createMattermostReplyDeliveryBarrier({ isDirect: true });
-    const policy = barrier.resolveTimeoutPolicy({
-      queuedCounts: { tool: 1, block: 0, final: 1 },
-      humanDelayBudgetMs: 0,
-    });
-    let rejectResolution: (error: Error) => void = () => {};
-    const resolution = new Promise<void>((_resolve, reject) => {
-      rejectResolution = reject;
-    });
-    barrier.trackDmChannelResolution(resolution);
-
-    rejectResolution(new Error("DM creation failed"));
-    await expect(resolution).rejects.toThrow("DM creation failed");
-    await Promise.resolve();
-    barrier.markDeliverySettled();
-    expect(policy?.shouldExtend()).toBe(true);
-
-    barrier.markDeliverySettled();
-    expect(policy?.shouldExtend()).toBe(false);
-  });
-
-  it("does not extend non-DM delivery", () => {
-    const barrier = createMattermostReplyDeliveryBarrier({ isDirect: false });
-    expect(
-      barrier.resolveTimeoutPolicy({
-        queuedCounts: { tool: 1, block: 1, final: 1 },
-        humanDelayBudgetMs: 0,
-      }),
-    ).toBeUndefined();
-  });
+let sendMessage: ReturnType<typeof createSendMessageMock>;
+let core: DeliverMattermostReplyPayloadParams["core"];
+beforeEach(() => {
+  sendMessage = createSendMessageMock();
+  core = createReplyDeliveryCore();
 });
 
-describe("deliverMattermostReplyPayload", () => {
-  it("suppresses payloads flagged as reasoning", async () => {
-    const sendMessage = vi.fn(async () => undefined);
-    const cfg = {} satisfies OpenClawConfig;
-    const core = createReplyDeliveryCore();
+function deliver(
+  options: Pick<DeliverMattermostReplyPayloadParams, "payload"> &
+    Partial<DeliverMattermostReplyPayloadParams>,
+) {
+  return deliverMattermostReplyPayload({
+    core,
+    sendMessage,
+    cfg: {},
+    channelId: "town-square",
+    accountId: "default",
+    textLimit: 4000,
+    tableMode: "off",
+    ...options,
+  });
+}
 
-    const outcome = await deliverMattermostReplyPayload({
-      core,
-      cfg,
-      payload: { text: "hidden", isReasoning: true },
-      to: "channel:town-square",
-      accountId: "default",
-      agentId: "agent-1",
-      replyToId: "root-post",
-      textLimit: 4000,
-      tableMode: "off",
-      sendMessage,
-    });
+type Presentation = NonNullable<ReplyPayload["presentation"]>;
+const present = (...blocks: Presentation["blocks"]): Pick<ReplyPayload, "presentation"> => ({
+  presentation: { blocks },
+});
+const openControls = present({ type: "buttons", buttons: [{ label: "Open", value: "open" }] });
+const nativeButton = { buttons: [[{ id: "open", callback_data: "open" }]] };
+const suppressed = (outcome: "empty" | "reasoning_skipped") => ({
+  outcome,
+  visibleReplySent: false,
+  suppression: { reason: "no_visible_result" },
+});
 
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(outcome).toBe("reasoning_skipped");
+it("uses authored fallback text without duplicating presentation text", async () => {
+  const result = await deliver({
+    payload: {
+      text: "Already formatted",
+      presentationTextMode: "fallback",
+      ...present({ type: "text", text: "Generated summary" }),
+    },
+    replyToId: "root-post",
+  });
+  expect(sendMessage).toHaveBeenCalledWith(
+    "channel:town-square",
+    "Already formatted",
+    expect.objectContaining({ accountId: "default", replyToId: "root-post" }),
+  );
+  expect(sendMessage.mock.calls[0]![2]).not.toHaveProperty("buttons");
+  expect(result).toMatchObject({ outcome: "text", visibleReplySent: true });
+});
+
+it("attaches presentation controls only to the first visible text chunk", async () => {
+  core.channel.text.chunkMarkdownTextWithMode = vi.fn(() => ["alpha", "beta"]);
+  sendMessage
+    .mockResolvedValueOnce(sendResult("post-1", "provider-finalized alpha", "card"))
+    .mockResolvedValueOnce(sendResult("post-2", "beta"));
+
+  const result = await deliver({ payload: { text: "alpha beta", ...openControls }, textLimit: 6 });
+
+  expect(sendMessage).toHaveBeenCalledTimes(2);
+  expect(sendMessage.mock.calls[0]![2]).toMatchObject(nativeButton);
+  expect("buttons" in sendMessage.mock.calls[1]![2]).toBe(false);
+  expect(result).toMatchObject({
+    outcome: "text",
+    messageIds: ["post-1", "post-2"],
+    visibleReplySent: true,
+    content: "provider-finalized alpha\nbeta",
+  });
+  expect(result.receipt?.parts.map((part) => part.platformMessageId)).toEqual(["post-1", "post-2"]);
+});
+
+it("keeps multiple-media presentations on the text/media fallback path", async () => {
+  await deliver({
+    payload: {
+      mediaUrls: ["https://example.com/1.png", "https://example.com/2.png"],
+      ...openControls,
+    },
   });
 
-  it("returns 'empty' for substantive text that produced no send (regression: #80501)", async () => {
-    const sendMessage = vi.fn(async () => undefined);
-    const cfg = {} satisfies OpenClawConfig;
-    const core = createReplyDeliveryCore();
-    // Make the markdown table converter strip the text to empty so
-    // deliverTextOrMediaReply sees an empty chunked text and returns "empty".
-    core.channel.text.convertMarkdownTables = vi.fn(() => "");
-    core.channel.text.chunkMarkdownTextWithMode = vi.fn(() => []);
+  expect(sendMessage).toHaveBeenCalledTimes(2);
+  expect(sendMessage.mock.calls[0]![1]).toBe("- Open");
+  for (const call of sendMessage.mock.calls) {
+    expect("buttons" in call[2]).toBe(false);
+  }
+});
 
-    const outcome = await deliverMattermostReplyPayload({
-      core,
-      cfg,
-      payload: { text: "non-trivial input that the converter strips" },
-      to: "channel:town-square",
-      accountId: "default",
-      agentId: "agent-1",
-      replyToId: "root-post",
-      textLimit: 4000,
-      tableMode: "off",
-      sendMessage,
-    });
+it("suppresses reasoning before sending", async () => {
+  const payload = { text: "> Reasoning:\n> _hidden_" };
+  const outcome = await deliver({ payload, agentId: "agent-1", replyToId: "root-post" });
+  expect(sendMessage).not.toHaveBeenCalled();
+  expect(outcome).toEqual(suppressed("reasoning_skipped"));
+});
 
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(outcome).toBe("empty");
+it("returns 'empty' for substantive text that produced no send (regression: #80501)", async () => {
+  core.channel.text.convertMarkdownTables = vi.fn(() => "");
+  core.channel.text.chunkMarkdownTextWithMode = vi.fn(() => []);
+
+  const outcome = await deliver({
+    payload: { text: "non-trivial input that the converter strips" },
+    agentId: "agent-1",
+    replyToId: "root-post",
   });
 
-  it("suppresses reasoning-prefixed payloads even without an explicit flag", async () => {
-    const sendMessage = vi.fn(async () => undefined);
-    const cfg = {} satisfies OpenClawConfig;
-    const core = createReplyDeliveryCore();
+  expect(sendMessage).not.toHaveBeenCalled();
+  expect(outcome).toEqual(suppressed("empty"));
+});
 
-    await deliverMattermostReplyPayload({
-      core,
-      cfg,
-      payload: { text: "  \n Reasoning:\n_hidden_" },
-      to: "channel:town-square",
-      accountId: "default",
-      agentId: "agent-1",
-      replyToId: "root-post",
-      textLimit: 4000,
-      tableMode: "off",
-      sendMessage,
-    });
-
-    expect(sendMessage).not.toHaveBeenCalled();
+it("passes agent-scoped mediaLocalRoots when sending media paths", async () => {
+  const openClawState = await createOpenClawTestState({
+    layout: "state-only",
+    prefix: "openclaw-mm-state-",
   });
+  const stateDir = openClawState.stateDir;
 
-  it("suppresses reasoning payloads formatted as a Mattermost blockquote", async () => {
-    const sendMessage = vi.fn(async () => undefined);
+  try {
+    const agentId = "agent-1";
+    const mediaUrl = `file://${path.join(stateDir, `workspace-${agentId}`, "photo.png")}`;
     const cfg = {} satisfies OpenClawConfig;
-    const core = createReplyDeliveryCore();
-
-    await deliverMattermostReplyPayload({
-      core,
+    await deliver({
       cfg,
-      payload: { text: "> Reasoning:\n> _hidden_" },
-      to: "channel:town-square",
-      accountId: "default",
-      agentId: "agent-1",
+      payload: { text: "caption", mediaUrl },
+      agentId,
       replyToId: "root-post",
-      textLimit: 4000,
-      tableMode: "off",
-      sendMessage,
-    });
-
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-
-  it("does not suppress messages that mention Reasoning: mid-text", async () => {
-    const sendMessage = vi.fn(async () => undefined);
-    const cfg = {} satisfies OpenClawConfig;
-    const core = createReplyDeliveryCore();
-
-    await deliverMattermostReplyPayload({
-      core,
-      cfg,
-      payload: { text: "Intro line\nReasoning: appears in content but is not a prefix" },
-      to: "channel:town-square",
-      accountId: "default",
-      agentId: "agent-1",
-      replyToId: "root-post",
-      textLimit: 4000,
-      tableMode: "off",
-      sendMessage,
     });
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
       "channel:town-square",
-      "Intro line\nReasoning: appears in content but is not a prefix",
-      {
-        cfg,
-        accountId: "default",
-        replyToId: "root-post",
-      },
-    );
-  });
-
-  it("passes agent-scoped mediaLocalRoots when sending media paths", async () => {
-    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-mm-state-"));
-    process.env.OPENCLAW_STATE_DIR = stateDir;
-
-    try {
-      const sendMessage = vi.fn(async () => undefined);
-      const core = createReplyDeliveryCore();
-
-      const agentId = "agent-1";
-      const mediaUrl = `file://${path.join(stateDir, `workspace-${agentId}`, "photo.png")}`;
-      const cfg = {} satisfies OpenClawConfig;
-
-      await deliverMattermostReplyPayload({
-        core,
-        cfg,
-        payload: { text: "caption", mediaUrl },
-        to: "channel:town-square",
-        accountId: "default",
-        agentId,
-        replyToId: "root-post",
-        textLimit: 4000,
-        tableMode: "off",
-        sendMessage,
-      });
-
-      expect(sendMessage).toHaveBeenCalledTimes(1);
-      expect(sendMessage).toHaveBeenCalledWith("channel:town-square", "caption", {
+      "caption",
+      expect.objectContaining({
         cfg,
         accountId: "default",
         mediaUrl,
+        requireMediaUpload: true,
         replyToId: "root-post",
         mediaLocalRoots: expect.arrayContaining([
           path.join(stateDir, "media"),
           path.join(stateDir, "canvas"),
           path.join(stateDir, "workspace"),
-          path.join(stateDir, "sandboxes"),
           path.join(stateDir, `workspace-${agentId}`),
         ]),
-      });
-    } finally {
-      if (previousStateDir === undefined) {
-        delete process.env.OPENCLAW_STATE_DIR;
-      } else {
-        process.env.OPENCLAW_STATE_DIR = previousStateDir;
-      }
-      await fs.rm(stateDir, { recursive: true, force: true });
-    }
-  });
+      }),
+    );
+    const sendOptions = sendMessage.mock.calls[0]?.[2];
+    expect(sendOptions?.mediaLocalRoots).not.toContain(path.join(stateDir, "sandboxes"));
+  } finally {
+    await openClawState.cleanup();
+  }
+});
 
-  it("forwards replyToId for text-only chunked replies", async () => {
-    const sendMessage = vi.fn(async () => undefined);
-    const cfg = {} satisfies OpenClawConfig;
-    const core = createReplyDeliveryCore();
-    core.channel.text.chunkMarkdownTextWithMode = vi.fn(() => ["hello"]);
+it("preserves the accepted post when a later chunk fails", async () => {
+  const firstResult = createSendMessageMock();
+  const partialSend = vi
+    .fn<DeliverMattermostReplyPayloadParams["sendMessage"]>()
+    .mockImplementationOnce(firstResult)
+    .mockRejectedValueOnce(new Error("second chunk failed"));
+  core.channel.text.chunkMarkdownTextWithMode = vi.fn(() => ["alpha", "beta"]);
 
-    const outcome = await deliverMattermostReplyPayload({
-      core,
-      cfg,
-      payload: { text: "hello" },
-      to: "channel:town-square",
-      accountId: "default",
-      agentId: "agent-1",
-      replyToId: "root-post",
-      textLimit: 4000,
-      tableMode: "off",
-      sendMessage,
-    });
-
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith("channel:town-square", "hello", {
-      cfg,
-      accountId: "default",
-      replyToId: "root-post",
-    });
-    expect(outcome).toBe("text");
+  const caught: unknown = await deliver({
+    payload: { text: "alpha beta" },
+    sendMessage: partialSend,
+    replyToId: "root-post",
+    textLimit: 6,
+  }).catch((error: unknown) => error);
+  if (!isChannelPartialDeliveryError(caught)) {
+    throw new Error("expected a partial Mattermost delivery error");
+  }
+  expect(caught.deliveryResult).toMatchObject({
+    messageIds: ["post-1"],
+    visibleReplySent: true,
+    content: "alpha",
   });
 });

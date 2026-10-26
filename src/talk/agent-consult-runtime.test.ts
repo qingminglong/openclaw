@@ -1,99 +1,87 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { expectDefined } from "@openclaw/normalization-core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import type { RunEmbeddedAgentParams } from "../agents/embedded-agent-runner/run/params.js";
-import type {
-  ForkSessionEntryFromParentParams,
-  ForkSessionEntryFromParentResult,
-} from "../auto-reply/reply/session-fork.js";
+import { setReplyPayloadMetadata } from "../auto-reply/reply-payload.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import {
-  setRealtimeVoiceAgentConsultDepsForTest,
-  consultRealtimeVoiceAgent,
-  resolveRealtimeVoiceAgentConsultTools,
-  resolveRealtimeVoiceAgentConsultToolsAllow,
-} from "./agent-consult-runtime.js";
-import { REALTIME_VOICE_AGENT_CONSULT_TOOL } from "./agent-consult-tool.js";
+  emitTrustedDiagnosticEvent,
+  waitForDiagnosticEventsDrained,
+} from "../infra/diagnostic-events.js";
+import { MODEL_SELECTION_LOCKED_MESSAGE } from "../sessions/model-overrides.js";
+import { runSessionMutation } from "../sessions/session-controller.lifecycle.js";
+import {
+  createOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
+import { normalizeSessionDeliveryState } from "../utils/delivery-context.shared.js";
+import { consultRealtimeVoiceAgent } from "./agent-consult-runtime.js";
+import {
+  createOrResumeClientVoiceSession,
+  registerClientVoiceConsultRun,
+  resolveClientVoiceRunBinding,
+} from "./client-voice-session.js";
+import { clientVoiceSessionTesting } from "./client-voice-session.test-support.js";
+
+type ForkSessionEntryFromParent =
+  typeof import("../auto-reply/reply/session-fork.js").forkSessionEntryFromParent;
+
+const forkSessionEntryFromParent = vi.hoisted(() => vi.fn<ForkSessionEntryFromParent>());
+
+vi.mock("../auto-reply/reply/session-fork.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../auto-reply/reply/session-fork.js")>();
+  return {
+    ...actual,
+    forkSessionEntryFromParent,
+  };
+});
+
+let state: OpenClawTestState;
 
 function createAgentRuntime(payloads: unknown[] = [{ text: "Speak this." }]) {
-  const sessionStore: Record<
-    string,
-    {
-      sessionId?: string;
-      updatedAt?: number;
-      sessionFile?: string;
-      spawnedBy?: string;
-      forkedFromParent?: boolean;
-      totalTokens?: number;
-      deliveryContext?: {
-        channel?: string;
-        to?: string;
-        accountId?: string;
-        threadId?: string | number;
-      };
-      lastChannel?: string;
-      lastTo?: string;
-      lastAccountId?: string;
-      lastThreadId?: string | number;
-    }
-  > = {};
-  const runEmbeddedAgent = vi.fn(async () => ({
+  const sessionStore: Record<string, SessionEntry> = {};
+  const runEmbeddedAgent = vi.fn(async (_params: RunEmbeddedAgentParams) => ({
     payloads,
     meta: {},
   }));
-  const updateSessionStore = vi.fn(
-    async (
-      _storePath: string,
-      mutator: (store: Record<string, { sessionId?: string; updatedAt?: number }>) => unknown,
-    ) => {
-      return await mutator(sessionStore);
-    },
-  );
   const getSessionEntry = vi.fn(
-    (params: { sessionKey: string }) => sessionStore[params.sessionKey],
+    ({ sessionKey }: { sessionKey: string }) => sessionStore[sessionKey],
   );
-  const patchSessionEntry = vi.fn(
-    async (params: {
-      sessionKey: string;
-      fallbackEntry?: Record<string, unknown>;
-      update: (
-        entry: Record<string, unknown>,
-      ) => Promise<Record<string, unknown> | null> | Record<string, unknown> | null;
-    }) => {
-      const existing = sessionStore[params.sessionKey] ?? params.fallbackEntry;
-      if (!existing) {
-        return null;
-      }
-      const patch = await params.update({ ...existing });
-      if (!patch) {
-        return existing;
-      }
-      const next = { ...existing, ...patch };
-      sessionStore[params.sessionKey] = next;
-      return next;
-    },
-  );
-  const upsertSessionEntry = vi.fn(
-    async (params: { sessionKey: string; entry: Record<string, unknown> }) => {
-      sessionStore[params.sessionKey] = { ...params.entry };
-    },
-  );
+  const prepareSessionEntryPatch = vi.fn<
+    ConsultParams["agentRuntime"]["session"]["prepareSessionEntryPatch"]
+  >(async (params) => {
+    const existing = sessionStore[params.sessionKey] ?? params.fallbackEntry;
+    if (!existing) {
+      return null;
+    }
+    const patch = await params.prepare(
+      { ...existing },
+      { existingEntry: sessionStore[params.sessionKey] },
+    );
+    if (params.authority?.kind !== "host") {
+      throw new Error("Expected host session authority");
+    }
+    params.authority.assertCurrent();
+    if (!patch) {
+      return existing;
+    }
+    const next = { ...existing, ...patch };
+    sessionStore[params.sessionKey] = next;
+    return next;
+  });
   return {
     runtime: {
-      resolveAgentDir: vi.fn(() => "/tmp/agent"),
-      resolveAgentWorkspaceDir: vi.fn(() => "/tmp/workspace"),
+      resolveAgentDir: vi.fn(() => state.statePath("agent")),
+      resolveAgentWorkspaceDir: vi.fn(() => state.statePath("workspace")),
       ensureAgentWorkspace: vi.fn(async () => {}),
       resolveAgentTimeoutMs: vi.fn(() => 30_000),
       session: {
-        resolveStorePath: vi.fn(() => "/tmp/sessions.json"),
-        loadSessionStore: vi.fn(() => sessionStore),
-        saveSessionStore: vi.fn(async () => {}),
-        updateSessionStore,
+        resolveStorePath: vi.fn(() => state.statePath("sessions.json")),
         getSessionEntry,
-        patchSessionEntry,
-        upsertSessionEntry,
-        resolveSessionFilePath: vi.fn(
-          (_sessionId: string, entry?: { sessionFile?: string }) =>
-            entry?.sessionFile ?? "/tmp/session.json",
+        getSessionEntryAsync: vi.fn(
+          async (params: { sessionKey: string }) => sessionStore[params.sessionKey],
         ),
+        prepareSessionEntryPatch,
       },
       runEmbeddedAgent,
     },
@@ -102,69 +90,208 @@ function createAgentRuntime(payloads: unknown[] = [{ text: "Speak this." }]) {
   };
 }
 
-function requireEmbeddedAgentCall(runEmbeddedAgent: {
-  mock: { calls: unknown[][] };
-}): RunEmbeddedAgentParams {
-  const [call] = runEmbeddedAgent.mock.calls;
-  if (!call) {
-    throw new Error("Expected embedded OpenClaw agent call");
-  }
-  const [params] = call;
-  if (typeof params !== "object" || params === null || Array.isArray(params)) {
-    throw new Error("Expected embedded OpenClaw agent params to be an object");
-  }
-  return params as RunEmbeddedAgentParams;
+type ConsultParams = Parameters<typeof consultRealtimeVoiceAgent>[0];
+type TestRuntime = ReturnType<typeof createAgentRuntime>["runtime"];
+
+function runConsult(runtime: TestRuntime, params: Partial<ConsultParams> = {}) {
+  return consultRealtimeVoiceAgent({
+    agentRuntime: runtime as never,
+    cfg: {},
+    logger: { warn: vi.fn() },
+    messageProvider: "voice",
+    lane: "voice",
+    transcript: [],
+    surface: "a live phone call",
+    userLabel: "Caller",
+    sessionKey: "voice:consult",
+    runIdPrefix: "voice-consult",
+    args: { question: "What should I say?" },
+    ...params,
+  });
 }
 
-function expectPositiveTimestamp(value: unknown) {
-  expect(typeof value).toBe("number");
-  expect(value as number).toBeGreaterThan(0);
+function expectNoDispatch(runtime: TestRuntime) {
+  expect(runtime.ensureAgentWorkspace).not.toHaveBeenCalled();
+  expect(runtime.session.prepareSessionEntryPatch).not.toHaveBeenCalled();
+  expect(runtime.runEmbeddedAgent).not.toHaveBeenCalled();
+}
+
+const requesterSessionKey = "agent:main:main";
+const forkSessionKey = "agent:main:subagent:google-meet:meet-1";
+const lockedEntry = { updatedAt: 1, agentHarnessId: "codex", modelSelectionLocked: true };
+const forkConsult = (runtime: TestRuntime, params: Partial<ConsultParams> = {}) =>
+  runConsult(runtime, {
+    sessionKey: forkSessionKey,
+    spawnedBy: requesterSessionKey,
+    contextMode: "fork",
+    messageProvider: "google-meet",
+    lane: "google-meet",
+    surface: "a private Google Meet",
+    userLabel: "Participant",
+    ...params,
+  });
+
+function requireEmbeddedAgentCall(
+  runEmbeddedAgent: ReturnType<typeof createAgentRuntime>["runEmbeddedAgent"],
+): RunEmbeddedAgentParams {
+  const params = runEmbeddedAgent.mock.calls[0]?.[0];
+  if (!params) {
+    throw new Error("Expected embedded OpenClaw agent call");
+  }
+  return params;
 }
 
 function expectNonEmptyString(value: unknown) {
-  expect(typeof value).toBe("string");
-  expect((value as string).trim()).not.toBe("");
+  expect(value).toEqual(expect.stringMatching(/\S/u));
+}
+
+function expectForkTarget(call: RunEmbeddedAgentParams, sessionId = call.sessionId) {
+  expect(call.sessionFile).toBeUndefined();
+  expect(call.spawnedBy).toBe(requesterSessionKey);
+  expect(call.sessionTarget).toMatchObject({
+    agentId: "main",
+    sessionId,
+    sessionKey: forkSessionKey,
+    storePath: state.statePath("sessions.json"),
+  });
 }
 
 describe("realtime voice agent consult runtime", () => {
-  afterEach(() => {
-    setRealtimeVoiceAgentConsultDepsForTest(null);
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import("../auto-reply/reply/session-fork.js")>(
+      "../auto-reply/reply/session-fork.js",
+    );
+    forkSessionEntryFromParent.mockImplementation(actual.forkSessionEntryFromParent);
+    state = await createOpenClawTestState({ label: "talk-consult", layout: "state-only" });
   });
 
-  it("exposes the shared consult tool based on policy", () => {
-    expect(resolveRealtimeVoiceAgentConsultTools("safe-read-only")).toStrictEqual([
-      REALTIME_VOICE_AGENT_CONSULT_TOOL,
-    ]);
-    expect(resolveRealtimeVoiceAgentConsultTools("none")).toStrictEqual([]);
-    expect(resolveRealtimeVoiceAgentConsultToolsAllow("safe-read-only")).toEqual([
-      "read",
-      "web_search",
-      "web_fetch",
-      "x_search",
-      "memory_search",
-      "memory_get",
-    ]);
-    expect(resolveRealtimeVoiceAgentConsultToolsAllow("owner")).toBeUndefined();
-    expect(resolveRealtimeVoiceAgentConsultToolsAllow("none")).toStrictEqual([]);
+  afterEach(async () => {
+    forkSessionEntryFromParent.mockReset();
+    clientVoiceSessionTesting.reset();
+    await state.cleanup();
+  });
+
+  it("does not start a consult after its caller has closed", async () => {
+    const { runtime, runEmbeddedAgent } = createAgentRuntime();
+    const controller = new AbortController();
+    controller.abort(new Error("voice session closed"));
+
+    await expect(runConsult(runtime, { abortSignal: controller.signal })).rejects.toThrow(
+      "voice session closed",
+    );
+    expect(runEmbeddedAgent).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "waits for run registration and releases it after cancellation=%s",
+    async (cancelled) => {
+      const { runtime, runEmbeddedAgent } = createAgentRuntime();
+      const entered = createDeferred();
+      const release = createDeferred();
+      const controller = new AbortController();
+      const cleanup = vi.fn();
+      const consult = runConsult(runtime, {
+        abortSignal: controller.signal,
+        onRunStarted: async () => {
+          entered.resolve();
+          await release.promise;
+          return { cleanup };
+        },
+      });
+      await entered.promise;
+      expect(runEmbeddedAgent).not.toHaveBeenCalled();
+      expect(cleanup).not.toHaveBeenCalled();
+      if (cancelled) {
+        controller.abort(new Error("voice session closed during registration"));
+      }
+      release.resolve();
+      if (cancelled) {
+        await expect(consult).rejects.toThrow("voice session closed during registration");
+        expect(runEmbeddedAgent).not.toHaveBeenCalled();
+      } else {
+        await expect(consult).resolves.toEqual({ text: "Speak this." });
+        expect(runEmbeddedAgent).toHaveBeenCalledOnce();
+      }
+      expect(cleanup).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("retains the voice binding until delegated run completion", async () => {
+    const { runtime, runEmbeddedAgent } = createAgentRuntime();
+    const started = createDeferred();
+    const release = createDeferred();
+    const voiceSessionId = await createOrResumeClientVoiceSession({
+      agentId: "main",
+      sessionKey: "agent:main:main",
+      origin: "client",
+      transcriptCapable: true,
+      voiceSessionId: "voice-gpt-live",
+    });
+    let runId: string | undefined;
+    runEmbeddedAgent.mockImplementationOnce(async (params) => {
+      const binding = resolveClientVoiceRunBinding(params.runId);
+      expect(binding).toMatchObject({
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        voiceSessionId,
+      });
+      started.resolve();
+      await release.promise;
+      emitTrustedDiagnosticEvent({
+        type: "run.completed",
+        runId: params.runId,
+        durationMs: 5,
+        outcome: "completed",
+      });
+      return { payloads: [{ text: "Done." }], meta: {} };
+    });
+
+    const consult = runConsult(runtime, {
+      agentId: "main",
+      sessionKey: "agent:main:main",
+      messageProvider: "webchat",
+      lane: "talk",
+      onRunStarted: async (startedRun) => {
+        runId = startedRun.runId;
+        await registerClientVoiceConsultRun({
+          agentId: "main",
+          sessionKey: "agent:main:main",
+          voiceSessionId,
+          runId: startedRun.runId,
+        });
+      },
+    });
+
+    await started.promise;
+    expect(runId).toEqual(expect.any(String));
+    release.resolve();
+    await expect(consult).resolves.toEqual({ text: "Done." });
+    await waitForDiagnosticEventsDrained();
+    expect(resolveClientVoiceRunBinding(runId)).toBeUndefined();
   });
 
   it("runs an embedded agent using the shared session and prompt contract", async () => {
-    const { runtime, runEmbeddedAgent, sessionStore } = createAgentRuntime();
+    const { runtime, runEmbeddedAgent, sessionStore } = createAgentRuntime([
+      setReplyPayloadMetadata({ text: "Earlier answer." }, { precedingInputAnswer: true }),
+      { text: "Speak this." },
+      { text: "Then this." },
+    ]);
 
-    const result = await consultRealtimeVoiceAgent({
-      cfg: {} as never,
-      agentRuntime: runtime as never,
-      logger: { warn: vi.fn() },
+    const result = await runConsult(runtime, {
+      cfg: { agents: { entries: { operator: {} } } },
       sessionKey: "voice:15550001234",
-      messageProvider: "voice",
-      lane: "voice",
       runIdPrefix: "voice-realtime-consult:call-1",
       args: { question: "What should I say?", context: "Caller asked about PR #123." },
-      transcript: [{ role: "user", text: "Can you check this?" }],
-      surface: "a live phone call",
-      userLabel: "Caller",
+      transcript: [
+        { role: "user", text: "Can you check this?" },
+        { role: "assistant", text: "I'll verify." },
+      ],
+      assistantLabel: "Agent",
       questionSourceLabel: "caller",
+      senderId: "+15550001234",
+      senderIsOwner: true,
       toolsAllow: ["read"],
+      toolBindings: { voice_call: { kind: "active-call", callId: "call-1" } },
       provider: "openai",
       model: "gpt-5.4",
       thinkLevel: "high",
@@ -172,34 +299,45 @@ describe("realtime voice agent consult runtime", () => {
       timeoutMs: 10_000,
     });
 
-    expect(result).toEqual({ text: "Speak this." });
-    const voiceSession = sessionStore["voice:15550001234"];
-    if (!voiceSession) {
-      throw new Error("Expected voice consult session entry");
-    }
-    expect(Object.keys(voiceSession).toSorted()).toStrictEqual(["sessionId", "updatedAt"]);
+    expect(result).toEqual({ text: "Speak this.\n\nThen this." });
+    const voiceSession = expectDefined(sessionStore["voice:15550001234"], "voice session");
+    expect(voiceSession).toStrictEqual({
+      createdAt: expect.any(Number),
+      createdVia: "talk",
+      sessionId: expect.any(String),
+      updatedAt: expect.any(Number),
+    });
+    expect(voiceSession.createdAt).toBeGreaterThan(0);
     expectNonEmptyString(voiceSession.sessionId);
-    expectPositiveTimestamp(voiceSession.updatedAt);
+    expect(voiceSession.updatedAt).toBeGreaterThan(0);
     const call = requireEmbeddedAgentCall(runEmbeddedAgent);
-    expect(call.sessionId).toBe(voiceSession.sessionId);
-    expect(call.sessionKey).toBe("voice:15550001234");
-    expect(call.sandboxSessionKey).toBe("agent:main:voice:15550001234");
-    expect(call.agentId).toBe("main");
-    expect(call.messageProvider).toBe("voice");
-    expect(call.lane).toBe("voice");
+    expect(call).toMatchObject({
+      sessionId: voiceSession.sessionId,
+      sessionKey: "voice:15550001234",
+      sandboxSessionKey: "agent:operator:voice:15550001234",
+      agentId: "operator",
+      senderId: "+15550001234",
+      senderIsOwner: true,
+      messageProvider: "voice",
+      lane: "voice",
+      provider: "openai",
+      model: "gpt-5.4",
+      thinkLevel: "high",
+      fastMode: true,
+      timeoutMs: 10_000,
+    });
     expect(call.toolsAllow).toStrictEqual(["read"]);
-    expect(call.provider).toBe("openai");
-    expect(call.model).toBe("gpt-5.4");
-    expect(call.thinkLevel).toBe("high");
-    expect(call.fastMode).toBe(true);
-    expect(call.timeoutMs).toBe(10_000);
+    expect(call.toolBindings).toStrictEqual({
+      voice_call: { kind: "active-call", callId: "call-1" },
+    });
     expect(call.prompt).toBe(
       [
         "Live voice request from the caller during a live phone call.",
         "Act as the configured OpenClaw agent on behalf of this user. Use available tools when the request asks you to do work.",
         "When finished, return only the concise result the realtime voice agent should speak back.",
+        "Report a security or approval block only when an actual tool result says so. Distinguish tool errors from permission denials; do not invent a blocked attempt. If a read-only call fails, correct the tool or arguments and continue when possible.",
         "Do not include markdown, tool logs, or private reasoning. Include citations only when the spoken answer needs them.",
-        "Recent voice transcript for context:\nCaller: Can you check this?",
+        "Recent voice transcript for context:\nCaller: Can you check this?\nAgent: I'll verify.",
         "Additional realtime context:\nCaller asked about PR #123.",
         "User request:\nWhat should I say?",
       ].join("\n\n"),
@@ -209,46 +347,123 @@ describe("realtime voice agent consult runtime", () => {
     );
   });
 
-  it("scopes sandbox resolution to the configured consult agent", async () => {
-    const { runtime, runEmbeddedAgent } = createAgentRuntime();
-
-    await consultRealtimeVoiceAgent({
-      cfg: {} as never,
-      agentRuntime: runtime as never,
-      logger: { warn: vi.fn() },
-      agentId: "voice",
-      sessionKey: "voice:15550001234",
-      messageProvider: "voice",
-      lane: "voice",
-      runIdPrefix: "voice-realtime-consult:call-1",
-      args: { question: "What should I say?" },
-      transcript: [],
-      surface: "a live phone call",
-      userLabel: "Caller",
+  it("carries current voice session permissions without enabling owner trace", async () => {
+    const { runtime, runEmbeddedAgent, sessionStore } = createAgentRuntime();
+    sessionStore["agent:main:voice"] = {
+      sessionId: "voice-session",
+      updatedAt: 1,
+      permissionMode: "workspace",
+      toolOverrides: { webSearch: false },
+    };
+    await runConsult(runtime, {
+      sessionKey: "agent:main:voice",
+      senderIsOwner: true,
     });
+    expect(requireEmbeddedAgentCall(runEmbeddedAgent)).toMatchObject({
+      permissionMode: "workspace",
+      toolOverrides: { webSearch: false },
+      traceAuthorized: false,
+    });
+  });
 
-    const call = requireEmbeddedAgentCall(runEmbeddedAgent);
-    expect(call.sessionKey).toBe("voice:15550001234");
-    expect(call.sandboxSessionKey).toBe("agent:voice:voice:15550001234");
-    expect(call.agentId).toBe("voice");
+  it.each(["consult", "requester"])(
+    "fails closed before forking or dispatching from a locked %s session",
+    async (lockedSession) => {
+      const { runtime, sessionStore } = createAgentRuntime();
+      const requester = lockedSession === "requester";
+      sessionStore[requester ? requesterSessionKey : "voice:locked"] = {
+        ...lockedEntry,
+        sessionId: requester ? "locked-requester" : "locked-session",
+      };
+      const consult = requester
+        ? forkConsult(runtime, {
+            sessionKey: "agent:main:subagent:google-meet:meet-locked",
+          })
+        : runConsult(runtime, { sessionKey: "voice:locked", provider: "openai", model: "gpt-5.4" });
+      await expect(consult).rejects.toThrow(MODEL_SELECTION_LOCKED_MESSAGE);
+      expect(forkSessionEntryFromParent).not.toHaveBeenCalled();
+      expectNoDispatch(runtime);
+    },
+  );
+
+  it("allows an independent consult when only the requester session is locked", async () => {
+    const { runtime, runEmbeddedAgent, sessionStore } = createAgentRuntime();
+    sessionStore[requesterSessionKey] = { ...lockedEntry, sessionId: "locked-requester" };
+
+    await expect(
+      forkConsult(runtime, {
+        agentId: "meet-consult",
+        sessionKey: "agent:meet-consult:subagent:google-meet:meet-independent",
+      }),
+    ).resolves.toEqual({ text: "Speak this." });
+    expect(forkSessionEntryFromParent).not.toHaveBeenCalled();
+    expect(requireEmbeddedAgentCall(runEmbeddedAgent).agentId).toBe("meet-consult");
+  });
+
+  it("fresh-checks archive state after a queued lifecycle mutation", async () => {
+    const { runtime, runEmbeddedAgent, sessionStore } = createAgentRuntime();
+    const sessionKey = "voice:archive-race";
+    sessionStore[sessionKey] = { sessionId: "active-session", updatedAt: 1 };
+    const mutationStarted = createDeferred();
+    const releaseMutation = createDeferred();
+    const mutation = runSessionMutation({
+      scope: state.statePath("sessions.json"),
+      identities: [sessionKey, "active-session"],
+      run: async () => {
+        mutationStarted.resolve();
+        await releaseMutation.promise;
+        const entry = sessionStore[sessionKey];
+        if (entry) {
+          entry.archivedAt = 2;
+        }
+      },
+    });
+    await mutationStarted.promise;
+
+    const consult = runConsult(runtime, { sessionKey });
+    await Promise.resolve();
+    expect(runEmbeddedAgent).not.toHaveBeenCalled();
+
+    releaseMutation.resolve();
+    await mutation;
+    await expect(consult).rejects.toThrow(
+      'Session "voice:archive-race" is archived. Restore it before starting new work.',
+    );
+    expectNoDispatch(runtime);
+  });
+
+  it.each([
+    { label: "cancellation", meta: { aborted: true }, errorName: "AbortError" },
+    {
+      label: "timeout",
+      meta: {
+        aborted: true,
+        stopReason: "timeout",
+        timeoutPhase: "provider",
+        providerStarted: true,
+      },
+      errorName: "TimeoutError",
+    },
+  ])("preserves $label instead of speaking a partial result", async ({ meta, errorName }) => {
+    const { runtime, runEmbeddedAgent } = createAgentRuntime();
+    const cleanup = vi.fn();
+    runEmbeddedAgent.mockResolvedValueOnce({ payloads: [{ text: "Partial answer." }], meta });
+
+    await expect(runConsult(runtime, { onRunStarted: () => ({ cleanup }) })).rejects.toMatchObject({
+      name: errorName,
+    });
+    expect(cleanup).toHaveBeenCalledOnce();
   });
 
   it("returns a speakable fallback when the embedded agent has no visible text", async () => {
     const warn = vi.fn();
-    const { runtime } = createAgentRuntime([{ text: "hidden", isReasoning: true }]);
+    const { runtime } = createAgentRuntime([
+      setReplyPayloadMetadata({ text: "Earlier answer." }, { precedingInputAnswer: true }),
+      { text: "hidden", isReasoning: true },
+    ]);
 
-    const result = await consultRealtimeVoiceAgent({
-      cfg: {} as never,
-      agentRuntime: runtime as never,
+    const result = await runConsult(runtime, {
       logger: { warn },
-      sessionKey: "google-meet:meet-1",
-      messageProvider: "google-meet",
-      lane: "google-meet",
-      runIdPrefix: "google-meet:meet-1",
-      args: { question: "What now?" },
-      transcript: [],
-      surface: "a private Google Meet",
-      userLabel: "Participant",
       fallbackText: "Let me verify that first.",
     });
 
@@ -258,269 +473,141 @@ describe("realtime voice agent consult runtime", () => {
     );
   });
 
-  it("forks requester context when fork mode has a parent session", async () => {
+  it("returns a yielded acknowledgement immediately without waiting for a visible final", async () => {
+    const warn = vi.fn();
+    const { runtime, runEmbeddedAgent } = createAgentRuntime();
+    runEmbeddedAgent.mockResolvedValueOnce({
+      payloads: [],
+      meta: { yielded: true, yieldAcknowledgment: "  Working on it.   I will report back.  " },
+    });
+
+    const result = await runConsult(runtime, { logger: { warn } });
+
+    expect(result).toEqual({ text: "Working on it. I will report back.", yielded: true });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("forks requester context and inherits its required creator isolation", async () => {
     const { runtime, runEmbeddedAgent, sessionStore } = createAgentRuntime();
-    sessionStore["agent:main:main"] = {
+    const parentEntry: SessionEntry = {
       sessionId: "parent-session",
-      sessionFile: "/tmp/parent.jsonl",
-      totalTokens: 100,
+      createdActor: { type: "human", source: "profile", id: "profile-required" },
+      sandbox: "required",
       updatedAt: 1,
     };
-    const resolveParentForkDecision = vi.fn(async () => ({
-      status: "fork" as const,
-      maxTokens: 100_000,
-      parentTokens: 100,
-    }));
-    const forkSessionEntryFromParent = vi.fn(
-      async (
-        params: ForkSessionEntryFromParentParams,
-      ): Promise<ForkSessionEntryFromParentResult> => {
-        const fork = {
-          sessionId: "forked-session",
-          sessionFile: "/tmp/forked.jsonl",
-        };
-        const parentEntry = sessionStore["agent:main:main"];
-        if (!parentEntry?.sessionId) {
-          return { status: "missing-parent" };
-        }
-        const typedParentEntry: SessionEntry = {
-          ...parentEntry,
-          sessionId: parentEntry.sessionId,
-          updatedAt: parentEntry.updatedAt ?? Date.now(),
-        };
-        const decision = {
-          status: "fork" as const,
-          maxTokens: 100_000,
-        };
-        const entry = params.fallbackEntry ?? { sessionId: "", updatedAt: Date.now() };
-        const sessionEntry: SessionEntry = {
-          ...entry,
-          ...params.patch?.({ entry, parentEntry: typedParentEntry, fork, decision }),
-          sessionId: fork.sessionId,
-          sessionFile: fork.sessionFile,
-          forkedFromParent: true,
-        };
-        sessionStore[params.sessionKey] = sessionEntry;
-        return {
-          status: "forked" as const,
-          fork,
-          parentEntry: typedParentEntry,
-          sessionEntry,
-          decision,
-        };
-      },
-    );
-    setRealtimeVoiceAgentConsultDepsForTest({
-      forkSessionEntryFromParent,
+    sessionStore[requesterSessionKey] = parentEntry;
+    forkSessionEntryFromParent.mockImplementation(async (params) => {
+      const fork = { sessionId: "forked-session", sessionFile: state.statePath("forked.jsonl") };
+      const sessionEntry: SessionEntry = {
+        ...(params.fallbackEntry ?? { sessionId: "", updatedAt: Date.now() }),
+        ...params.entryPatch?.forked,
+        sessionId: fork.sessionId,
+        forkedFromParent: true,
+      };
+      sessionStore[params.sessionKey] = sessionEntry;
+      return {
+        status: "forked" as const,
+        fork,
+        parentEntry,
+        sessionEntry,
+        decision: { status: "fork", maxTokens: 100_000 },
+      };
     });
 
-    await consultRealtimeVoiceAgent({
-      cfg: {} as never,
-      agentRuntime: runtime as never,
-      logger: { warn: vi.fn() },
+    await forkConsult(runtime);
+
+    expect(forkSessionEntryFromParent.mock.calls[0]?.[0]).toMatchObject({
+      parentSessionKey: "agent:main:main",
       agentId: "main",
+      config: {},
       sessionKey: "agent:main:subagent:google-meet:meet-1",
-      spawnedBy: "agent:main:main",
-      contextMode: "fork",
-      messageProvider: "google-meet",
-      lane: "google-meet",
-      runIdPrefix: "google-meet:meet-1",
-      args: { question: "What should I say?" },
-      transcript: [],
-      surface: "a private Google Meet",
-      userLabel: "Participant",
     });
-
-    expect(resolveParentForkDecision).not.toHaveBeenCalled();
-    expect(forkSessionEntryFromParent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        parentSessionKey: "agent:main:main",
-        agentId: "main",
-        config: {},
-        sessionKey: "agent:main:subagent:google-meet:meet-1",
-      }),
+    expect(runtime.session.prepareSessionEntryPatch).not.toHaveBeenCalled();
+    const forkedEntry = expectDefined(
+      sessionStore["agent:main:subagent:google-meet:meet-1"],
+      "forked voice session",
     );
-    expect(runtime.session.patchSessionEntry).not.toHaveBeenCalled();
-    const forkedEntry = sessionStore["agent:main:subagent:google-meet:meet-1"];
-    if (!forkedEntry) {
-      throw new Error("Expected forked consult session entry");
-    }
+    expect(forkedEntry).toBeDefined();
     expect(forkedEntry).toStrictEqual({
       sessionId: "forked-session",
-      sessionFile: "/tmp/forked.jsonl",
       spawnedBy: "agent:main:main",
+      // The consult child's lineage receipt; the fixture parent has no lifecycle revision.
+      spawnedBySessionId: "parent-session",
+      parentSessionLifecycleRevision: undefined,
+      spawnedBySenderIsOwner: false,
       forkedFromParent: true,
+      createdVia: "talk",
+      createdActor: { type: "human", source: "profile", id: "profile-required" },
+      sandbox: "required",
+      createdAt: forkedEntry.createdAt,
       updatedAt: forkedEntry.updatedAt,
     });
-    expectPositiveTimestamp(forkedEntry.updatedAt);
+    expect(forkedEntry.updatedAt).toEqual(expect.any(Number));
+    expect(forkedEntry.updatedAt).toBeGreaterThan(0);
     const call = requireEmbeddedAgentCall(runEmbeddedAgent);
     expect(call.sessionId).toBe("forked-session");
-    expect(call.sessionFile).toBeUndefined();
-    expect(call.sessionTarget).toMatchObject({
-      agentId: "main",
-      sessionId: "forked-session",
-      sessionKey: "agent:main:subagent:google-meet:meet-1",
-      storePath: "/tmp/sessions.json",
-    });
-    expect(call.spawnedBy).toBe("agent:main:main");
+    expectForkTarget(call, "forked-session");
   });
 
   it("falls back to a fresh isolated consult session when requester context is too large", async () => {
     const { runtime, runEmbeddedAgent } = createAgentRuntime();
     const warn = vi.fn();
-    const forkSessionEntryFromParent = vi.fn(
-      async (
-        params: ForkSessionEntryFromParentParams,
-      ): Promise<ForkSessionEntryFromParentResult> => ({
-        status: "skipped",
-        reason: "decision-skip",
-        sessionEntry: {
-          ...(params.fallbackEntry ?? { sessionId: "", updatedAt: Date.now() }),
-          sessionId: "",
-          updatedAt: Date.now(),
-        },
-        decision: {
-          status: "skip",
-          reason: "parent-too-large",
-          maxTokens: 100_000,
-          parentTokens: 150_000,
-          message:
-            "Parent context is too large to fork (150000/100000 tokens); starting with isolated context instead.",
-        },
-      }),
-    );
-    setRealtimeVoiceAgentConsultDepsForTest({
-      forkSessionEntryFromParent,
-      randomUUID: () => "00000000-0000-4000-8000-000000000000",
-    });
+    forkSessionEntryFromParent.mockImplementation(async (params) => ({
+      status: "skipped",
+      reason: "decision-skip",
+      sessionEntry: {
+        ...(params.fallbackEntry ?? { sessionId: "", updatedAt: Date.now() }),
+        sessionId: "",
+        updatedAt: Date.now(),
+      },
+      decision: {
+        status: "skip",
+        reason: "parent-too-large",
+        maxTokens: 100_000,
+        parentTokens: 150_000,
+        message:
+          "Parent context is too large to fork (150000/100000 tokens); starting with isolated context instead.",
+      },
+    }));
 
-    await consultRealtimeVoiceAgent({
-      cfg: {} as never,
-      agentRuntime: runtime as never,
-      logger: { warn },
-      agentId: "main",
-      sessionKey: "agent:main:subagent:google-meet:meet-1",
-      spawnedBy: "agent:main:main",
-      contextMode: "fork",
-      messageProvider: "google-meet",
-      lane: "google-meet",
-      runIdPrefix: "google-meet:meet-1",
-      args: { question: "What should I say?" },
-      transcript: [],
-      surface: "a private Google Meet",
-      userLabel: "Participant",
-    });
+    await forkConsult(runtime, { logger: { warn } });
 
     expect(warn).toHaveBeenCalledWith(
       "[talk] Parent context is too large to fork (150000/100000 tokens); starting with isolated context instead.",
     );
-    expect(runtime.session.patchSessionEntry).toHaveBeenCalled();
+    expect(runtime.session.prepareSessionEntryPatch).toHaveBeenCalled();
     const call = requireEmbeddedAgentCall(runEmbeddedAgent);
-    expect(call.sessionId).toBe("00000000-0000-4000-8000-000000000000");
-    expect(call.sessionFile).toBeUndefined();
-    expect(call.sessionTarget).toMatchObject({
-      agentId: "main",
-      sessionId: "00000000-0000-4000-8000-000000000000",
-      sessionKey: "agent:main:subagent:google-meet:meet-1",
-      storePath: "/tmp/sessions.json",
-    });
-    expect(call.spawnedBy).toBe("agent:main:main");
-  });
-
-  it("inherits requester message routing for forked consult sessions", async () => {
-    const { runtime, runEmbeddedAgent, sessionStore } = createAgentRuntime();
-    sessionStore["agent:main:discord:channel:123"] = {
-      sessionId: "parent-session",
-      deliveryContext: {
-        channel: "discord",
-        to: "channel:123",
-        accountId: "default",
-      },
-      updatedAt: 1,
-    };
-
-    await consultRealtimeVoiceAgent({
-      cfg: {} as never,
-      agentRuntime: runtime as never,
-      logger: { warn: vi.fn() },
-      agentId: "main",
-      sessionKey: "voice:google-meet:meet-1",
-      spawnedBy: "agent:main:discord:channel:123",
-      contextMode: "fork",
-      messageProvider: "voice",
-      lane: "voice",
-      runIdPrefix: "voice-realtime-consult:call-1",
-      args: { question: "Send a status message." },
-      transcript: [],
-      surface: "a live phone call",
-      userLabel: "Caller",
-    });
-
-    const call = requireEmbeddedAgentCall(runEmbeddedAgent);
-    expect(call.sessionKey).toBe("voice:google-meet:meet-1");
-    expect(call.spawnedBy).toBe("agent:main:discord:channel:123");
-    expect(call.messageProvider).toBe("discord");
-    expect(call.agentAccountId).toBe("default");
-    expect(call.messageTo).toBe("channel:123");
-    expect(call.currentChannelId).toBe("channel:123");
-    const voiceEntry = sessionStore["voice:google-meet:meet-1"];
-    if (!voiceEntry) {
-      throw new Error("Expected voice consult session entry");
-    }
-    expect(voiceEntry).toStrictEqual({
-      sessionId: voiceEntry.sessionId,
-      spawnedBy: "agent:main:discord:channel:123",
-      deliveryContext: {
-        channel: "discord",
-        to: "channel:123",
-        accountId: "default",
-      },
-      lastChannel: "discord",
-      lastTo: "channel:123",
-      lastAccountId: "default",
-      lastThreadId: undefined,
-      updatedAt: voiceEntry.updatedAt,
-    });
-    expectNonEmptyString(voiceEntry.sessionId);
-    expectPositiveTimestamp(voiceEntry.updatedAt);
+    expectNonEmptyString(call.sessionId);
+    expectForkTarget(call);
   });
 
   it("reuses the call session delivery context when requester metadata is absent", async () => {
     const { runtime, runEmbeddedAgent, sessionStore } = createAgentRuntime();
     sessionStore["voice:google-meet:meet-1"] = {
       sessionId: "call-session",
-      deliveryContext: {
-        channel: "discord",
-        to: "channel:123",
-        accountId: "default",
-        threadId: "thread-456",
-      },
+      delivery: normalizeSessionDeliveryState({
+        context: {
+          channel: "discord",
+          to: "channel:123",
+          accountId: "default",
+          threadId: "thread-456",
+        },
+      }),
       updatedAt: 1,
     };
 
-    await consultRealtimeVoiceAgent({
-      cfg: {} as never,
-      agentRuntime: runtime as never,
-      logger: { warn: vi.fn() },
-      agentId: "main",
-      sessionKey: "voice:google-meet:meet-1",
-      messageProvider: "voice",
-      lane: "voice",
-      runIdPrefix: "voice-realtime-consult:call-1",
-      args: { question: "Send this to the original chat." },
-      transcript: [],
-      surface: "a live phone call",
-      userLabel: "Caller",
-    });
+    await runConsult(runtime, { sessionKey: "voice:google-meet:meet-1" });
 
     const call = requireEmbeddedAgentCall(runEmbeddedAgent);
-    expect(call.sessionId).toBe("call-session");
-    expect(call.sessionKey).toBe("voice:google-meet:meet-1");
-    expect(call.messageProvider).toBe("discord");
-    expect(call.agentAccountId).toBe("default");
-    expect(call.messageTo).toBe("channel:123");
-    expect(call.messageThreadId).toBe("thread-456");
-    expect(call.currentChannelId).toBe("channel:123");
-    expect(call.currentThreadTs).toBe("thread-456");
+    expect(call).toMatchObject({
+      sessionId: "call-session",
+      sessionKey: "voice:google-meet:meet-1",
+      messageProvider: "discord",
+      agentAccountId: "default",
+      messageTo: "channel:123",
+      messageThreadId: "thread-456",
+      currentChannelId: "channel:123",
+      currentThreadTs: "thread-456",
+    });
   });
 });

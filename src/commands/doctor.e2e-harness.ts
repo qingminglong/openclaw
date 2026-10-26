@@ -4,155 +4,103 @@ import os from "node:os";
 import path from "node:path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { afterEach, beforeEach, vi } from "vitest";
+import type { LegacyStateDetection } from "../infra/state-migrations.types.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import type { MockFn } from "../test-utils/vitest-mock-fn.js";
 import {
   readEmbeddedGatewayTokenForTest,
   testServiceAuditCodes,
 } from "./doctor-service-audit.test-helpers.js";
-import type { LegacyStateDetection } from "./doctor-state-migrations.js";
+import {
+  applyMockDoctorConfigSnapshot,
+  arrangeLegacyStateMigrationFixture,
+  createCommandWithTimeoutResult,
+  createDoctorConfigTransform,
+  createDoctorServiceMocks,
+  createDoctorRuntime as createDoctorRuntimeFixture,
+  createLegacyConfigSnapshot,
+  type DoctorConfigSnapshotFixtureParams,
+  setDoctorStdinTty,
+} from "./doctor.e2e-harness.test-helpers.js";
 
 let originalIsTTY: boolean | undefined;
 let originalStateDir: string | undefined;
 let originalUpdateInProgress: string | undefined;
 let tempStateDir: string | undefined;
 
-function setStdinTty(value: boolean | undefined) {
-  try {
-    Object.defineProperty(process.stdin, "isTTY", {
-      value,
-      configurable: true,
-    });
-  } catch {
-    // ignore
-  }
-}
-
-function createGatewayUpdateResult() {
-  return {
-    status: "skipped",
-    mode: "unknown",
-    steps: [],
-    durationMs: 0,
-  } as const;
-}
-
-function createCommandWithTimeoutResult() {
-  return {
-    stdout: "",
-    stderr: "",
-    code: 0,
-    signal: null,
-    killed: false,
-  } as const;
-}
-
-function createLegacyConfigSnapshot() {
-  return {
-    path: "/tmp/openclaw.json",
-    exists: false,
-    raw: null,
-    parsed: {},
-    valid: true,
-    config: {},
-    issues: [],
-    legacyIssues: [],
-  } as const;
-}
-
-const readConfigFileSnapshot = vi.fn() as unknown as MockFn;
-export const confirm = vi.fn().mockResolvedValue(true) as unknown as MockFn;
-const select = vi.fn().mockResolvedValue("node") as unknown as MockFn;
-const note = vi.fn() as unknown as MockFn;
-export const writeConfigFile = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
-const resolveOpenClawPackageRoot = vi.fn().mockResolvedValue(null) as unknown as MockFn;
-const runGatewayUpdate = vi
-  .fn()
-  .mockResolvedValue(createGatewayUpdateResult()) as unknown as MockFn;
-const collectRelevantDoctorPluginIds = vi.fn(() => []) as unknown as MockFn;
-const listPluginDoctorLegacyConfigRules = vi.fn(() => []) as unknown as MockFn;
-const runDoctorHealthContributions = vi.fn(
-  defaultRunDoctorHealthContributions,
-) as unknown as MockFn;
-const maybeRepairMemoryRecallHealth = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
-const noteMemorySearchHealth = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
-const noteMemoryRecallHealth = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
+export const readConfigFileSnapshot =
+  vi.fn<typeof import("../config/config.js").readConfigFileSnapshot>();
+export const confirm = vi.fn().mockResolvedValue(true);
+const select = vi.fn().mockResolvedValue("node");
+const note = vi.fn();
+export const transformConfigFile =
+  vi.fn<typeof import("../config/config.js").transformConfigFile>();
+export const resolveOpenClawPackageRoot = vi.fn().mockResolvedValue(null);
+export const updateCommand =
+  vi.fn<typeof import("../cli/update-cli/update-command.js").updateCommand>();
+const listPluginDoctorLegacyConfigRules = vi.fn(() => []);
+const runDoctorHealthContributions = vi.fn(defaultRunDoctorHealthContributions);
+const maybeRepairMemoryRecallHealth = vi.fn().mockResolvedValue(undefined);
+const noteMemorySearchHealth = vi.fn().mockResolvedValue(undefined);
+const noteMemoryRecallHealth = vi.fn().mockResolvedValue(undefined);
 const migrateLegacyConfig = vi.fn((raw: unknown) => ({
   config: raw as Record<string, unknown>,
   changes: ["Moved routing.allowFrom → channels.whatsapp.allowFrom."],
-})) as unknown as MockFn;
+}));
 
 const runExec = vi.fn().mockResolvedValue({
   stdout: "",
   stderr: "",
-}) as unknown as MockFn;
-const runCommandWithTimeout = vi
-  .fn()
-  .mockResolvedValue(createCommandWithTimeoutResult()) as unknown as MockFn;
+});
+export const runCommandWithTimeout = vi.fn().mockResolvedValue(createCommandWithTimeoutResult());
 
-export const ensureAuthProfileStore = vi
-  .fn()
-  .mockReturnValue({ version: 1, profiles: {} }) as unknown as MockFn;
+export const ensureAuthProfileStore = vi.fn().mockReturnValue({ version: 1, profiles: {} });
 
-const legacyReadConfigFileSnapshot = vi
-  .fn()
-  .mockResolvedValue(createLegacyConfigSnapshot()) as unknown as MockFn;
+const legacyReadConfigFileSnapshot = vi.fn().mockResolvedValue(createLegacyConfigSnapshot());
 const createConfigIO = vi.fn(() => ({
+  configPath: "/tmp/openclaw.json",
   readConfigFileSnapshot: legacyReadConfigFileSnapshot,
-})) as unknown as MockFn;
+}));
 
-const findLegacyGatewayServices = vi.fn().mockResolvedValue([]) as unknown as MockFn;
-const uninstallLegacyGatewayServices = vi.fn().mockResolvedValue([]) as unknown as MockFn;
-const findExtraGatewayServices = vi.fn().mockResolvedValue([]) as unknown as MockFn;
-const findSystemGatewayServices = vi.fn().mockResolvedValue([]) as unknown as MockFn;
-const renderGatewayServiceCleanupHints = vi.fn().mockReturnValue(["cleanup"]) as unknown as MockFn;
-const auditGatewayServiceConfig = vi
-  .fn()
-  .mockResolvedValue({ ok: true, issues: [] }) as unknown as MockFn;
-const buildGatewayInstallPlan = vi.mocked(
-  vi.fn().mockResolvedValue({
-    programArguments: ["node", "cli", "gateway", "--port", "18789"],
-    workingDirectory: "/tmp",
-    environment: {},
-  }),
-) as unknown as MockFn;
-const resolveGatewayAuthTokenForService = vi
-  .fn()
-  .mockResolvedValue({ token: undefined }) as unknown as MockFn;
-const resolveGatewayProgramArguments = vi.fn().mockResolvedValue({
-  programArguments: ["node", "cli", "gateway", "--port", "18789"],
-}) as unknown as MockFn;
-const serviceInstall = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
-export const serviceIsLoaded = vi.fn().mockResolvedValue(false) as unknown as MockFn;
-const serviceStop = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
-export const serviceRestart = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
-const serviceUninstall = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
-const serviceReadCommand = vi.fn().mockResolvedValue(null) as unknown as MockFn;
-export const callGateway = vi
-  .fn()
-  .mockRejectedValue(new Error("gateway closed")) as unknown as MockFn;
+const {
+  auditGatewayServiceConfig,
+  buildGatewayInstallPlan,
+  callGateway,
+  findExtraGatewayServices,
+  findLegacyGatewayServices,
+  findSystemGatewayServices,
+  renderGatewayServiceCleanupHints,
+  resolveGatewayAuthTokenForService,
+  resolveGatewayProgramArguments,
+  serviceInstall,
+  serviceIsLoaded,
+  serviceReadCommand,
+  serviceRestart,
+  serviceStop,
+  serviceUninstall,
+  uninstallLegacyGatewayServices,
+} = createDoctorServiceMocks();
+export { callGateway };
 
-const autoMigrateLegacyStateDir = vi.fn().mockResolvedValue({
+export const autoMigrateLegacyStateDir = vi.fn().mockResolvedValue({
   migrated: false,
   skipped: false,
   changes: [],
   warnings: [],
-}) as unknown as MockFn;
+});
 const autoMigrateLegacyState = vi.fn().mockResolvedValue({
   migrated: false,
   skipped: false,
   changes: [],
   warnings: [],
-}) as unknown as MockFn;
-const autoMigrateLegacyTaskStateSidecars = vi.fn().mockResolvedValue({
+});
+const autoMigrateLegacyPluginDoctorState = vi.fn().mockResolvedValue({
   migrated: false,
   skipped: false,
   changes: [],
   warnings: [],
-}) as unknown as MockFn;
-const runChannelPluginStartupMaintenance = vi
-  .fn()
-  .mockResolvedValue(undefined) as unknown as MockFn;
+});
+const runChannelPluginStartupMaintenance = vi.fn().mockResolvedValue(undefined);
 
 function defaultRunDoctorHealthContributions(ctx: {
   cfg: Record<string, unknown>;
@@ -199,24 +147,55 @@ function createLegacyStateMigrationDetectionResult(params?: {
   return {
     targetAgentId: "main",
     targetMainKey: "main",
-    targetScope: undefined,
     stateDir: "/tmp/state",
     oauthDir: "/tmp/oauth",
+    pluginSessionStoreAgentIds: [],
+    pairingStores: { sourcePaths: [], hasLegacy: false },
+    deviceAuth: {
+      sourcePath: "/tmp/state/identity/device-auth.json",
+      sourcePresent: false,
+      hasLegacy: false,
+    },
+    deviceIdentity: {
+      sources: [
+        {
+          identityKey: "primary",
+          sourcePath: "/tmp/state/identity/device.json",
+          claimPath: "/tmp/state/identity/device.json.doctor-importing",
+          nativeClaimPath: "/tmp/state/identity/device.json.native-importing",
+          hasLegacy: false,
+          hasInvalidCanonical: false,
+        },
+      ],
+      hasLegacy: false,
+      hasInvalidCanonical: false,
+    },
+    mcpOauth: {
+      sourceDir: "/tmp/state/mcp-oauth",
+      sourcePaths: [],
+      hasLegacy: false,
+    },
+    execApprovals: {
+      sourcePath: "/tmp/state/exec-approvals.json",
+      hasLegacy: false,
+      preview: "",
+    },
     sessions: {
-      legacyDir: "/tmp/state/sessions",
-      legacyStorePath: "/tmp/state/sessions/sessions.json",
       targetDir: "/tmp/state/agents/main/sessions",
       targetStorePath: "/tmp/state/agents/main/sessions/sessions.json",
       hasLegacy: params?.hasLegacySessions ?? false,
       legacyKeys: [],
+      preserveAmbiguousKeys: false,
+      preserveForeignMainAliases: false,
+      targetStoreAliases: {
+        hasDistinctAliases: false,
+        hasFinalSymlink: false,
+        hasUnresolvedIdentity: false,
+      },
     },
     agentDir: {
-      legacyDir: "/tmp/state/agent",
+      sources: [{ legacyDir: "/tmp/state/agent", standalone: false, boundaryRoot: "/tmp/state" }],
       targetDir: "/tmp/state/agents/main/agent",
-      hasLegacy: false,
-    },
-    pluginStateSidecar: {
-      sourcePath: "/tmp/state/plugin-state/state.sqlite",
       hasLegacy: false,
     },
     pluginInstallIndex: {
@@ -232,69 +211,72 @@ function createLegacyStateMigrationDetectionResult(params?: {
       hasLegacy: false,
       preview: [],
     },
-    taskStateSidecars: {
-      taskRunsPath: "/tmp/state/tasks/runs.sqlite",
-      flowRunsPath: "/tmp/state/flows/registry.sqlite",
+    sharedAuthStore: {
+      sourcePath: "/tmp/state/agents/main/agent/openclaw-agent.sqlite",
       hasLegacy: false,
     },
-    deliveryQueues: {
-      outboundPath: "/tmp/state/delivery-queue",
-      sessionPath: "/tmp/state/session-delivery-queue",
-      hasLegacy: false,
-    },
-    voiceWake: {
-      triggersPath: "/tmp/state/settings/voicewake.json",
-      routingPath: "/tmp/state/settings/voicewake-routing.json",
-      hasLegacy: false,
-    },
-    updateCheck: {
-      sourcePath: "/tmp/state/update-check.json",
-      hasLegacy: false,
-    },
+    worktrees: { hasLegacy: false, legacyIds: [], pathRewrites: [] },
     configHealth: {
       sourcePath: "/tmp/state/logs/config-health.json",
       hasLegacy: false,
     },
-    pluginBindingApprovals: {
-      sourcePath: "/tmp/state/plugin-binding-approvals.json",
+    tuiLastSessions: {
+      sourcePath: "/tmp/state/tui/last-session.json",
       hasLegacy: false,
     },
-    currentConversationBindings: {
-      sourcePath: "/tmp/state/bindings/current-conversations.json",
+    auditLogs: {
+      sources: [],
       hasLegacy: false,
     },
-    execApprovals: {
-      sourcePath: "/tmp/state/exec-approvals.legacy.json",
-      targetPath: "/tmp/state/exec-approvals.json",
+    managedOutgoingImages: {
+      sourceDir: "/tmp/state/media/outgoing/records",
       hasLegacy: false,
     },
-    channelPlans: {
+    apns: {
+      sourcePath: "/tmp/state/push/apns-registrations.json",
       hasLegacy: false,
-      plans: [],
     },
+    workspace: {
+      sources: [],
+      hasLegacy: false,
+    },
+    webPush: {
+      subscriptionsPath: "/tmp/state/push/web-push-subscriptions.json",
+      vapidKeysPath: "/tmp/state/push/vapid-keys.json",
+      hasLegacy: false,
+    },
+    nodeHost: {
+      sourcePath: "/tmp/state/node.json",
+      hasLegacy: false,
+    },
+    rescuePending: {
+      sourcePaths: ["/tmp/state/crestodian/rescue-pending", "/tmp/state/openclaw/rescue-pending"],
+      hasLegacy: false,
+    },
+    channelPairing: {
+      sourceDir: "/tmp/oauth",
+      files: [],
+      knownChannelIds: [],
+      defaultAccountIds: {},
+      accountIds: {},
+      accountDiscoveryDeferred: false,
+      hasLegacy: false,
+    },
+    warnings: [],
+    notices: [],
     preview: params?.preview ?? [],
   };
 }
 
 const detectLegacyStateMigrations = vi
   .fn()
-  .mockResolvedValue(createLegacyStateMigrationDetectionResult()) as unknown as MockFn;
+  .mockResolvedValue(createLegacyStateMigrationDetectionResult());
 
 const runLegacyStateMigrations = vi.fn().mockResolvedValue({
   changes: [],
   warnings: [],
-}) as unknown as MockFn;
-
-const DEFAULT_CONFIG_SNAPSHOT = {
-  path: "/tmp/openclaw.json",
-  exists: true,
-  raw: "{}",
-  parsed: {},
-  valid: true,
-  config: {},
-  issues: [],
-  legacyIssues: [],
-} as const;
+  stepReceipts: [],
+});
 
 vi.mock("@clack/prompts", () => ({
   confirm,
@@ -309,9 +291,9 @@ vi.mock("../skills/discovery/status.js", () => ({
 }));
 
 vi.mock("../plugins/loader.js", () => ({
-  getRuntimePluginRegistryForLoadOptions: () => null,
   isPluginRegistryLoadInFlight: () => false,
   loadOpenClawPlugins: () => createEmptyPluginRegistry(),
+  loadPluginRegistryHandle: () => createEmptyPluginRegistry(),
   resolveCompatibleRuntimePluginRegistry: () => null,
   resolveRuntimePluginRegistry: () => null,
 }));
@@ -323,7 +305,7 @@ vi.mock("../config/config.js", async () => {
     CONFIG_PATH: "/tmp/openclaw.json",
     createConfigIO,
     readConfigFileSnapshot,
-    writeConfigFile,
+    transformConfigFile,
     migrateLegacyConfig,
   };
 });
@@ -334,7 +316,6 @@ vi.mock("../config/io.js", async () => {
     ...actual,
     createConfigIO,
     readConfigFileSnapshot,
-    writeConfigFile,
   };
 });
 
@@ -377,7 +358,8 @@ vi.mock("../gateway/call.js", async () => {
   };
 });
 
-vi.mock("../process/exec.js", () => ({
+vi.mock("../process/exec.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../process/exec.js")>()),
   runExec,
   runCommandWithTimeout,
 }));
@@ -406,31 +388,55 @@ vi.mock("openclaw/plugin-sdk/runtime-env", () => ({
   }),
 }));
 
-vi.mock("../infra/openclaw-root.js", () => ({
-  resolveOpenClawPackageRoot,
-  resolveOpenClawPackageRootSync: vi.fn(() => "/tmp/openclaw"),
-}));
+vi.mock("../infra/openclaw-root.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../infra/openclaw-root.js")>();
+  return {
+    ...actual,
+    resolveOpenClawPackageRoot,
+  };
+});
 
-vi.mock("../infra/update-runner.js", () => ({
-  runGatewayUpdate,
+vi.mock("../cli/update-cli/update-command.js", () => ({
+  updateCommand,
 }));
 
 vi.mock("../flows/doctor-health-contributions.js", () => ({
   runDoctorHealthContributions,
 }));
 
-vi.mock("./doctor-memory-search.js", () => ({
+vi.mock("../flows/doctor-core-checks.runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../flows/doctor-core-checks.runtime.js")>()),
+  collectProviderCatalogProjectionFindings: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../flows/doctor-tool-schema-runtime.js", () => ({
+  collectRuntimeToolSchemaFindings: vi.fn().mockResolvedValue([]),
+}));
+
+// mock-isolation: Doctor fixtures isolate host browser probes; the real browser owner has its production-path permission proof.
+vi.mock("./doctor-browser.js", () => ({
+  collectBrowserReadinessFindings: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("./doctor-memory-recall.js", () => ({
   maybeRepairMemoryRecallHealth,
-  noteMemorySearchHealth,
   noteMemoryRecallHealth,
 }));
 
-vi.mock("../plugins/doctor-contract-registry.js", () => ({
+vi.mock("./doctor-memory-search.js", () => ({
+  noteMemorySearchHealth,
+}));
+
+// mock-isolation: Isolate config repair discovery; recovery inventory remains real.
+vi.mock("../plugins/doctor-contract-registry.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/doctor-contract-registry.js")>()),
+  withDeferredPluginDoctorMigrations: (_pluginIds: readonly string[], run: () => unknown) => run(),
   applyPluginDoctorCompatibilityMigrations: (config: unknown) => ({
     config,
     changes: [],
   }),
-  collectRelevantDoctorPluginIds,
+  collectDoctorConfigRepairPluginIds: () => [],
+  resolvePluginDoctorProviderRenames: () => [],
   listPluginDoctorLegacyConfigRules,
 }));
 
@@ -452,13 +458,14 @@ vi.mock("../agents/auth-profiles.js", async () => {
   };
 });
 
-vi.mock("../agents/auth-profiles/store.js", async () => {
-  const actual = await vi.importActual<typeof import("../agents/auth-profiles/store.js")>(
-    "../agents/auth-profiles/store.js",
+vi.mock("../agents/auth-profiles/store-runtime.js", async () => {
+  const actual = await vi.importActual<typeof import("../agents/auth-profiles/store-runtime.js")>(
+    "../agents/auth-profiles/store-runtime.js",
   );
   return {
     ...actual,
     ensureAuthProfileStore,
+    ensureAuthProfileStoreWithoutExternalProfiles: ensureAuthProfileStore,
   };
 });
 
@@ -482,15 +489,19 @@ vi.mock("../pairing/pairing-store.js", () => ({
   upsertChannelPairingRequest: vi.fn().mockResolvedValue({ code: "000000", created: false }),
 }));
 
-vi.mock("../runtime.js", () => ({
-  defaultRuntime: {
-    log: () => {},
-    error: () => {},
-    exit: () => {
-      throw new Error("exit");
+vi.mock("../runtime.js", async () => {
+  const actual = await vi.importActual<typeof import("../runtime.js")>("../runtime.js");
+  return {
+    ...actual,
+    defaultRuntime: {
+      log: () => {},
+      error: () => {},
+      exit: () => {
+        throw new Error("exit");
+      },
     },
-  },
-}));
+  };
+});
 
 vi.mock("../utils.js", async () => {
   const actual = await vi.importActual<typeof import("../utils.js")>("../utils.js");
@@ -503,6 +514,7 @@ vi.mock("../utils.js", async () => {
 
 vi.mock("./health.js", () => ({
   healthCommand: vi.fn().mockResolvedValue(undefined),
+  healthCommandNonExiting: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("./onboard-helpers.js", () => ({
@@ -513,12 +525,30 @@ vi.mock("./onboard-helpers.js", () => ({
   randomToken: vi.fn(() => "test-gateway-token"),
 }));
 
-vi.mock("./doctor-state-migrations.js", () => ({
+vi.mock("../infra/state-migrations.doctor.js", () => ({
   autoMigrateLegacyState,
-  autoMigrateLegacyStateDir,
-  autoMigrateLegacyTaskStateSidecars,
   detectLegacyStateMigrations,
+  prepareLegacyStateDatabaseSchema: vi.fn(async () => ({
+    outcome: "skipped",
+    changes: [],
+    warnings: [],
+  })),
   runLegacyStateMigrations,
+}));
+
+vi.mock("../infra/state-migrations.plugin-doctor.js", () => ({
+  autoMigrateLegacyPluginDoctorState,
+}));
+
+vi.mock("../infra/state-migrations.state-dir.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../infra/state-migrations.state-dir.js")>()),
+  autoMigrateLegacyStateDir,
+  resolvePendingLegacyStateDirMigrationPaths: vi.fn().mockReturnValue(null),
+  prepareLegacyStateDirMigration: vi.fn(),
+}));
+
+vi.mock("../infra/state-migrations.config-machine-state.js", () => ({
+  migrateLegacyConfigMachineState: vi.fn(() => ({ changes: [], warnings: [] })),
 }));
 
 vi.mock("../channels/plugins/lifecycle-startup.js", () => ({
@@ -526,33 +556,11 @@ vi.mock("../channels/plugins/lifecycle-startup.js", () => ({
 }));
 
 /** Configures the mocked doctor config snapshot with a partial snapshot override. */
-export function mockDoctorConfigSnapshot(
-  params: {
-    config?: Record<string, unknown>;
-    parsed?: Record<string, unknown>;
-    valid?: boolean;
-    issues?: Array<{ path: string; message: string }>;
-    legacyIssues?: Array<{ path: string; message: string }>;
-  } = {},
-) {
-  readConfigFileSnapshot.mockResolvedValue({
-    ...DEFAULT_CONFIG_SNAPSHOT,
-    config: params.config ?? DEFAULT_CONFIG_SNAPSHOT.config,
-    parsed: params.parsed ?? DEFAULT_CONFIG_SNAPSHOT.parsed,
-    valid: params.valid ?? DEFAULT_CONFIG_SNAPSHOT.valid,
-    issues: params.issues ?? DEFAULT_CONFIG_SNAPSHOT.issues,
-    legacyIssues: params.legacyIssues ?? DEFAULT_CONFIG_SNAPSHOT.legacyIssues,
-  });
+export function mockDoctorConfigSnapshot(params: DoctorConfigSnapshotFixtureParams = {}): void {
+  applyMockDoctorConfigSnapshot(readConfigFileSnapshot, params);
 }
 
-/** Creates a runtime mock that captures doctor command output and exits. */
-export function createDoctorRuntime() {
-  return {
-    log: vi.fn() as unknown as MockFn,
-    error: vi.fn() as unknown as MockFn,
-    exit: vi.fn() as unknown as MockFn,
-  };
-}
+export const createDoctorRuntime = createDoctorRuntimeFixture;
 
 /** Sets up temporary legacy state paths and mocked config for migration tests. */
 export async function arrangeLegacyStateMigrationTest(): Promise<{
@@ -561,32 +569,13 @@ export async function arrangeLegacyStateMigrationTest(): Promise<{
   detectLegacyStateMigrations: MockFn;
   runLegacyStateMigrations: MockFn;
 }> {
-  mockDoctorConfigSnapshot();
-
-  const { doctorCommand } = await import("./doctor.js");
-  const runtime = createDoctorRuntime();
-
-  detectLegacyStateMigrations.mockClear();
-  runLegacyStateMigrations.mockClear();
-  detectLegacyStateMigrations.mockResolvedValue(
-    createLegacyStateMigrationDetectionResult({
-      hasLegacySessions: true,
-      preview: ["- Legacy sessions detected"],
-    }),
-  );
-  runLegacyStateMigrations.mockResolvedValueOnce({
-    changes: ["migrated"],
-    warnings: [],
-  });
-
-  confirm.mockClear();
-
-  return {
-    doctorCommand,
-    runtime,
+  return arrangeLegacyStateMigrationFixture({
+    confirm,
+    createDetection: createLegacyStateMigrationDetectionResult,
     detectLegacyStateMigrations,
+    mockDoctorConfigSnapshot,
     runLegacyStateMigrations,
-  };
+  });
 }
 
 beforeEach(() => {
@@ -595,9 +584,11 @@ beforeEach(() => {
   note.mockClear();
 
   readConfigFileSnapshot.mockReset();
-  writeConfigFile.mockReset().mockResolvedValue(undefined);
+  transformConfigFile
+    .mockReset()
+    .mockImplementation(createDoctorConfigTransform(readConfigFileSnapshot));
   resolveOpenClawPackageRoot.mockReset().mockResolvedValue(null);
-  runGatewayUpdate.mockReset().mockResolvedValue(createGatewayUpdateResult());
+  updateCommand.mockReset().mockResolvedValue(undefined);
   listPluginDoctorLegacyConfigRules.mockReset().mockReturnValue([]);
   runDoctorHealthContributions.mockReset().mockImplementation(defaultRunDoctorHealthContributions);
   maybeRepairMemoryRecallHealth.mockReset().mockResolvedValue(undefined);
@@ -605,6 +596,7 @@ beforeEach(() => {
   noteMemoryRecallHealth.mockReset().mockResolvedValue(undefined);
   legacyReadConfigFileSnapshot.mockReset().mockResolvedValue(createLegacyConfigSnapshot());
   createConfigIO.mockReset().mockImplementation(() => ({
+    configPath: "/tmp/openclaw.json",
     readConfigFileSnapshot: legacyReadConfigFileSnapshot,
   }));
   runExec.mockReset().mockResolvedValue({ stdout: "", stderr: "" });
@@ -616,7 +608,7 @@ beforeEach(() => {
   }));
   findLegacyGatewayServices.mockReset().mockResolvedValue([]);
   uninstallLegacyGatewayServices.mockReset().mockResolvedValue([]);
-  findExtraGatewayServices.mockReset().mockResolvedValue([]);
+  findExtraGatewayServices.mockReset().mockResolvedValue({ services: [], errors: [] });
   renderGatewayServiceCleanupHints.mockReset().mockReturnValue(["cleanup"]);
   auditGatewayServiceConfig.mockReset().mockResolvedValue({ ok: true, issues: [] });
   buildGatewayInstallPlan.mockReset().mockResolvedValue({
@@ -642,11 +634,10 @@ beforeEach(() => {
     warnings: [],
   });
   autoMigrateLegacyState.mockReset().mockResolvedValue({ changes: [], warnings: [] });
-  autoMigrateLegacyTaskStateSidecars.mockReset().mockResolvedValue({ changes: [], warnings: [] });
   runChannelPluginStartupMaintenance.mockReset().mockResolvedValue(undefined);
 
   originalIsTTY = process.stdin.isTTY;
-  setStdinTty(true);
+  setDoctorStdinTty(true);
   originalStateDir = process.env.OPENCLAW_STATE_DIR;
   originalUpdateInProgress = process.env.OPENCLAW_UPDATE_IN_PROGRESS;
   process.env.OPENCLAW_UPDATE_IN_PROGRESS = "1";
@@ -659,7 +650,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  setStdinTty(originalIsTTY);
+  setDoctorStdinTty(originalIsTTY);
   if (originalStateDir === undefined) {
     delete process.env.OPENCLAW_STATE_DIR;
   } else {

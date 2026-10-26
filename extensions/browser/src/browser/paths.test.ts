@@ -1,23 +1,22 @@
-// Browser tests cover paths plugin behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import {
-  resolveExistingPathsWithinRoot,
-  resolveExistingUploadPaths,
-  resolvePathsWithinRoot,
-  resolvePathWithinRoot,
-  resolveStrictExistingPathsWithinRoot,
-  resolveStrictExistingUploadPaths,
-  resolveWritablePathWithinRoot,
-} from "./paths.js";
+import { resolveExistingPathsWithinRoot } from "openclaw/plugin-sdk/security-runtime";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-async function createFixtureRoot(): Promise<{
-  baseDir: string;
-  inboundMediaDir: string;
-  uploadsDir: string;
-}> {
+const pathFixture = vi.hoisted(() => ({ root: "" }));
+vi.mock("openclaw/plugin-sdk/temp-path", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/temp-path")>()),
+  resolvePreferredOpenClawTmpDir: () => pathFixture.root,
+}));
+vi.mock("openclaw/plugin-sdk/text-utility-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/text-utility-runtime")>()),
+  get CONFIG_DIR() {
+    return pathFixture.root;
+  },
+}));
+
+async function createFixtureRoot() {
   const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-browser-paths-"));
   const uploadsDir = path.join(baseDir, "uploads");
   const inboundMediaDir = path.join(baseDir, "media", "inbound");
@@ -26,187 +25,65 @@ async function createFixtureRoot(): Promise<{
   return { baseDir, inboundMediaDir, uploadsDir };
 }
 
-async function withFixtureRoot<T>(
-  run: (ctx: { baseDir: string; inboundMediaDir: string; uploadsDir: string }) => Promise<T>,
-): Promise<T> {
-  const fixture = await createFixtureRoot();
-  try {
-    return await run(fixture);
-  } finally {
-    await fs.rm(fixture.baseDir, { recursive: true, force: true });
-  }
-}
-
-async function createAliasedUploadsRoot(baseDir: string): Promise<{
-  canonicalUploadsDir: string;
-  aliasedUploadsDir: string;
-}> {
-  const canonicalUploadsDir = path.join(baseDir, "canonical", "uploads");
-  const aliasedUploadsDir = path.join(baseDir, "uploads-link");
-  await fs.mkdir(canonicalUploadsDir, { recursive: true });
-  await fs.symlink(canonicalUploadsDir, aliasedUploadsDir);
-  return { canonicalUploadsDir, aliasedUploadsDir };
-}
+let fixture: Awaited<ReturnType<typeof createFixtureRoot>>;
+beforeEach(async () => {
+  fixture = await createFixtureRoot();
+});
+afterEach(async () => {
+  await fs.rm(fixture.baseDir, { recursive: true, force: true });
+});
 
 describe("resolveExistingPathsWithinRoot", () => {
   function expectInvalidResult(
     result: Awaited<ReturnType<typeof resolveExistingPathsWithinRoot>>,
     expectedSnippet: string,
   ) {
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain(expectedSnippet);
-    }
+    expect(result).toEqual({ ok: false, error: expect.stringContaining(expectedSnippet) });
   }
 
-  function resolveWithinUploads(params: {
-    uploadsDir: string;
-    requestedPaths: string[];
-  }): Promise<Awaited<ReturnType<typeof resolveExistingPathsWithinRoot>>> {
+  function resolveWithinUploads(requestedPath: string, uploadsDir = fixture.uploadsDir) {
     return resolveExistingPathsWithinRoot({
-      rootDir: params.uploadsDir,
-      requestedPaths: params.requestedPaths,
+      rootDir: uploadsDir,
+      requestedPaths: [requestedPath],
       scopeLabel: "uploads directory",
     });
   }
 
-  it("accepts existing files under the upload root", async () => {
-    await withFixtureRoot(async ({ uploadsDir }) => {
-      const nestedDir = path.join(uploadsDir, "nested");
-      await fs.mkdir(nestedDir, { recursive: true });
-      const filePath = path.join(nestedDir, "ok.txt");
-      await fs.writeFile(filePath, "ok", "utf8");
-
-      const result = await resolveWithinUploads({
-        uploadsDir,
-        requestedPaths: [filePath],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(filePath)]);
-      }
-    });
-  });
-
   it("rejects traversal outside the upload root", async () => {
-    await withFixtureRoot(async ({ baseDir, uploadsDir }) => {
-      const outsidePath = path.join(baseDir, "outside.txt");
-      await fs.writeFile(outsidePath, "nope", "utf8");
-
-      const result = await resolveWithinUploads({
-        uploadsDir,
-        requestedPaths: ["../outside.txt"],
-      });
-
-      expectInvalidResult(result, "must stay within uploads directory");
-    });
-  });
-
-  it("rejects blank paths", async () => {
-    await withFixtureRoot(async ({ uploadsDir }) => {
-      const result = await resolveWithinUploads({
-        uploadsDir,
-        requestedPaths: ["  "],
-      });
-
-      expectInvalidResult(result, "path is required");
-    });
-  });
-
-  it("keeps lexical in-root paths when files do not exist yet", async () => {
-    await withFixtureRoot(async ({ uploadsDir }) => {
-      const result = await resolveWithinUploads({
-        uploadsDir,
-        requestedPaths: ["missing.txt"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([path.join(uploadsDir, "missing.txt")]);
-      }
-    });
+    await writeFixtureFile(path.join(fixture.baseDir, "outside.txt"), "nope");
+    expectInvalidResult(
+      await resolveWithinUploads("../outside.txt"),
+      "must stay within uploads directory",
+    );
   });
 
   it("rejects directory paths inside upload root", async () => {
-    await withFixtureRoot(async ({ uploadsDir }) => {
-      const nestedDir = path.join(uploadsDir, "nested");
-      await fs.mkdir(nestedDir, { recursive: true });
-
-      const result = await resolveWithinUploads({
-        uploadsDir,
-        requestedPaths: ["nested"],
-      });
-
-      expectInvalidResult(result, "regular non-symlink file");
-    });
+    await fs.mkdir(path.join(fixture.uploadsDir, "nested"), { recursive: true });
+    expectInvalidResult(await resolveWithinUploads("nested"), "regular non-symlink file");
   });
 
   it.runIf(process.platform !== "win32")(
     "rejects symlink escapes outside upload root",
     async () => {
-      await withFixtureRoot(async ({ baseDir, uploadsDir }) => {
-        const outsidePath = path.join(baseDir, "secret.txt");
-        await fs.writeFile(outsidePath, "secret", "utf8");
-        const symlinkPath = path.join(uploadsDir, "leak.txt");
-        await fs.symlink(outsidePath, symlinkPath);
+      const { baseDir, uploadsDir } = fixture;
+      const outsidePath = await writeFixtureFile(path.join(baseDir, "secret.txt"), "secret");
+      await fs.symlink(outsidePath, path.join(uploadsDir, "leak.txt"));
 
-        const result = await resolveWithinUploads({
-          uploadsDir,
-          requestedPaths: ["leak.txt"],
-        });
-
-        expectInvalidResult(result, "regular non-symlink file");
-      });
+      expectInvalidResult(await resolveWithinUploads("leak.txt"), "regular non-symlink file");
     },
   );
 
   it.runIf(process.platform !== "win32")(
     "returns outside-root message for files reached via escaping symlinked directories",
     async () => {
-      await withFixtureRoot(async ({ baseDir, uploadsDir }) => {
-        const outsideDir = path.join(baseDir, "outside");
-        await fs.mkdir(outsideDir, { recursive: true });
-        await fs.writeFile(path.join(outsideDir, "secret.txt"), "secret", "utf8");
-        await fs.symlink(outsideDir, path.join(uploadsDir, "alias"));
+      const { baseDir, uploadsDir } = fixture;
+      const outsideDir = path.join(baseDir, "outside");
+      await writeFixtureFile(path.join(outsideDir, "secret.txt"), "secret");
+      await fs.symlink(outsideDir, path.join(uploadsDir, "alias"));
 
-        const result = await resolveWithinUploads({
-          uploadsDir,
-          requestedPaths: ["alias/secret.txt"],
-        });
-
-        expect(result).toEqual({
-          ok: false,
-          error: "File is outside uploads directory",
-        });
-      });
-    },
-  );
-
-  it.runIf(process.platform !== "win32")(
-    "accepts canonical absolute paths when upload root is a symlink alias",
-    async () => {
-      await withFixtureRoot(async ({ baseDir }) => {
-        const { canonicalUploadsDir, aliasedUploadsDir } = await createAliasedUploadsRoot(baseDir);
-
-        const filePath = path.join(canonicalUploadsDir, "ok.txt");
-        await fs.writeFile(filePath, "ok", "utf8");
-        const canonicalPath = await fs.realpath(filePath);
-
-        const firstPass = await resolveWithinUploads({
-          uploadsDir: aliasedUploadsDir,
-          requestedPaths: [path.join(aliasedUploadsDir, "ok.txt")],
-        });
-        expect(firstPass.ok).toBe(true);
-
-        const secondPass = await resolveWithinUploads({
-          uploadsDir: aliasedUploadsDir,
-          requestedPaths: [canonicalPath],
-        });
-        expect(secondPass.ok).toBe(true);
-        if (secondPass.ok) {
-          expect(secondPass.paths).toEqual([canonicalPath]);
-        }
+      expect(await resolveWithinUploads("alias/secret.txt")).toEqual({
+        ok: false,
+        error: "File is outside uploads directory",
       });
     },
   );
@@ -214,464 +91,116 @@ describe("resolveExistingPathsWithinRoot", () => {
   it.runIf(process.platform !== "win32")(
     "rejects canonical absolute paths outside symlinked upload root",
     async () => {
-      await withFixtureRoot(async ({ baseDir }) => {
-        const { aliasedUploadsDir } = await createAliasedUploadsRoot(baseDir);
+      const { baseDir } = fixture;
+      const canonicalUploadsDir = path.join(baseDir, "canonical", "uploads");
+      const aliasedUploadsDir = path.join(baseDir, "uploads-link");
+      await fs.mkdir(canonicalUploadsDir, { recursive: true });
+      await fs.symlink(canonicalUploadsDir, aliasedUploadsDir);
 
-        const outsideDir = path.join(baseDir, "outside");
-        await fs.mkdir(outsideDir, { recursive: true });
-        const outsideFile = path.join(outsideDir, "secret.txt");
-        await fs.writeFile(outsideFile, "secret", "utf8");
-
-        const result = await resolveWithinUploads({
-          uploadsDir: aliasedUploadsDir,
-          requestedPaths: [await fs.realpath(outsideFile)],
-        });
-        expectInvalidResult(result, "must stay within uploads directory");
-      });
+      const outsideFile = await writeFixtureFile(
+        path.join(baseDir, "outside/secret.txt"),
+        "secret",
+      );
+      expectInvalidResult(
+        await resolveWithinUploads(outsideFile, aliasedUploadsDir),
+        "must stay within uploads directory",
+      );
     },
   );
 });
 
-describe("resolveExistingUploadPaths", () => {
-  it("falls back to inbound media when the uploads root rejects the file", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.writeFile(inboundFile, "pdf", "utf8");
+type FixtureRoot = Awaited<ReturnType<typeof createFixtureRoot>>;
+type UploadPathResolver = "resolveExistingUploadPaths" | "resolveStrictExistingUploadPaths";
+type UploadPathScenario =
+  | "inbound-relative"
+  | "mixed-relative"
+  | `${"nested" | "traversal"}-uri`
+  | "nested-absolute"
+  | "outside"
+  | "missing";
+type UploadPathCase = readonly [string, UploadPathScenario, string?];
+const directChild = "direct child of inbound media directory";
+const nonSymlink = "regular non-symlink file";
+const sandboxRelative = "sandbox-relative inbound media";
 
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: [inboundFile],
-      });
+async function writeFixtureFile(filePath: string, contents: string): Promise<string> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, contents, "utf8");
+  return fs.realpath(filePath);
+}
 
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(inboundFile)]);
-      }
-    });
-  });
-
-  it("resolves canonical inbound media URI references before root validation", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.writeFile(inboundFile, "pdf", "utf8");
-
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["media://inbound/report.pdf"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(inboundFile)]);
-      }
-    });
-  });
-
-  it("falls back to sandbox-relative inbound media paths after root validation", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.writeFile(inboundFile, "pdf", "utf8");
-
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["media/inbound/report.pdf"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(inboundFile)]);
-      }
-    });
-  });
-
-  it("keeps upload-root paths before sandbox-relative inbound media fallback", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const uploadFile = path.join(uploadsDir, "media", "inbound", "report.pdf");
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.mkdir(path.dirname(uploadFile), { recursive: true });
-      await fs.writeFile(uploadFile, "upload", "utf8");
-      await fs.writeFile(inboundFile, "inbound", "utf8");
-
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["media/inbound/report.pdf"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(uploadFile)]);
-      }
-    });
-  });
-
-  it("accepts mixed upload-root and inbound-media files in one request", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const uploadFile = path.join(uploadsDir, "from-upload.txt");
-      const inboundFile = path.join(inboundMediaDir, "from-inbound.txt");
-      await fs.writeFile(uploadFile, "upload", "utf8");
-      await fs.writeFile(inboundFile, "inbound", "utf8");
-
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: [uploadFile, "media://inbound/from-inbound.txt"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([
-          await fs.realpath(uploadFile),
-          await fs.realpath(inboundFile),
-        ]);
-      }
-    });
-  });
-
-  it("rejects nested inbound media URI references", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["media://inbound/nested%2Fsecret.pdf"],
-      });
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.error).toContain("Invalid media reference");
-      }
-    });
-  });
-
-  it("rejects traversal-shaped inbound media URI references before URL normalization", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.writeFile(inboundFile, "pdf", "utf8");
-
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["media://inbound/nested/../report.pdf"],
-      });
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.error).toContain("Invalid media reference");
-      }
-    });
-  });
-
-  it("rejects nested absolute inbound media paths", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const nestedDir = path.join(inboundMediaDir, "nested");
-      await fs.mkdir(nestedDir, { recursive: true });
-      const nestedFile = path.join(nestedDir, "secret.pdf");
-      await fs.writeFile(nestedFile, "secret", "utf8");
-
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: [nestedFile],
-      });
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.error).toContain("direct child of inbound media directory");
-      }
-    });
-  });
-
-  it("rejects files outside both managed upload roots", async () => {
-    await withFixtureRoot(async ({ baseDir, inboundMediaDir, uploadsDir }) => {
-      const outsideFile = path.join(baseDir, "secret.txt");
-      await fs.writeFile(outsideFile, "secret", "utf8");
-
-      const result = await resolveExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: [outsideFile],
-      });
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.error).toContain("inbound media directory");
-      }
-    });
-  });
-});
-
-describe("resolveStrictExistingPathsWithinRoot", () => {
-  function expectInvalidResult(
-    result: Awaited<ReturnType<typeof resolveStrictExistingPathsWithinRoot>>,
-    expectedSnippet: string,
-  ) {
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain(expectedSnippet);
-    }
+async function prepareUploadPathCase(
+  { baseDir, inboundMediaDir, uploadsDir }: FixtureRoot,
+  scenario: UploadPathScenario,
+): Promise<{ requestedPaths: string[]; expectedPaths?: string[] }> {
+  const inboundFile = path.join(inboundMediaDir, "report.pdf");
+  if (scenario === "mixed-relative") {
+    const uploadFile = path.join(uploadsDir, "from-upload.txt");
+    const mixedInboundFile = path.join(inboundMediaDir, "from-inbound.txt");
+    const expectedPaths = [
+      await writeFixtureFile(uploadFile, "upload"),
+      await writeFixtureFile(mixedInboundFile, "inbound"),
+    ];
+    return {
+      requestedPaths: [uploadFile, "media/inbound/from-inbound.txt"],
+      expectedPaths,
+    };
   }
+  const requestedPath = {
+    "inbound-relative": "media/inbound/report.pdf",
+    "nested-uri": "media://inbound/nested%2Fsecret.pdf",
+    "traversal-uri": "media://inbound/nested/../report.pdf",
+    "nested-absolute": path.join(inboundMediaDir, "nested", "secret.pdf"),
+    outside: path.join(baseDir, "secret.txt"),
+    missing: "missing.txt",
+  }[scenario];
+  if (scenario === "inbound-relative" || scenario === "traversal-uri") {
+    await writeFixtureFile(inboundFile, "pdf");
+  }
+  if (scenario === "nested-absolute" || scenario === "outside") {
+    await writeFixtureFile(requestedPath, "secret");
+  }
+  return {
+    requestedPaths: [requestedPath],
+    ...(scenario === "inbound-relative" ? { expectedPaths: [await fs.realpath(inboundFile)] } : {}),
+  };
+}
 
-  it("rejects missing files instead of returning lexical fallbacks", async () => {
-    await withFixtureRoot(async ({ uploadsDir }) => {
-      const result = await resolveStrictExistingPathsWithinRoot({
-        rootDir: uploadsDir,
-        requestedPaths: ["missing.txt"],
-        scopeLabel: "uploads directory",
-      });
-      expectInvalidResult(result, "regular non-symlink file");
+// Keep URI/root-precedence cases ordered across ingest and strict use-time validation.
+function registerUploadPathCases(resolver: UploadPathResolver, cases: UploadPathCase[]) {
+  for (const [title, scenario, expectedError] of cases) {
+    it(title, async () => {
+      pathFixture.root = fixture.baseDir;
+      vi.resetModules();
+      const resolve = (await import("./paths.js"))[resolver];
+      const prepared = await prepareUploadPathCase(fixture, scenario);
+      const result = await resolve({ requestedPaths: prepared.requestedPaths });
+      if (expectedError) {
+        expect(result).toEqual({ ok: false, error: expect.stringContaining(expectedError) });
+        return;
+      }
+      expect(result).toEqual({ ok: true, paths: prepared.expectedPaths });
     });
-  });
+  }
+}
+
+describe("resolveExistingUploadPaths", () => {
+  registerUploadPathCases("resolveExistingUploadPaths", [
+    [`falls back to ${sandboxRelative} paths after root validation`, "inbound-relative"],
+    ["rejects nested inbound media URI references", "nested-uri", "Invalid media reference"],
+    [
+      "rejects traversal-shaped inbound media URI references before URL normalization",
+      "traversal-uri",
+      "Invalid media reference",
+    ],
+    ["rejects nested absolute inbound media paths", "nested-absolute", directChild],
+    ["rejects files outside both managed upload roots", "outside", "inbound media directory"],
+  ]);
 });
 
 describe("resolveStrictExistingUploadPaths", () => {
-  it("falls back to inbound media for use-time upload validation", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.writeFile(inboundFile, "pdf", "utf8");
-
-      const result = await resolveStrictExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: [inboundFile],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(inboundFile)]);
-      }
-    });
-  });
-
-  it("resolves inbound media URI references for use-time upload validation", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.writeFile(inboundFile, "pdf", "utf8");
-
-      const result = await resolveStrictExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["media://inbound/report.pdf"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(inboundFile)]);
-      }
-    });
-  });
-
-  it("falls back to sandbox-relative inbound media paths for use-time upload validation", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.writeFile(inboundFile, "pdf", "utf8");
-
-      const result = await resolveStrictExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["media/inbound/report.pdf"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(inboundFile)]);
-      }
-    });
-  });
-
-  it("keeps upload-root paths before sandbox-relative inbound media fallback at use time", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const uploadFile = path.join(uploadsDir, "media", "inbound", "report.pdf");
-      const inboundFile = path.join(inboundMediaDir, "report.pdf");
-      await fs.mkdir(path.dirname(uploadFile), { recursive: true });
-      await fs.writeFile(uploadFile, "upload", "utf8");
-      await fs.writeFile(inboundFile, "inbound", "utf8");
-
-      const result = await resolveStrictExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["media/inbound/report.pdf"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([await fs.realpath(uploadFile)]);
-      }
-    });
-  });
-
-  it("accepts mixed upload-root and inbound-media files at use time", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const uploadFile = path.join(uploadsDir, "from-upload.txt");
-      const inboundFile = path.join(inboundMediaDir, "from-inbound.txt");
-      await fs.writeFile(uploadFile, "upload", "utf8");
-      await fs.writeFile(inboundFile, "inbound", "utf8");
-
-      const result = await resolveStrictExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: [uploadFile, "media/inbound/from-inbound.txt"],
-      });
-
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.paths).toEqual([
-          await fs.realpath(uploadFile),
-          await fs.realpath(inboundFile),
-        ]);
-      }
-    });
-  });
-
-  it("rejects files missing from both managed upload roots", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const result = await resolveStrictExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: ["missing.txt"],
-      });
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.error).toContain("regular non-symlink file");
-      }
-    });
-  });
-
-  it("rejects nested absolute inbound media paths at use time", async () => {
-    await withFixtureRoot(async ({ inboundMediaDir, uploadsDir }) => {
-      const nestedDir = path.join(inboundMediaDir, "nested");
-      await fs.mkdir(nestedDir, { recursive: true });
-      const nestedFile = path.join(nestedDir, "secret.pdf");
-      await fs.writeFile(nestedFile, "secret", "utf8");
-
-      const result = await resolveStrictExistingUploadPaths({
-        uploadDir: uploadsDir,
-        inboundMediaDir,
-        requestedPaths: [nestedFile],
-      });
-
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.error).toContain("direct child of inbound media directory");
-      }
-    });
-  });
-});
-
-describe("resolvePathWithinRoot", () => {
-  it("uses default file name when requested path is blank", () => {
-    const result = resolvePathWithinRoot({
-      rootDir: "/tmp/uploads",
-      requestedPath: " ",
-      scopeLabel: "uploads directory",
-      defaultFileName: "fallback.txt",
-    });
-    expect(result).toEqual({
-      ok: true,
-      path: path.resolve("/tmp/uploads", "fallback.txt"),
-    });
-  });
-
-  it("rejects root-level path aliases that do not point to a file", () => {
-    const result = resolvePathWithinRoot({
-      rootDir: "/tmp/uploads",
-      requestedPath: ".",
-      scopeLabel: "uploads directory",
-    });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain("must stay within uploads directory");
-    }
-  });
-});
-
-describe("resolveWritablePathWithinRoot", () => {
-  it("accepts a writable path under root when parent is a real directory", async () => {
-    await withFixtureRoot(async ({ uploadsDir }) => {
-      const result = await resolveWritablePathWithinRoot({
-        rootDir: uploadsDir,
-        requestedPath: "safe.txt",
-        scopeLabel: "uploads directory",
-      });
-      expect(result).toEqual({
-        ok: true,
-        path: path.resolve(uploadsDir, "safe.txt"),
-      });
-    });
-  });
-
-  it.runIf(process.platform !== "win32")(
-    "rejects write paths routed through a symlinked parent directory",
-    async () => {
-      await withFixtureRoot(async ({ baseDir, uploadsDir }) => {
-        const outsideDir = path.join(baseDir, "outside");
-        await fs.mkdir(outsideDir, { recursive: true });
-        const symlinkDir = path.join(uploadsDir, "escape-link");
-        await fs.symlink(outsideDir, symlinkDir);
-
-        const result = await resolveWritablePathWithinRoot({
-          rootDir: uploadsDir,
-          requestedPath: "escape-link/pwned.txt",
-          scopeLabel: "uploads directory",
-        });
-
-        expect(result.ok).toBe(false);
-        if (!result.ok) {
-          expect(result.error).toContain("must stay within uploads directory");
-        }
-      });
-    },
-  );
-
-  it.runIf(process.platform !== "win32")(
-    "rejects existing hardlinked files under root",
-    async () => {
-      await withFixtureRoot(async ({ baseDir, uploadsDir }) => {
-        const outsidePath = path.join(baseDir, "outside-target.txt");
-        await fs.writeFile(outsidePath, "outside", "utf8");
-        const hardlinkedPath = path.join(uploadsDir, "linked.txt");
-        await fs.link(outsidePath, hardlinkedPath);
-
-        const result = await resolveWritablePathWithinRoot({
-          rootDir: uploadsDir,
-          requestedPath: "linked.txt",
-          scopeLabel: "uploads directory",
-        });
-
-        expect(result.ok).toBe(false);
-        if (!result.ok) {
-          expect(result.error).toContain("must stay within uploads directory");
-        }
-      });
-    },
-  );
-});
-
-describe("resolvePathsWithinRoot", () => {
-  it("resolves all valid in-root paths", () => {
-    const result = resolvePathsWithinRoot({
-      rootDir: "/tmp/uploads",
-      requestedPaths: ["a.txt", "nested/b.txt"],
-      scopeLabel: "uploads directory",
-    });
-    expect(result).toEqual({
-      ok: true,
-      paths: [path.resolve("/tmp/uploads", "a.txt"), path.resolve("/tmp/uploads", "nested/b.txt")],
-    });
-  });
-
-  it("returns the first path validation error", () => {
-    const result = resolvePathsWithinRoot({
-      rootDir: "/tmp/uploads",
-      requestedPaths: ["a.txt", "../outside.txt", "b.txt"],
-      scopeLabel: "uploads directory",
-    });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain("must stay within uploads directory");
-    }
-  });
+  registerUploadPathCases("resolveStrictExistingUploadPaths", [
+    ["accepts mixed upload-root and inbound-media files at use time", "mixed-relative"],
+    ["rejects files missing from both managed upload roots", "missing", nonSymlink],
+  ]);
 });

@@ -10,6 +10,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -95,7 +96,7 @@ class VoiceE2eService : Service() {
       if (mode == "connect") {
         val resultJson = """{"ok":true,"mode":"connect","connected":true}"""
         writeResult(resultJson)
-        Log.i(tag, "PASS $resultJson")
+        Log.i(tag, "PASS result=$resultFileName")
         return
       }
 
@@ -121,7 +122,7 @@ class VoiceE2eService : Service() {
         )
       val resultJson = encodeResult(result)
       writeResult(resultJson)
-      Log.i(tag, "PASS $resultJson")
+      Log.i(tag, "PASS result=$resultFileName")
     } catch (err: Throwable) {
       val resultJson =
         buildJsonObject {
@@ -129,7 +130,7 @@ class VoiceE2eService : Service() {
           put("error", JsonPrimitive(err.message ?: err::class.java.simpleName))
         }.toString()
       writeResult(resultJson)
-      Log.e(tag, "FAIL $resultJson", err)
+      Log.e(tag, "FAIL result=$resultFileName")
     }
   }
 
@@ -144,25 +145,43 @@ class VoiceE2eService : Service() {
         .orEmpty()
         .ifEmpty { "127.0.0.1" }
     val port = intent.getIntExtra("port", 18789)
-    runtime.setManualEnabled(true)
-    runtime.setManualHost(host)
-    runtime.setManualPort(port)
-    runtime.setManualTls(intent.getBooleanExtra("tls", false))
-    runtime.setGatewayToken(intent.getDecodedStringExtra("token").orEmpty())
-    runtime.setGatewayBootstrapToken(intent.getDecodedStringExtra("bootstrapToken").orEmpty())
-    runtime.setGatewayPassword(intent.getDecodedStringExtra("password").orEmpty())
-    runtime.setOnboardingCompleted(true)
-    runtime.connectManual()
+    runtime.prefs.setManualEnabled(true)
+    runtime.prefs.setManualHost(host)
+    runtime.prefs.setManualPort(port)
+    runtime.prefs.setManualTls(intent.getBooleanExtra("tls", false))
+    runtime.prefs.setOnboardingCompleted(true)
+    runtime.connect(
+      ai.openclaw.app.gateway.GatewayEndpoint
+        .manual(host, port),
+      NodeRuntime.GatewayConnectAuth(
+        token = intent.getDecodedStringExtra("token"),
+        bootstrapToken = intent.getDecodedStringExtra("bootstrapToken"),
+        password = intent.getDecodedStringExtra("password"),
+      ),
+    )
   }
 
   private suspend fun awaitGateway(
     runtime: NodeRuntime,
     timeoutMs: Long,
   ) {
-    withTimeout(timeoutMs) {
-      while (!runtime.isConnected.value) {
-        delay(100L)
+    try {
+      withTimeout(timeoutMs) {
+        while (!runtime.isConnected.value) {
+          voiceE2eTerminalGatewayFailure(runtime.gatewayConnectionDisplay.value.problem)?.let { error(it) }
+          delay(100L)
+        }
       }
+    } catch (err: TimeoutCancellationException) {
+      val display = runtime.gatewayConnectionDisplay.value
+      throw IllegalStateException(
+        voiceE2eGatewayTimeoutMessage(
+          timeoutMs = timeoutMs,
+          statusText = display.statusText,
+          problem = display.problem,
+        ),
+        err,
+      )
     }
   }
 
@@ -192,4 +211,33 @@ private fun Intent.getDecodedStringExtra(name: String): String? {
     return String(Base64.decode(encoded, Base64.NO_WRAP), Charsets.UTF_8)
   }
   return getStringExtra(name)
+}
+
+internal fun voiceE2eTerminalGatewayFailure(problem: GatewayConnectionProblem?): String? =
+  problem
+    ?.takeIf { it.pauseReconnect && !it.canAutoRetry }
+    ?.message
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+
+internal fun voiceE2eGatewayTimeoutMessage(
+  timeoutMs: Long,
+  statusText: String,
+  problem: GatewayConnectionProblem?,
+): String {
+  val detail =
+    problem
+      ?.message
+      ?.trim()
+      ?.takeIf { it.isNotEmpty() }
+      ?: statusText.trim().takeIf { it.isNotEmpty() }
+  return buildString {
+    append("Gateway connection timed out after ")
+    append(timeoutMs)
+    append(" ms")
+    if (detail != null) {
+      append(": ")
+      append(detail)
+    }
+  }
 }

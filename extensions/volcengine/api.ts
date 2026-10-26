@@ -1,4 +1,4 @@
-// Volcengine API module exposes the plugin public contract.
+import { applyModelCompatPatch } from "openclaw/plugin-sdk/provider-model-shared";
 import type { ModelCompatConfig } from "openclaw/plugin-sdk/provider-model-shared";
 import { uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
 
@@ -11,46 +11,24 @@ export const VOLCENGINE_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = [
   "maxContains",
 ] as const;
 
-function mergeUnsupportedToolSchemaKeywords(existing: readonly string[] | undefined): string[] {
-  return uniqueStrings([...(existing ?? []), ...VOLCENGINE_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS]);
-}
-
-export function resolveVolcengineToolSchemaCompatPatch(
-  compat?: ModelCompatConfig,
-): ModelCompatConfig {
-  return {
-    unsupportedToolSchemaKeywords: mergeUnsupportedToolSchemaKeywords(
-      compat?.unsupportedToolSchemaKeywords,
-    ),
-  };
-}
-
 export function applyVolcengineToolSchemaCompat<T extends { compat?: ModelCompatConfig }>(
   model: T,
 ): T {
-  const unsupportedToolSchemaKeywords = mergeUnsupportedToolSchemaKeywords(
-    model.compat?.unsupportedToolSchemaKeywords,
-  );
-  if (
-    model.compat?.unsupportedToolSchemaKeywords?.length === unsupportedToolSchemaKeywords.length &&
-    unsupportedToolSchemaKeywords.every(
-      (keyword, index) => model.compat?.unsupportedToolSchemaKeywords?.[index] === keyword,
-    )
-  ) {
-    return model;
-  }
-  return {
-    ...model,
-    compat: {
-      ...model.compat,
-      unsupportedToolSchemaKeywords,
-    },
-  };
+  const existing = model.compat?.unsupportedToolSchemaKeywords;
+  const merged = uniqueStrings([
+    ...(existing ?? []),
+    ...VOLCENGINE_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS,
+  ]);
+  return applyModelCompatPatch(model, {
+    unsupportedToolSchemaKeywords:
+      existing?.length === merged.length &&
+      existing.every((value, index) => value === merged[index])
+        ? existing
+        : merged,
+  });
 }
 
-export { buildDoubaoCodingProvider, buildDoubaoProvider } from "./provider-catalog.js";
 export {
-  buildDoubaoModelDefinition,
   DOUBAO_BASE_URL,
   DOUBAO_CODING_BASE_URL,
   DOUBAO_CODING_MODEL_CATALOG,

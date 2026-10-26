@@ -1,10 +1,14 @@
 // Channel test helper exports provide shared fixtures for plugin channel contract tests.
+export {
+  createAccountPolicyInheritanceCases,
+  validateTestChannelConfig,
+} from "./test-helpers/channel-config.js";
 export { createDirectoryTestRuntime, expectDirectorySurface } from "./test-helpers/directory.js";
 export { expectDirectoryIds, type DirectoryListFn } from "./test-helpers/directory-ids.js";
 export {
   expectChannelPluginContract,
   installChannelActionsContractSuite,
-  installChannelPluginContractSuite,
+  installChannelDmPolicyContractSuite,
   installChannelSetupContractSuite,
   installChannelStatusContractSuite,
 } from "./test-helpers/channel-contract-suites.js";
@@ -14,23 +18,18 @@ export {
   createOutboundTestPlugin,
   createTestRegistry,
   initializeGlobalHookRunner,
-  releasePinnedPluginChannelRegistry,
+  resetPluginRuntimeStateForTest,
   resetGlobalHookRunner,
   setActivePluginRegistry,
+  withPluginRuntimeRegistryScope,
   type PluginHookRegistration,
 } from "./test-helpers/outbound-delivery.js";
-/** @deprecated Direct outbound delivery is runtime substrate; use channel message runtime helpers. */
-export { deliverOutboundPayloads } from "./test-helpers/outbound-delivery.js";
 export {
+  createTestInboundDebounceFlush,
   createPluginRuntimeMediaMock,
   createPluginRuntimeMock,
   type PluginRuntimeMediaMock,
 } from "./test-helpers/plugin-runtime-mock.js";
-export {
-  createSendCfgThreadingRuntime,
-  expectProvidedCfgSkipsRuntimeLoad,
-  expectRuntimeCfgFallback,
-} from "./test-helpers/send-config.js";
 export { createStartAccountContext } from "./test-helpers/start-account-context.js";
 export {
   abortStartedAccount,
@@ -45,11 +44,10 @@ export {
   getRequiredHookHandler,
   registerHookHandlersForTest,
 } from "./test-helpers/subagent-hooks.js";
-export { assertBundledChannelEntries } from "./test-helpers/bundled-channel-entry.js";
-export {
-  escapeRegExp,
-  formatEnvelopeTimestamp,
-  formatLocalEnvelopeTimestamp,
-} from "./test-helpers/envelope-timestamp.js";
+export { escapeRegExp, formatEnvelopeTimestamp } from "./test-helpers/envelope-timestamp.js";
 export { expectPairingReplyText, extractPairingCode } from "./test-helpers/pairing-reply.js";
 export { stripAnsi } from "../../packages/terminal-core/src/ansi.js";
+export {
+  createNativeApprovalTestFixture,
+  createLocalApprovalPromptTestFixture,
+} from "./test-helpers/native-approval.js";

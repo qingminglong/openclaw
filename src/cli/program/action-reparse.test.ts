@@ -1,171 +1,145 @@
 // Action reparse tests cover Commander action reparsing for nested CLI commands.
 import { Command } from "commander";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { reparseProgramFromActionArgs } from "./action-reparse.js";
+import { describe, expect, it, vi } from "vitest";
+import { removeCommandByName } from "./command-tree.js";
+import { registerCommandGroups } from "./register-command-groups.js";
 
-const buildParseArgvMock = vi.hoisted(() => vi.fn());
-const resolveActionArgsMock = vi.hoisted(() => vi.fn());
-const resolveCommandOptionArgsMock = vi.hoisted(() => vi.fn());
+async function expectReparseArgv(params: {
+  parent: Command;
+  action: Command;
+  argv: string[];
+  expected: string[];
+}): Promise<void> {
+  let root = params.parent;
+  while (root.parent) {
+    root = root.parent;
+  }
+  removeCommandByName(params.parent, params.action.name());
+  registerCommandGroups(
+    params.parent,
+    [
+      {
+        placeholders: [{ name: params.action.name(), description: "Lazy test command" }],
+        register: () => {
+          params.parent.addCommand(params.action);
+        },
+      },
+    ],
+    { eager: false, primary: null, registerPrimaryOnly: false },
+  );
+  const parse = root.parseAsync.bind(root);
+  const parseAsync = vi.spyOn(root, "parseAsync").mockResolvedValue(root);
+  parseAsync.mockImplementationOnce(parse);
 
-vi.mock("../argv.js", () => ({
-  buildParseArgv: buildParseArgvMock,
-}));
+  await root.parseAsync(params.argv);
 
-vi.mock("./helpers.js", () => ({
-  resolveActionArgs: resolveActionArgsMock,
-  resolveCommandOptionArgs: resolveCommandOptionArgsMock,
-}));
-
-function setRawArgs(command: Command, rawArgs: string[]): void {
-  (command as Command & { rawArgs: string[] }).rawArgs = rawArgs;
+  expect(parseAsync).toHaveBeenCalledTimes(2);
+  expect(parseAsync).toHaveBeenLastCalledWith(params.expected);
 }
 
-function deleteRawArgs(command: Command): void {
-  delete (command as Command & { rawArgs?: string[] }).rawArgs;
-}
-
-describe("reparseProgramFromActionArgs", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    buildParseArgvMock.mockReturnValue(["node", "openclaw", "status"]);
-    resolveActionArgsMock.mockReturnValue([]);
-    resolveCommandOptionArgsMock.mockReturnValue([]);
-  });
-
-  it("uses action command name + args as fallback argv", async () => {
-    const program = new Command().name("openclaw");
-    setRawArgs(program, ["node", "openclaw", "status", "--json"]);
-    const parseAsync = vi.spyOn(program, "parseAsync").mockResolvedValue(program);
-    const actionCommand = {
-      name: () => "status",
-      parent: program,
-    } as unknown as Command;
-    resolveActionArgsMock.mockReturnValue(["--json"]);
-
-    await reparseProgramFromActionArgs(program, [actionCommand]);
-
-    expect(buildParseArgvMock).toHaveBeenCalledWith({
-      programName: "openclaw",
-      rawArgs: ["node", "openclaw", "status", "--json"],
-      fallbackArgv: ["status", "--json"],
-    });
-    expect(parseAsync).toHaveBeenCalledWith(["node", "openclaw", "status"]);
-  });
-
-  it("falls back to action args without command name when action has no name", async () => {
-    const program = new Command().name("openclaw");
-    setRawArgs(program, ["node", "openclaw"]);
-    const parseAsync = vi.spyOn(program, "parseAsync").mockResolvedValue(program);
-    const actionCommand = {
-      name: () => "",
-      parent: program,
-    } as unknown as Command;
-    resolveActionArgsMock.mockReturnValue(["--json"]);
-
-    await reparseProgramFromActionArgs(program, [actionCommand]);
-
-    expect(buildParseArgvMock).toHaveBeenCalledWith({
-      programName: "openclaw",
-      rawArgs: ["node", "openclaw"],
-      fallbackArgv: ["--json"],
-    });
-    expect(parseAsync).toHaveBeenCalledWith(["node", "openclaw", "status"]);
-  });
-
-  it("preserves explicit parent command options in fallback argv", async () => {
-    const program = new Command().name("browser");
-    const parseAsync = vi.spyOn(program, "parseAsync").mockResolvedValue(program);
-    const actionCommand = {
-      name: () => "open",
-      parent: program,
-    } as unknown as Command;
-    resolveActionArgsMock.mockReturnValue(["about:blank"]);
-    resolveCommandOptionArgsMock.mockReturnValue(["--json"]);
-
-    await reparseProgramFromActionArgs(program, [actionCommand]);
-
-    expect(resolveCommandOptionArgsMock).toHaveBeenCalledWith(program);
-    expect(buildParseArgvMock).toHaveBeenCalledWith({
-      programName: "browser",
-      rawArgs: [],
-      fallbackArgv: ["--json", "open", "about:blank"],
-    });
-    expect(parseAsync).toHaveBeenCalledWith(["node", "openclaw", "status"]);
+describe("lazy command action reparsing", () => {
+  it("keeps literal flag-looking values through actual lazy reparse", async () => {
+    const program = new Command().name("openclaw").enablePositionalOptions();
+    const received: string[] = [];
+    registerCommandGroups(
+      program,
+      [
+        {
+          placeholders: [{ name: "config", description: "Read config" }],
+          register: () => {
+            program
+              .command("config")
+              .command("get")
+              .argument("<path>")
+              .action((value: string) => {
+                received.push(value);
+              });
+          },
+        },
+      ],
+      { eager: false, primary: null, registerPrimaryOnly: false },
+    );
+    await program.parseAsync(["node", "openclaw", "config", "get", "--", "--help"]);
+    expect(received).toEqual(["--help"]);
   });
 
   it("uses root raw args and reparses the root for nested lazy commands", async () => {
     const root = new Command().name("openclaw");
-    setRawArgs(root, ["node", "openclaw", "workspaces", "audit", "export", "--since", "1"]);
     const workspaces = root.command("workspaces");
     const audit = workspaces.command("audit");
     const exportCommand = audit.command("export");
-    const parseAsync = vi.spyOn(root, "parseAsync").mockResolvedValue(root);
     const auditParseAsync = vi.spyOn(audit, "parseAsync");
-    resolveActionArgsMock.mockReturnValue(["--since", "1"]);
 
-    await reparseProgramFromActionArgs(audit, [exportCommand]);
-
-    expect(buildParseArgvMock).toHaveBeenCalledWith({
-      programName: "openclaw",
-      rawArgs: ["node", "openclaw", "workspaces", "audit", "export", "--since", "1"],
-      fallbackArgv: ["workspaces", "audit", "export", "--since", "1"],
-    });
-    expect(parseAsync).toHaveBeenCalledWith(["node", "openclaw", "status"]);
+    const argv = ["node", "openclaw", "workspaces", "audit", "export", "--since", "1"];
+    await expectReparseArgv({ parent: audit, action: exportCommand, argv, expected: argv });
     expect(auditParseAsync).not.toHaveBeenCalled();
   });
 
-  it("reconstructs the full nested command path when Commander rawArgs is missing", async () => {
-    // #83893: nested lazy commands still need their ancestor path if
-    // Commander stops exposing root rawArgs at runtime.
-    const root = new Command().name("openclaw");
-    const workspaces = root.command("workspaces");
-    const audit = workspaces.command("audit");
-    const exportCommand = audit.command("export");
-    deleteRawArgs(root);
-    const parseAsync = vi.spyOn(root, "parseAsync").mockResolvedValue(root);
-    resolveActionArgsMock.mockReturnValue(["--since", "1"]);
-
-    await reparseProgramFromActionArgs(audit, [exportCommand]);
-
-    expect(buildParseArgvMock).toHaveBeenCalledWith({
-      programName: "openclaw",
-      rawArgs: undefined,
-      fallbackArgv: ["workspaces", "audit", "export", "--since", "1"],
+  it("skips an attached root option value that matches the parent command name", async () => {
+    const root = new Command().name("openclaw").option("-p, --profile <name>");
+    const browser = root.command("browser").option("--browser-profile <name>");
+    const tabs = browser.command("tabs");
+    await expectReparseArgv({
+      parent: browser,
+      action: tabs,
+      argv: ["node", "openclaw", "-pbrowser", "browser", "tabs", "--browser-profile", "remote"],
+      expected: ["node", "openclaw", "-pbrowser", "browser", "--browser-profile", "remote", "tabs"],
     });
-    expect(parseAsync).toHaveBeenCalledWith(["node", "openclaw", "status"]);
   });
 
-  it("uses program root when action command is missing", async () => {
-    const program = new Command().name("openclaw");
-    const parseAsync = vi.spyOn(program, "parseAsync").mockResolvedValue(program);
-
-    await reparseProgramFromActionArgs(program, []);
-
-    expect(resolveActionArgsMock).toHaveBeenCalledWith(undefined);
-    expect(buildParseArgvMock).toHaveBeenCalledWith({
-      programName: "openclaw",
-      rawArgs: [],
-      fallbackArgv: [],
-    });
-    expect(parseAsync).toHaveBeenCalledWith(["node", "openclaw", "status"]);
+  it("leaves a child-owned option collision after the child command", async () => {
+    const root = new Command().name("openclaw");
+    const browser = root.command("browser").option("--json");
+    const extension = browser.command("extension");
+    extension.command("path");
+    extension.command("pair").option("--json");
+    const argv = ["node", "openclaw", "browser", "extension", "pair", "--json"];
+    await expectReparseArgv({ parent: browser, action: extension, argv, expected: argv });
   });
 
-  it("falls back to fallbackArgv when Commander rawArgs is missing from the root command", async () => {
-    // #83893: rawArgs is a Commander runtime field, so the root command must
-    // still reparse from reconstructed argv if Commander stops exposing it.
+  it("preserves an unknown suffix after a child-owned boolean short flag", async () => {
     const root = new Command().name("openclaw");
-    const configCommand = root.command("config");
-    deleteRawArgs(root);
-    const parseAsync = vi.spyOn(root, "parseAsync").mockResolvedValue(root);
-    resolveActionArgsMock.mockReturnValue(["set", "key", "value"]);
+    const browser = root.command("browser").option("-p, --browser-profile <name>");
+    const extension = browser.command("extension");
+    const pair = extension.command("pair").option("-p, --preview");
 
-    await reparseProgramFromActionArgs(root, [configCommand]);
+    const parsed = pair.parseOptions(["-pfoo"]);
 
-    expect(buildParseArgvMock).toHaveBeenCalledWith({
-      programName: "openclaw",
-      rawArgs: undefined,
-      fallbackArgv: ["config", "set", "key", "value"],
+    expect(parsed.unknown).toEqual(["-foo"]);
+    expect(pair.opts()).toEqual({ preview: true });
+
+    const argv = ["node", "openclaw", "browser", "extension", "pair", "-pfoo"];
+    await expectReparseArgv({ parent: browser, action: extension, argv, expected: argv });
+  });
+
+  it("preserves child-owned short groups with an optional separate value", async () => {
+    const root = new Command().name("openclaw");
+    const browser = root.command("browser").option("-p, --browser-profile <name>");
+    const extension = browser.command("extension");
+    const pair = extension.command("pair").option("-p, --preview").option("-r, --retry [value]");
+
+    const parsed = pair.parseOptions(["-pr", "remote"]);
+
+    expect(parsed.unknown).toEqual([]);
+    expect(pair.opts()).toEqual({ preview: true, retry: "remote" });
+
+    const argv = ["node", "openclaw", "browser", "extension", "pair", "-pr", "remote"];
+    await expectReparseArgv({ parent: browser, action: extension, argv, expected: argv });
+  });
+
+  it("rejects a missing parent option value before loading the lazy command", async () => {
+    const root = new Command().name("openclaw").exitOverride();
+    const browser = root.command("browser").option("--browser-profile <name>");
+    const register = vi.fn();
+    registerCommandGroups(
+      browser,
+      [{ placeholders: [{ name: "tabs", description: "Browser tabs" }], register }],
+      { eager: false, primary: null, registerPrimaryOnly: false },
+    );
+    const argv = ["node", "openclaw", "browser", "tabs", "--browser-profile"];
+    await expect(root.parseAsync(argv)).rejects.toMatchObject({
+      code: "commander.optionMissingArgument",
     });
-    expect(parseAsync).toHaveBeenCalled();
+    expect(register).not.toHaveBeenCalled();
   });
 });

@@ -2,26 +2,30 @@
 // logger wiring, runtime env shims, and global verbose console helpers.
 
 export type { RuntimeEnv } from "../runtime.js";
+export {
+  annotateRuntimeExecutionError,
+  noteRuntimeDynamicExecution,
+  type RuntimeDynamicExecutionFeature,
+  getRuntimeExecutionProfile,
+  type RuntimeExecutionProfile,
+} from "../infra/runtime-profile.js";
 export { createNonExitingRuntime, defaultRuntime } from "../runtime.js";
 export {
   danger,
   info,
   isVerbose,
-  isYes,
   logVerbose,
-  logVerboseConsole,
-  setVerbose,
-  setYes,
   shouldLogVerbose,
   success,
   warn,
 } from "../globals.js";
-export { sleep } from "../utils.js";
-export { withTimeout } from "../utils/with-timeout.js";
+export { sleep } from "../utils/sleep.js";
+
 export { isTruthyEnvValue } from "../infra/env.js";
-export * from "../logging.js";
+export { getChildLogger, resetLogger, setLoggerOverride, toPinoLikeLogger } from "../logging.js";
 export { waitForAbortSignal } from "../infra/abort-signal.js";
-export { computeBackoff, sleepWithAbort, type BackoffPolicy } from "../infra/backoff.js";
+export { computeBackoff, sleepWithAbort } from "../infra/backoff.js";
+export type { BackoffPolicy } from "../infra/backoff.js";
 export {
   formatDurationPrecise,
   formatDurationSeconds,
@@ -33,3 +37,5 @@ export {
   registerUnhandledRejectionHandler,
 } from "../infra/unhandled-rejections.js";
 export { isWSL2Sync } from "../infra/wsl.js";
+
+export { createSubsystemLogger } from "../logging/subsystem.js";

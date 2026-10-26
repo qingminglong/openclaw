@@ -2,80 +2,80 @@
 // Centralizes Vitest mock wiring for agent, channel, plugin, and runtime seams.
 import path from "node:path";
 import { vi } from "vitest";
+import { withReplyDispatcher } from "../auto-reply/dispatch-dispatcher.js";
+import { createReplyDispatcher } from "../auto-reply/reply/reply-dispatcher.js";
+import { getTestPluginRegistry } from "./test-helpers.plugin-registry.js";
 import {
-  getTestPluginRegistry,
-  resetTestPluginRegistry,
-  setTestPluginRegistry,
-} from "./test-helpers.plugin-registry.js";
-import {
-  agentCommand,
+  agentCommandMock,
   cronIsolatedRun,
-  dispatchInboundMessageMock,
   embeddedRunMock,
   type GetReplyFromConfigFn,
-  getReplyFromConfig,
   getGatewayTestHoistedState,
-  mockGetReplyFromConfigOnce,
   agentDiscoveryMock,
-  runBtwSideQuestion,
-  sendWhatsAppMock,
-  sessionStoreSaveDelayMs,
-  setTestConfigRoot,
-  testIsNixMode,
-  testState,
   testTailnetIPv4,
   testTailscaleWhois,
   type RunBtwSideQuestionFn,
 } from "./test-helpers.runtime-state.js";
 
-export { getTestPluginRegistry, resetTestPluginRegistry, setTestPluginRegistry };
-export {
-  agentCommand,
-  cronIsolatedRun,
-  dispatchInboundMessageMock,
-  embeddedRunMock,
-  getReplyFromConfig,
-  mockGetReplyFromConfigOnce,
-  agentDiscoveryMock,
-  runBtwSideQuestion,
-  sendWhatsAppMock,
-  sessionStoreSaveDelayMs,
-  setTestConfigRoot,
-  testIsNixMode,
-  testState,
-  testTailnetIPv4,
-  testTailscaleWhois,
-};
-
 const gatewayTestHoisted = getGatewayTestHoistedState();
 
 function createEmbeddedRunMockExports() {
-  return {
+  const runtime = {
     compactEmbeddedAgentSession: (...args: unknown[]) =>
       embeddedRunMock.compactEmbeddedAgentSession(...args),
-    isEmbeddedAgentRunActive: (sessionId: string) => embeddedRunMock.activeIds.has(sessionId),
     abortEmbeddedAgentRun: (sessionId: string) => {
       embeddedRunMock.abortCalls.push(sessionId);
       return embeddedRunMock.activeIds.has(sessionId);
     },
-    waitForEmbeddedAgentRunEnd: async (sessionId: string) => {
+    waitForNativeRunEnd: async (sessionId: string, timeoutMs?: number | null) => {
+      if (timeoutMs === null) {
+        embeddedRunMock.endWaitCalls.push(sessionId);
+        return await new Promise<boolean>((resolve) => {
+          embeddedRunMock.endWaiters.set(sessionId, resolve);
+        });
+      }
       embeddedRunMock.waitCalls.push(sessionId);
-      return embeddedRunMock.waitResults.get(sessionId) ?? true;
+      const ended = embeddedRunMock.waitResults.get(sessionId) ?? true;
+      if (ended) {
+        embeddedRunMock.activeIds.delete(sessionId);
+        embeddedRunMock.endWaiters.get(sessionId)?.(true);
+      } else if (embeddedRunMock.resolveEndBeforeTimeoutIds.delete(sessionId)) {
+        embeddedRunMock.endWaiters.get(sessionId)?.(true);
+      }
+      return ended;
     },
+  };
+  return {
+    compactEmbeddedAgentSession: runtime.compactEmbeddedAgentSession,
+    abortEmbeddedAgentRun: runtime.abortEmbeddedAgentRun,
+    captureEmbeddedRunDrainTarget: (
+      sessionId: string,
+      owner: Parameters<
+        typeof import("../agents/embedded-agent-runner/runs.js").captureEmbeddedRunDrainTarget
+      >[1],
+    ) =>
+      embeddedRunMock.activeIds.has(sessionId)
+        ? {
+            sessionId,
+            agentId: owner.agentId,
+            sessionKey: undefined,
+            isActive: () => embeddedRunMock.activeIds.has(sessionId),
+            abort: () => runtime.abortEmbeddedAgentRun(sessionId),
+            waitForEnd: (timeoutMs: number | null) =>
+              runtime.waitForNativeRunEnd(sessionId, timeoutMs),
+            release: () => {},
+          }
+        : undefined,
   };
 }
 
 async function importEmbeddedRunMockModule<TModule extends object>(
   actualPath: string,
-  opts?: { includeActiveCount?: boolean },
 ): Promise<TModule> {
   const actual = await vi.importActual<TModule>(actualPath);
   return {
     ...actual,
     ...createEmbeddedRunMockExports(),
-    ...(opts?.includeActiveCount
-      ? { getActiveEmbeddedRunCount: () => embeddedRunMock.activeIds.size }
-      : {}),
   };
 }
 
@@ -92,6 +92,26 @@ function createDispatchInboundMessageMockExports(
           >)
         : actual.dispatchInboundMessage(...args);
     },
+    dispatchInboundMessageWithProjectedDispatcher: (
+      ...args: Parameters<typeof actual.dispatchInboundMessageWithProjectedDispatcher>
+    ) => {
+      const impl = gatewayTestHoisted.dispatchInboundMessage.getMockImplementation();
+      if (!impl) {
+        return actual.dispatchInboundMessageWithProjectedDispatcher(...args);
+      }
+      const [params] = args;
+      const { dispatcherOptions, ...dispatchParams } = params;
+      const dispatcher = createReplyDispatcher(dispatcherOptions);
+      // The override bypasses dispatchInboundMessage's dispatcher lifecycle ownership.
+      return withReplyDispatcher({
+        dispatcher,
+        run: () =>
+          gatewayTestHoisted.dispatchInboundMessage({
+            ...dispatchParams,
+            dispatcher,
+          }) as ReturnType<typeof actual.dispatchInboundMessageWithProjectedDispatcher>,
+      });
+    },
   };
 }
 
@@ -103,7 +123,7 @@ vi.mock("../agents/agent-model-discovery.js", async () => {
     "../agents/sessions/index.js",
   );
 
-  const createActualRegistry = (...args: Parameters<typeof actual.discoverModels>) => {
+  const createActualRegistry = (...args: Parameters<typeof actual.discoverModelsAsync>) => {
     const modelsFile = path.join(args[1], "models.json");
     const Registry = modelSessions.ModelRegistry as unknown as {
       create?: (
@@ -165,8 +185,10 @@ vi.mock("../agents/agent-model-discovery.js", async () => {
 
   return {
     ...actual,
-    discoverModels: (authStorage: Parameters<typeof actual.discoverModels>[0], agentDir: string) =>
-      new MockModelRegistry(authStorage, path.join(agentDir, "models.json")),
+    discoverModelsAsync: async (
+      authStorage: Parameters<typeof actual.discoverModelsAsync>[0],
+      agentDir: string,
+    ) => new MockModelRegistry(authStorage, path.join(agentDir, "models.json")),
     ModelRegistry: MockModelRegistry,
   };
 });
@@ -186,39 +208,31 @@ vi.mock("../infra/tailscale.js", async () => {
     await vi.importActual<typeof import("../infra/tailscale.js")>("../infra/tailscale.js");
   return {
     ...actual,
-    readTailscaleWhoisIdentity: async () => testTailscaleWhois.value,
-  };
-});
-
-vi.mock("../config/sessions.js", async () => {
-  const actual =
-    await vi.importActual<typeof import("../config/sessions.js")>("../config/sessions.js");
-  return {
-    ...actual,
-    saveSessionStore: vi.fn(async (storePath: string, store: unknown) => {
-      const delay = sessionStoreSaveDelayMs.value;
-      if (delay > 0) {
-        await new Promise((resolve) => {
-          setTimeout(resolve, delay);
-        });
-      }
-      return actual.saveSessionStore(storePath, store as never);
-    }),
+    readTailscaleWhoisIdentity: async (
+      ip: string,
+      _exec: unknown,
+      opts?: { timeoutMs?: number; cacheTtlMs?: number; errorTtlMs?: number },
+    ) => {
+      testTailscaleWhois.calls.push({ ip, opts });
+      return testTailscaleWhois.value;
+    },
   };
 });
 
 vi.mock("../config/config.js", async () => {
   const actual = await vi.importActual<typeof import("../config/config.js")>("../config/config.js");
-  const { createGatewayConfigModuleMock } = await import("./test-helpers.config-runtime.js");
-  return createGatewayConfigModuleMock(actual);
+  const { createGatewayConfigOverrides } = await import("./test-helpers.config-runtime.js");
+  return Object.defineProperties(
+    { ...actual },
+    Object.getOwnPropertyDescriptors(createGatewayConfigOverrides(actual)),
+  );
 });
 
 vi.mock("../config/io.js", async () => {
   const actual = await vi.importActual<typeof import("../config/io.js")>("../config/io.js");
-  const configActual =
-    await vi.importActual<typeof import("../config/config.js")>("../config/config.js");
-  const { createGatewayConfigModuleMock } = await import("./test-helpers.config-runtime.js");
-  const configMock = createGatewayConfigModuleMock(configActual);
+  // The config facade re-exports IO; waiting for it here can deadlock a fresh module graph.
+  const { createGatewayConfigOverrides } = await import("./test-helpers.config-runtime.js");
+  const configMock = createGatewayConfigOverrides(actual);
   const createConfigIO = vi.fn(() => ({
     ...actual.createConfigIO(),
     getRuntimeConfig: configMock.getRuntimeConfig,
@@ -253,24 +267,42 @@ vi.mock("/src/agents/embedded-agent.js", async () => {
 vi.mock("../agents/embedded-agent-runner/runs.js", async () => {
   return await importEmbeddedRunMockModule<
     typeof import("../agents/embedded-agent-runner/runs.js")
-  >("../agents/embedded-agent-runner/runs.js", { includeActiveCount: true });
+  >("../agents/embedded-agent-runner/runs.js");
 });
 
 vi.mock("/src/agents/embedded-agent-runner/runs.js", async () => {
   return await importEmbeddedRunMockModule<
     typeof import("../agents/embedded-agent-runner/runs.js")
-  >("../agents/embedded-agent-runner/runs.js", { includeActiveCount: true });
+  >("../agents/embedded-agent-runner/runs.js");
 });
 
-vi.mock("../commands/health.js", () => ({
-  getHealthSnapshot: vi.fn().mockResolvedValue({ ok: true, stub: true }),
+// mock-isolation: Gateway fixtures must not collect real channel or session state.
+vi.mock("./health/collector.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./health/collector.js")>()),
+  collectGatewayHealthSnapshot: vi
+    .fn<typeof import("./health/collector.js").collectGatewayHealthSnapshot>()
+    .mockImplementation(async () => ({
+      ok: true,
+      ts: 0,
+      durationMs: 0,
+      channels: {},
+      channelOrder: [],
+      channelLabels: {},
+      heartbeatSeconds: 0,
+      agents: [],
+      sessions: { path: "/test/gateway/sessions", count: 0, recent: [] },
+    })),
 }));
-vi.mock("../commands/status.js", () => ({
+// mock-isolation: Gateway fixtures own their status response and must not collect local state.
+vi.mock("../status/summary.js", () => ({
   getStatusSummary: vi.fn().mockResolvedValue({ ok: true }),
+  prepareStatusSummary: vi.fn().mockResolvedValue({ publish: () => ({ summary: { ok: true } }) }),
 }));
 vi.mock("../commands/agent.js", () => ({
-  agentCommand,
-  agentCommandFromIngress: agentCommand,
+  agentCommand: agentCommandMock,
+  agentCommandFromGatewayIngress: agentCommandMock,
+  agentCommandFromIngress: (...args: Parameters<typeof agentCommandMock>) =>
+    agentCommandMock(...args),
 }));
 vi.mock("../agents/btw.js", () => ({
   runBtwSideQuestion: (...args: Parameters<RunBtwSideQuestionFn>) =>
@@ -292,22 +324,15 @@ vi.mock("/src/auto-reply/dispatch.js", async () => {
   );
   return createDispatchInboundMessageMockExports(actual);
 });
-vi.mock("../auto-reply/reply.js", () => ({
-  getReplyFromConfig: (...args: Parameters<GetReplyFromConfigFn>) =>
-    gatewayTestHoisted.getReplyFromConfig(...args),
-}));
-
-vi.mock("/src/auto-reply/reply.js", () => ({
-  getReplyFromConfig: (...args: Parameters<GetReplyFromConfigFn>) =>
-    gatewayTestHoisted.getReplyFromConfig(...args),
-}));
 vi.mock("../auto-reply/reply/get-reply-from-config.runtime.js", () => ({
   getReplyFromConfig: (...args: Parameters<GetReplyFromConfigFn>) =>
     gatewayTestHoisted.getReplyFromConfig(...args),
+  prewarmConfigDrivenReplyRuntime: vi.fn(async () => {}),
 }));
 vi.mock("/src/auto-reply/reply/get-reply-from-config.runtime.js", () => ({
   getReplyFromConfig: (...args: Parameters<GetReplyFromConfigFn>) =>
     gatewayTestHoisted.getReplyFromConfig(...args),
+  prewarmConfigDrivenReplyRuntime: vi.fn(async () => {}),
 }));
 vi.mock("../cli/deps.js", async () => {
   const actual = await vi.importActual<typeof import("../cli/deps.js")>("../cli/deps.js");
@@ -316,7 +341,7 @@ vi.mock("../cli/deps.js", async () => {
     ...actual,
     createDefaultDeps: () => ({
       ...base,
-      sendMessageWhatsApp: (...args: unknown[]) =>
+      whatsapp: (...args: unknown[]) =>
         (gatewayTestHoisted.sendWhatsAppMock as (...args: unknown[]) => unknown)(...args),
     }),
   };
@@ -330,5 +355,5 @@ vi.mock("../plugins/loader.js", async () => {
     loadOpenClawPlugins: () => getTestPluginRegistry(),
   };
 });
-process.env.OPENCLAW_SKIP_CHANNELS = "1";
-process.env.OPENCLAW_SKIP_CRON = "1";
+vi.stubEnv("OPENCLAW_SKIP_CHANNELS", "1");
+vi.stubEnv("OPENCLAW_SKIP_CRON", "1");

@@ -17,16 +17,18 @@ read_when:
 | API                    | OpenAI-compatible (`openai-completions`) |
 | Base URL               | `https://api.groq.com/openai/v1`         |
 | Audio transcription    | `whisper-large-v3-turbo` (default)       |
-| Suggested chat default | `groq/llama-3.3-70b-versatile`           |
+| Suggested chat default | `groq/openai/gpt-oss-120b`               |
 
 ## Install plugin
 
-Install the official plugin, then restart Gateway:
+Install the official plugin:
 
 ```bash
 openclaw plugins install @openclaw/groq-provider
-openclaw gateway restart
 ```
+
+Installation applies to a running Gateway automatically; otherwise it takes effect
+on the next startup. See [Apply changes and inspect](/plugins/manage-plugins#apply-changes-and-inspect).
 
 ## Getting started
 
@@ -36,15 +38,15 @@ openclaw gateway restart
   </Step>
   <Step title="Set the API key">
     ```bash
-export GROQ_API_KEY=gsk_...
-```
+    export GROQ_API_KEY=gsk_...
+    ```
   </Step>
   <Step title="Set a default model">
     ```json5
     {
       agents: {
         defaults: {
-          model: { primary: "groq/llama-3.3-70b-versatile" },
+          model: { primary: "groq/openai/gpt-oss-120b" },
         },
       },
     }
@@ -61,10 +63,10 @@ export GROQ_API_KEY=gsk_...
 
 ```json5
 {
-  env: { GROQ_API_KEY: "gsk_..." },
+  env: { vars: { GROQ_API_KEY: "gsk_..." } },
   agents: {
     defaults: {
-      model: { primary: "groq/llama-3.3-70b-versatile" },
+      model: { primary: "groq/openai/gpt-oss-120b" },
     },
   },
 }
@@ -72,19 +74,14 @@ export GROQ_API_KEY=gsk_...
 
 ## Built-in catalog
 
-OpenClaw ships a manifest-backed Groq catalog with both reasoning and non-reasoning entries. Run `openclaw models list --provider groq` to see the static rows for your installed version, or check [console.groq.com/docs/models](https://console.groq.com/docs/models) for Groq's authoritative list.
+OpenClaw ships a manifest-backed Groq catalog of reasoning models. Run `openclaw models list --provider groq` to see the static rows for your installed version, or check [console.groq.com/docs/models](https://console.groq.com/docs/models) for Groq's authoritative list.
 
-| Model ref                                        | Name                    | Reasoning | Input        | Context |
-| ------------------------------------------------ | ----------------------- | --------- | ------------ | ------- |
-| `groq/llama-3.3-70b-versatile`                   | Llama 3.3 70B Versatile | no        | text         | 131,072 |
-| `groq/llama-3.1-8b-instant`                      | Llama 3.1 8B Instant    | no        | text         | 131,072 |
-| `groq/meta-llama/llama-4-scout-17b-16e-instruct` | Llama 4 Scout 17B       | no        | text + image | 131,072 |
-| `groq/openai/gpt-oss-120b`                       | GPT OSS 120B            | yes       | text         | 131,072 |
-| `groq/openai/gpt-oss-20b`                        | GPT OSS 20B             | yes       | text         | 131,072 |
-| `groq/openai/gpt-oss-safeguard-20b`              | Safety GPT OSS 20B      | yes       | text         | 131,072 |
-| `groq/qwen/qwen3-32b`                            | Qwen3 32B               | yes       | text         | 131,072 |
-| `groq/groq/compound`                             | Compound                | yes       | text         | 131,072 |
-| `groq/groq/compound-mini`                        | Compound Mini           | yes       | text         | 131,072 |
+| Model ref                           | Name               | Reasoning | Input | Context |
+| ----------------------------------- | ------------------ | --------- | ----- | ------- |
+| `groq/openai/gpt-oss-120b`          | GPT OSS 120B       | yes       | text  | 131,072 |
+| `groq/openai/gpt-oss-20b`           | GPT OSS 20B        | yes       | text  | 131,072 |
+| `groq/openai/gpt-oss-safeguard-20b` | Safety GPT OSS 20B | yes       | text  | 131,072 |
+| `groq/qwen/qwen3.6-27b`             | Qwen 3.6 27B       | yes       | text  | 131,072 |
 
 <Tip>
   The catalog evolves with each OpenClaw release. `openclaw models list --provider groq` shows the rows known to your installed version; cross-check with [console.groq.com/docs/models](https://console.groq.com/docs/models) for newly-added or deprecated models.
@@ -92,11 +89,9 @@ OpenClaw ships a manifest-backed Groq catalog with both reasoning and non-reason
 
 ## Reasoning models
 
-OpenClaw maps its shared `/think` levels to Groq's model-specific `reasoning_effort` values:
+Groq's GPT OSS reasoning models map OpenClaw's shared `/think` levels onto `reasoning_effort` values of `low`, `medium`, or `high`. `/think off` or `/think none` omits `reasoning_effort` from those requests rather than sending a disabled value.
 
-- For `qwen/qwen3-32b`, disabled thinking sends `none` and enabled thinking sends `default`.
-- For Groq GPT OSS reasoning models (`openai/gpt-oss-*`), OpenClaw sends `low`, `medium`, or `high` based on `/think` level. Disabled thinking omits `reasoning_effort` because those models do not support a disabled value.
-- DeepSeek R1 Distill, Qwen QwQ, and Compound use Groq's native reasoning surface; `/think` controls visibility but the model always reasons.
+Qwen 3.6 27B is text-only on Groq and supports two wire reasoning modes. `/think off` or `/think none` sends `reasoning_effort: "none"`; every enabled level sends `"default"`. When reasoning is enabled on Groq Qwen models, OpenClaw requests `reasoning_format: "parsed"` so reasoning stays in thinking blocks instead of visible answer text. Disabled reasoning and GPT OSS requests are left unchanged by this format hook.
 
 See [Thinking modes](/tools/thinking) for the shared `/think` levels and how OpenClaw translates them per provider.
 
@@ -104,13 +99,13 @@ See [Thinking modes](/tools/thinking) for the shared `/think` levels and how Ope
 
 Groq's plugin also registers an **audio media-understanding provider** so voice messages can be transcribed through the shared `tools.media.audio` surface.
 
-| Property           | Value                                     |
-| ------------------ | ----------------------------------------- |
-| Shared config path | `tools.media.audio`                       |
-| Default base URL   | `https://api.groq.com/openai/v1`          |
-| Default model      | `whisper-large-v3-turbo`                  |
-| Auto priority      | 20                                        |
-| API endpoint       | OpenAI-compatible `/audio/transcriptions` |
+| Property          | Value                                     |
+| ----------------- | ----------------------------------------- |
+| Shared model path | `tools.media.models`                      |
+| Default base URL  | `https://api.groq.com/openai/v1`          |
+| Default model     | `whisper-large-v3-turbo`                  |
+| Auto priority     | 20                                        |
+| API endpoint      | OpenAI-compatible `/audio/transcriptions` |
 
 To make Groq the default audio backend:
 
@@ -118,9 +113,7 @@ To make Groq the default audio backend:
 {
   tools: {
     media: {
-      audio: {
-        models: [{ provider: "groq" }],
-      },
+      models: [{ provider: "groq", capabilities: ["audio"] }],
     },
   },
 }

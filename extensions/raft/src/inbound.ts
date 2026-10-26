@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
 import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
+import { shellEscape as shellQuote } from "openclaw/plugin-sdk/string-normalization-runtime";
 import type { ResolvedRaftAccount } from "./accounts.js";
 import { RAFT_CHANNEL_ID } from "./accounts.js";
 
@@ -13,14 +14,9 @@ type RaftChannelRuntime = Pick<
   "inbound" | "reply" | "routing" | "session"
 >;
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
-export async function dispatchRaftWake(params: {
-  ctx: ChannelGatewayContext<ResolvedRaftAccount>;
-}): Promise<void> {
-  const { ctx } = params;
+export async function dispatchRaftWake(
+  ctx: ChannelGatewayContext<ResolvedRaftAccount>,
+): Promise<void> {
   // Gateway supplies the full runtime; the public context type intentionally
   // exposes only runtime contexts so external plugins cannot assume more.
   const channelRuntime = ctx.channelRuntime as RaftChannelRuntime | undefined;
@@ -58,6 +54,7 @@ export async function dispatchRaftWake(params: {
       }),
       resolveTurn: async (input) => {
         const ctxPayload = channelRuntime.inbound.buildContext({
+          channelIngress: "unsupported",
           channel: RAFT_CHANNEL_ID,
           accountId: ctx.accountId,
           messageId: input.id,
@@ -87,20 +84,12 @@ export async function dispatchRaftWake(params: {
             bodyForAgent: input.textForAgent,
           },
         });
-        const storePath = channelRuntime.session.resolveStorePath(ctx.cfg.session?.store, {
-          agentId: route.agentId,
-        });
         return {
           cfg: ctx.cfg,
           channel: RAFT_CHANNEL_ID,
           accountId: ctx.accountId,
-          agentId: route.agentId,
-          routeSessionKey: route.sessionKey,
-          storePath,
+          route: { agentId: route.agentId, sessionKey: route.sessionKey },
           ctxPayload,
-          recordInboundSession: channelRuntime.session.recordInboundSession,
-          dispatchReplyWithBufferedBlockDispatcher:
-            channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
           // Raft's bridge only transports wake hints. The agent owns CLI delivery
           // after it reads the pending Raft messages, so OpenClaw must not emit a
           // duplicate synthetic reply through the channel dispatcher.

@@ -1,46 +1,8 @@
-// Xai helper module supports x search config behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { isRecord } from "./tool-config-shared.js";
+import { resolveProviderWebSearchPluginConfig } from "openclaw/plugin-sdk/provider-web-search-config-contract";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 type JsonRecord = Record<string, unknown>;
-
-function cloneRecord<T extends JsonRecord | undefined>(value: T): T {
-  if (!value) {
-    return value;
-  }
-  return { ...value } as T;
-}
-
-function resolveLegacyXSearchConfig(config?: OpenClawConfig): JsonRecord | undefined {
-  const web = config?.tools?.web as Record<string, unknown> | undefined;
-  const xSearch = web?.x_search;
-  return isRecord(xSearch) ? cloneRecord(xSearch) : undefined;
-}
-
-function resolvePluginXSearchConfig(config?: OpenClawConfig): JsonRecord | undefined {
-  const pluginConfig = config?.plugins?.entries?.xai?.config;
-  if (!isRecord(pluginConfig?.xSearch)) {
-    return undefined;
-  }
-  return cloneRecord(pluginConfig.xSearch);
-}
-
-function resolveLegacyGrokWebSearchConfig(config?: OpenClawConfig): JsonRecord | undefined {
-  const web = config?.tools?.web as Record<string, unknown> | undefined;
-  const search = web?.search;
-  if (!isRecord(search) || !isRecord(search.grok)) {
-    return undefined;
-  }
-  return cloneRecord(search.grok);
-}
-
-function resolvePluginWebSearchConfig(config?: OpenClawConfig): JsonRecord | undefined {
-  const pluginConfig = config?.plugins?.entries?.xai?.config;
-  if (!isRecord(pluginConfig?.webSearch)) {
-    return undefined;
-  }
-  return cloneRecord(pluginConfig.webSearch);
-}
 
 function baseUrlFallback(config?: JsonRecord): JsonRecord | undefined {
   return typeof config?.baseUrl === "string" && config.baseUrl.trim()
@@ -49,15 +11,13 @@ function baseUrlFallback(config?: JsonRecord): JsonRecord | undefined {
 }
 
 export function resolveEffectiveXSearchConfig(config?: OpenClawConfig): JsonRecord | undefined {
-  const legacyGrokBaseUrl = baseUrlFallback(resolveLegacyGrokWebSearchConfig(config));
-  const pluginWebSearchBaseUrl = baseUrlFallback(resolvePluginWebSearchConfig(config));
-  const legacy = resolveLegacyXSearchConfig(config);
-  const pluginOwned = resolvePluginXSearchConfig(config);
+  const pluginWebSearchBaseUrl = baseUrlFallback(
+    resolveProviderWebSearchPluginConfig(config, "xai"),
+  );
+  const pluginOwned = config?.plugins?.entries?.xai?.config?.xSearch;
   const merged = {
-    ...legacyGrokBaseUrl,
     ...pluginWebSearchBaseUrl,
-    ...legacy,
-    ...pluginOwned,
+    ...(isRecord(pluginOwned) ? pluginOwned : undefined),
   };
   if (Object.keys(merged).length === 0) {
     return undefined;

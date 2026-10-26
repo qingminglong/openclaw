@@ -1,21 +1,14 @@
-// Matrix plugin module implements probe behavior.
+import type { BaseProbeResult } from "openclaw/plugin-sdk/channel-contract";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { PinnedDispatcherPolicy } from "openclaw/plugin-sdk/ssrf-dispatcher";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import type { SsrFPolicy } from "../runtime-api.js";
-import type { BaseProbeResult } from "../runtime-api.js";
-import { isBunRuntime } from "./client/runtime.js";
-
-type MatrixProbeRuntimeDeps = Pick<typeof import("./probe.runtime.js"), "createMatrixClient">;
-
-let matrixProbeRuntimeDepsPromise: Promise<MatrixProbeRuntimeDeps> | undefined;
-
-async function loadMatrixProbeRuntimeDeps(): Promise<MatrixProbeRuntimeDeps> {
-  matrixProbeRuntimeDepsPromise ??= import("./probe.runtime.js").then((runtimeModule) => ({
-    createMatrixClient: runtimeModule.createMatrixClient,
-  }));
-  return await matrixProbeRuntimeDepsPromise;
-}
+import {
+  ssrfPolicyFromDangerouslyAllowPrivateNetwork,
+  type SsrFPolicy,
+} from "openclaw/plugin-sdk/ssrf-runtime";
+import { isRecord, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { runChannelProbe } from "openclaw/plugin-sdk/text-utility-runtime";
+import { resolveValidatedMatrixHomeserverUrl } from "./client/url-validation.js";
+import { resolveMatrixLocalTimeoutMs } from "./sdk/client-support.js";
 
 export type MatrixProbe = BaseProbeResult & {
   status?: number | null;
@@ -34,65 +27,55 @@ export async function probeMatrix(params: {
   ssrfPolicy?: SsrFPolicy;
   dispatcherPolicy?: PinnedDispatcherPolicy;
 }): Promise<MatrixProbe> {
-  const started = Date.now();
-  const result: MatrixProbe = {
-    ok: false,
-    status: null,
-    error: null,
-    elapsedMs: 0,
-  };
-  if (isBunRuntime()) {
-    return {
-      ...result,
-      error: "Matrix probe requires Node (bun runtime not supported)",
-      elapsedMs: Date.now() - started,
-    };
-  }
-  if (!params.homeserver?.trim()) {
-    return {
-      ...result,
-      error: "missing homeserver",
-      elapsedMs: Date.now() - started,
-    };
-  }
-  if (!params.accessToken?.trim()) {
-    return {
-      ...result,
-      error: "missing access token",
-      elapsedMs: Date.now() - started,
-    };
-  }
-  try {
-    const { createMatrixClient } = await loadMatrixProbeRuntimeDeps();
-    const inputUserId = normalizeOptionalString(params.userId);
-    const client = await createMatrixClient({
-      homeserver: params.homeserver,
-      userId: inputUserId,
-      accessToken: params.accessToken,
-      deviceId: params.deviceId,
-      persistStorage: false,
-      localTimeoutMs: params.timeoutMs,
-      accountId: params.accountId,
-      allowPrivateNetwork: params.allowPrivateNetwork,
-      ssrfPolicy: params.ssrfPolicy,
-      dispatcherPolicy: params.dispatcherPolicy,
-    });
-    // The client wrapper resolves user ID via whoami when needed.
-    const userId = await client.getUserId();
-    result.ok = true;
-    result.userId = userId ?? null;
-
-    result.elapsedMs = Date.now() - started;
-    return result;
-  } catch (err) {
-    return {
-      ...result,
+  return await runChannelProbe(
+    undefined,
+    async () => {
+      const result: Omit<MatrixProbe, "elapsedMs"> = {
+        ok: false,
+        status: null,
+        error: null,
+      };
+      if (!params.homeserver?.trim()) {
+        return { ...result, error: "missing homeserver" };
+      }
+      if (!params.accessToken?.trim()) {
+        return { ...result, error: "missing access token" };
+      }
+      const inputUserId = normalizeOptionalString(params.userId);
+      const homeserver = await resolveValidatedMatrixHomeserverUrl(params.homeserver, {
+        dangerouslyAllowPrivateNetwork: params.allowPrivateNetwork,
+      });
+      const { MatrixAuthedHttpClient } = await import("./sdk/http-client.js");
+      const client = new MatrixAuthedHttpClient({
+        homeserver,
+        accessToken: params.accessToken,
+        ssrfPolicy:
+          params.ssrfPolicy ??
+          ssrfPolicyFromDangerouslyAllowPrivateNetwork(params.allowPrivateNetwork),
+        dispatcherPolicy: params.dispatcherPolicy,
+      });
+      const identity = await client.requestJson({
+        method: "GET",
+        endpoint: "/_matrix/client/v3/account/whoami",
+        timeoutMs: resolveMatrixLocalTimeoutMs(params.timeoutMs),
+      });
+      const userId =
+        isRecord(identity) && typeof identity.user_id === "string" ? identity.user_id.trim() : "";
+      if (!userId) {
+        throw new Error("Matrix whoami did not return user_id");
+      }
+      if (inputUserId && inputUserId !== userId) {
+        return { ...result, error: "Matrix access token user does not match configured userId" };
+      }
+      return { ...result, ok: true, userId };
+    },
+    (error) => ({
+      ok: false,
       status:
-        typeof err === "object" && err && "statusCode" in err
-          ? Number((err as { statusCode?: number }).statusCode)
-          : result.status,
-      error: formatErrorMessage(err),
-      elapsedMs: Date.now() - started,
-    };
-  }
+        typeof error === "object" && error && "statusCode" in error
+          ? Number((error as { statusCode?: number }).statusCode)
+          : null,
+      error: formatErrorMessage(error),
+    }),
+  );
 }

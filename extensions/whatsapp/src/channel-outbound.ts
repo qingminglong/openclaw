@@ -1,43 +1,38 @@
-// Whatsapp plugin module implements channel outbound behavior.
 import {
   createMessageReceiptFromOutboundResults,
   defineChannelMessageAdapter,
   type ChannelMessageSendResult,
 } from "openclaw/plugin-sdk/channel-outbound";
-import { chunkText } from "openclaw/plugin-sdk/reply-chunking";
-import { createWhatsAppOutboundBase } from "./outbound-base.js";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-result";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import { whatsappOutboundBase } from "./outbound-base.js";
 import { normalizeWhatsAppPayloadTextPreservingIndentation } from "./outbound-media-contract.js";
-import { resolveWhatsAppOutboundTarget } from "./resolve-outbound-target.js";
-import { getWhatsAppRuntime } from "./runtime.js";
-import { sendMessageWhatsApp, sendPollWhatsApp } from "./send.js";
 
-export function normalizeWhatsAppChannelPayloadText(text: string | undefined): string {
-  return normalizeWhatsAppPayloadTextPreservingIndentation(text);
-}
-
-function normalizeWhatsAppChannelSendText(text: string | undefined): string {
-  const normalized = normalizeWhatsAppChannelPayloadText(text);
-  return normalized.trim() ? normalized : "";
-}
+const loadWhatsAppApprovalReactionsModule = createLazyRuntimeModule(
+  () => import("./approval-reactions.js"),
+);
 
 export const whatsappChannelOutbound = {
-  ...createWhatsAppOutboundBase({
-    chunker: chunkText,
-    sendMessageWhatsApp: async (to, text, options) =>
-      await sendMessageWhatsApp(to, text, {
-        ...options,
-        preserveLeadingWhitespace: true,
-      }),
-    sendPollWhatsApp,
-    shouldLogVerbose: () => getWhatsAppRuntime().logging.shouldLogVerbose(),
-    resolveTarget: ({ to, allowFrom, mode }) =>
-      resolveWhatsAppOutboundTarget({ to, allowFrom, mode }),
-    normalizeText: normalizeWhatsAppChannelSendText,
-  }),
+  ...whatsappOutboundBase,
   sendTextOnlyErrorPayloads: true,
+  renderPresentation: async (
+    params: Parameters<NonNullable<ChannelOutboundAdapter["renderPresentation"]>>[0],
+  ) => {
+    return (await loadWhatsAppApprovalReactionsModule()).prepareWhatsAppApprovalPayloadForDelivery({
+      payload: params.payload,
+      presentation: params.presentation,
+    });
+  },
+  afterDeliverPayload: async (
+    params: Parameters<NonNullable<ChannelOutboundAdapter["afterDeliverPayload"]>>[0],
+  ): Promise<void> => {
+    await (
+      await loadWhatsAppApprovalReactionsModule()
+    ).registerWhatsAppApprovalReactionTargetForDeliveredPayload(params);
+  },
   normalizePayload: ({ payload }: { payload: { text?: string } }) => ({
     ...payload,
-    text: normalizeWhatsAppChannelPayloadText(payload.text),
+    text: normalizeWhatsAppPayloadTextPreservingIndentation(payload.text),
   }),
 };
 
@@ -77,12 +72,16 @@ export const whatsappMessageAdapter = defineChannelMessageAdapter({
     },
   },
   send: {
-    text: async (ctx) =>
-      toWhatsAppMessageSendResult(
-        await whatsappChannelOutbound.sendText!({
-          ...ctx,
-        }),
-        ctx.replyToId,
-      ),
+    text: async ({ onDeliveryResult, ...ctx }) => {
+      const result = await whatsappChannelOutbound.sendText!({
+        ...ctx,
+        onDeliveryResult: onDeliveryResult
+          ? async (progress) => {
+              await onDeliveryResult(toWhatsAppMessageSendResult(progress, ctx.replyToId));
+            }
+          : undefined,
+      });
+      return toWhatsAppMessageSendResult(result, ctx.replyToId);
+    },
   },
 });

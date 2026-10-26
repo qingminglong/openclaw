@@ -1,18 +1,3 @@
-// Tencent provider module implements model/runtime integration.
-import type { ProviderPlugin } from "openclaw/plugin-sdk/provider-model-shared";
-import { buildTokenHubProvider } from "./provider-catalog.js";
+import { TENCENT_PROVIDER_CATALOG } from "./models.js";
 
-const tencentProviderDiscovery: ProviderPlugin = {
-  id: "tencent-tokenhub",
-  label: "Tencent TokenHub",
-  docsPath: "/providers/models",
-  auth: [],
-  staticCatalog: {
-    order: "simple",
-    run: async () => ({
-      provider: buildTokenHubProvider(),
-    }),
-  },
-};
-
-export default tencentProviderDiscovery;
+export default TENCENT_PROVIDER_CATALOG.staticDiscovery;

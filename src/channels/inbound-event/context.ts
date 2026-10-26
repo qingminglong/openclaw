@@ -3,6 +3,7 @@
  *
  * Converts route, sender, command, media, and supplemental facts into finalized message context.
  */
+import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import {
   commandTurnKindToSource,
   createCommandTurnContext,
@@ -12,16 +13,23 @@ import {
   finalizeInboundContext as finalizeCoreInboundContext,
   type FinalizeInboundContextOptions,
 } from "../../auto-reply/reply/inbound-context.js";
-import {
-  normalizeInboundTextNewlines,
-  sanitizeInboundSystemTags,
-} from "../../auto-reply/reply/inbound-text.js";
-import type { FinalizedMsgContext } from "../../auto-reply/templating.js";
+import { normalizeInboundTextNewlines } from "../../auto-reply/reply/inbound-text.js";
+import type {
+  FinalizedMsgContext,
+  MentionSource,
+  SessionTranscriptContext,
+} from "../../auto-reply/templating.js";
 import type { ContextVisibilityMode } from "../../config/types.base.js";
+import type { GroupToolPolicyConfig } from "../../config/types.tools.js";
 import type { PluginHookChannelContext } from "../../plugins/hook-channel-context.types.js";
 import { shouldIncludeSupplementalContext } from "../../security/context-visibility.js";
+import { copyConversationBindingRouteFacts } from "../conversation-binding-route-facts.js";
+import type { InboundImplicitMentionKind } from "../mention-gating.js";
 import type {
-  AccessFacts,
+  ChannelIngressCommandAccess,
+  ResolvedChannelMessageIngress,
+} from "../message-access/runtime-types.js";
+import type {
   CommandFacts,
   ConversationFacts,
   InboundMediaFacts,
@@ -31,6 +39,7 @@ import type {
   SenderFacts,
   SupplementalContextFacts,
 } from "../turn/types.js";
+import { createHostChannelInboundEventContextBuilder } from "./host-context-builder.js";
 import type { InboundEventKind } from "./kind.js";
 import { buildChannelInboundMediaPayload } from "./media.js";
 
@@ -54,8 +63,22 @@ export type ChannelInboundSupplementalResolutionOptions = {
   suppressSelfQuoteBody?: boolean;
   suppressSelfQuoteMedia?: boolean;
 };
-type BuildAccessFacts = Omit<AccessFacts, "commands"> & {
-  commands?: Partial<NonNullable<AccessFacts["commands"]>>;
+type BuildChannelInboundEventAccess = {
+  commands?: Pick<ChannelIngressCommandAccess, "authorized">;
+  /** @deprecated Resolve policy through security.resolveDirectToolPolicy or groups.resolveToolPolicy. Retained for the original external request until a later stable release after an announced deprecation window and explicit maintainer approval; no removal date is set. */
+  toolPolicy?: GroupToolPolicyConfig;
+  mentions?: {
+    canDetectMention: boolean;
+    wasMentioned: boolean;
+    hasAnyMention?: boolean;
+    explicitlyMentionedBot?: boolean;
+    mentionedUserIds?: string[];
+    mentionedSubteamIds?: string[];
+    mentionSource?: MentionSource;
+    implicitMentionKinds?: readonly InboundImplicitMentionKind[];
+    requireMention?: boolean;
+    effectiveWasMentioned?: boolean;
+  };
 };
 
 export type BuildChannelInboundEventContextParams = {
@@ -72,7 +95,8 @@ export type BuildChannelInboundEventContextParams = {
   route: RouteFacts;
   reply: ReplyPlanFacts;
   message: MessageFacts;
-  access?: BuildAccessFacts;
+  sessionTranscript?: SessionTranscriptContext;
+  access?: BuildChannelInboundEventAccess;
   command?: CommandFacts;
   commandTurn?: CommandTurnContext;
   media?: InboundMediaFacts[];
@@ -82,6 +106,11 @@ export type BuildChannelInboundEventContextParams = {
   finalize?: FinalizeInboundContextFn;
   finalizeOptions?: FinalizeInboundContextOptions;
   extra?: Record<string, unknown>;
+  /** Exact host-resolved ingress result, or an explicit unsupported adapter marker. */
+  channelIngress?:
+    | ResolvedChannelMessageIngress
+    | readonly ResolvedChannelMessageIngress[]
+    | "unsupported";
 };
 /**
  * @deprecated Prefer `BuildChannelInboundEventContextParams` with
@@ -90,10 +119,7 @@ export type BuildChannelInboundEventContextParams = {
 export type BuildChannelInboundEventContextAsyncParams = BuildChannelInboundEventContextParams &
   ChannelInboundSupplementalResolutionOptions;
 
-type UntrustedStructuredContextEntries = NonNullable<
-  FinalizedMsgContext["UntrustedStructuredContext"]
->;
-
+type ChannelStructuredContextEntries = NonNullable<FinalizedMsgContext["ChannelStructuredContext"]>;
 export type BuiltChannelInboundEventContext = FinalizedMsgContext & {
   Body: string;
   BodyForAgent: string;
@@ -145,22 +171,24 @@ export type FinalizeChannelInboundContextResult<T extends Record<string, unknown
   threadHidden: boolean;
 };
 
-function keepSupplementalContext(params: {
-  mode?: ContextVisibilityMode;
-  kind: "quote" | "forwarded" | "thread";
-  senderAllowed?: boolean;
-}): boolean {
-  if (!params.mode || params.mode === "all") {
-    return true;
+function filterSupplementalContext<T extends { senderAllowed?: boolean }>(
+  mode: ContextVisibilityMode | undefined,
+  kind: "quote" | "forwarded" | "thread",
+  context: T | undefined,
+): T | undefined {
+  if (!mode || mode === "all") {
+    return context;
   }
-  if (params.senderAllowed === undefined) {
-    return false;
+  if (context?.senderAllowed === undefined) {
+    return undefined;
   }
   return shouldIncludeSupplementalContext({
-    mode: params.mode,
-    kind: params.kind,
-    senderAllowed: params.senderAllowed,
-  });
+    mode,
+    kind,
+    senderAllowed: context.senderAllowed,
+  })
+    ? context
+    : undefined;
 }
 
 export function filterChannelInboundSupplementalContext(params: {
@@ -171,184 +199,36 @@ export function filterChannelInboundSupplementalContext(params: {
   if (!supplemental) {
     return undefined;
   }
-  const quote = keepSupplementalContext({
-    mode: params.contextVisibility,
-    kind: "quote",
-    senderAllowed: supplemental.quote?.senderAllowed,
-  })
-    ? supplemental.quote
-    : undefined;
-  const forwarded = keepSupplementalContext({
-    mode: params.contextVisibility,
-    kind: "forwarded",
-    senderAllowed: supplemental.forwarded?.senderAllowed,
-  })
-    ? supplemental.forwarded
-    : undefined;
-  const thread = keepSupplementalContext({
-    mode: params.contextVisibility,
-    kind: "thread",
-    senderAllowed: supplemental.thread?.senderAllowed,
-  })
-    ? supplemental.thread
-    : undefined;
-
   return {
     ...supplemental,
-    quote,
-    forwarded,
-    thread,
+    quote: filterSupplementalContext(params.contextVisibility, "quote", supplemental.quote),
+    forwarded: filterSupplementalContext(
+      params.contextVisibility,
+      "forwarded",
+      supplemental.forwarded,
+    ),
+    thread: filterSupplementalContext(params.contextVisibility, "thread", supplemental.thread),
   };
+}
+
+/** Resolves whether a supplemental-context sender passes the active group policy. */
+export function resolveInboundSupplementalSenderAllowed<TAllowFrom>(params: {
+  isGroup: boolean;
+  groupPolicy: string;
+  allowFrom: readonly TAllowFrom[];
+  isSenderAllowed: (allowFrom: readonly TAllowFrom[]) => boolean;
+}): boolean {
+  if (!params.isGroup || params.groupPolicy !== "allowlist") {
+    return true;
+  }
+  return params.isSenderAllowed(params.allowFrom);
 }
 
 export function filterChannelInboundQuoteContext(
   contextVisibility: ContextVisibilityMode | undefined,
   quote: SupplementalContextFacts["quote"] | undefined,
 ): SupplementalContextFacts["quote"] | undefined {
-  return filterChannelInboundSupplementalContext({
-    contextVisibility,
-    supplemental: quote ? { quote } : undefined,
-  })?.quote;
-}
-
-function definedFields<T extends Record<string, unknown>>(fields: T): Partial<T> {
-  return Object.fromEntries(
-    Object.entries(fields).filter(
-      (entry): entry is [string, Exclude<unknown, undefined>] => entry[1] !== undefined,
-    ),
-  ) as Partial<T>;
-}
-
-function isPromiseLike<T>(value: MaybePromise<T>): value is Promise<T> {
-  return Boolean(value) && typeof (value as { then?: unknown }).then === "function";
-}
-
-function stripQuoteRuntimeFields(
-  quote: ChannelInboundSupplementalQuoteFacts,
-): NonNullable<SupplementalContextFacts["quote"]> {
-  const { media: _media, isSelf: _isSelf, ...stripped } = quote;
-  return stripped;
-}
-
-function resolveChannelInboundSupplementalForFinalizer(params: {
-  supplemental?: SupplementalContextFacts | ChannelInboundSupplementalFacts;
-  contextVisibility?: ContextVisibilityMode;
-  media?: readonly InboundMediaFacts[];
-  resolveSupplementalMedia?: true;
-  suppressSelfQuoteBody?: boolean;
-  suppressSelfQuoteMedia?: boolean;
-}): MaybePromise<{
-  rawSupplemental?: SupplementalContextFacts | ChannelInboundSupplementalFacts;
-  supplemental?: SupplementalContextFacts;
-  media?: readonly InboundMediaFacts[];
-}> {
-  const rawSupplemental = params.supplemental;
-  const filtered = filterChannelInboundSupplementalContext({
-    supplemental: rawSupplemental,
-    contextVisibility: params.contextVisibility,
-  });
-  const media = [...(params.media ?? [])];
-  if (!rawSupplemental?.quote || !filtered?.quote) {
-    return { rawSupplemental, supplemental: filtered, media };
-  }
-
-  const quote = filtered.quote as ChannelInboundSupplementalQuoteFacts;
-  const selfQuote = quote.isSelf === true;
-  const suppressSelfQuoteBody = params.suppressSelfQuoteBody ?? true;
-  const suppressSelfQuoteMedia = params.suppressSelfQuoteMedia ?? true;
-  const finalizeQuote = (quoteMedia?: readonly InboundMediaFacts[] | null) => {
-    if (!(selfQuote && suppressSelfQuoteMedia)) {
-      media.push(...(quoteMedia ?? []));
-    }
-    const stripped = stripQuoteRuntimeFields(quote);
-    const visibleQuote =
-      selfQuote && suppressSelfQuoteBody
-        ? (({ body: _body, ...withoutBody }) => withoutBody)(stripped)
-        : stripped;
-    return {
-      rawSupplemental,
-      supplemental: {
-        ...filtered,
-        quote: visibleQuote,
-      },
-      media,
-    };
-  };
-
-  if (selfQuote && suppressSelfQuoteMedia) {
-    return finalizeQuote(undefined);
-  }
-  if (!params.resolveSupplementalMedia) {
-    return finalizeQuote(Array.isArray(quote.media) ? quote.media : undefined);
-  }
-  if (typeof quote.media !== "function") {
-    return finalizeQuote(quote.media);
-  }
-  const resolved = quote.media();
-  return isPromiseLike(resolved) ? resolved.then(finalizeQuote) : finalizeQuote(resolved);
-}
-
-/**
- * @deprecated Prefer `buildChannelInboundEventContext({ resolveSupplementalMedia: true })`
- * for channel inbound payloads.
- */
-export async function resolveChannelInboundSupplementalContext(params: {
-  supplemental?: ChannelInboundSupplementalFacts;
-  contextVisibility?: ContextVisibilityMode;
-  media?: readonly InboundMediaFacts[];
-  suppressSelfQuoteBody?: boolean;
-  suppressSelfQuoteMedia?: boolean;
-}): Promise<{
-  supplemental?: SupplementalContextFacts;
-  media: InboundMediaFacts[];
-  quoteHidden: boolean;
-}> {
-  const resolved = await resolveChannelInboundSupplementalForFinalizer({
-    ...params,
-    resolveSupplementalMedia: true,
-  });
-  return {
-    supplemental: resolved.supplemental,
-    media: [...(resolved.media ?? [])],
-    quoteHidden: Boolean(resolved.rawSupplemental?.quote && !resolved.supplemental?.quote),
-  };
-}
-
-function finalizePreparedChannelInboundContext<T extends Record<string, unknown>>(params: {
-  originalContext: T;
-  rawSupplemental?: SupplementalContextFacts | ChannelInboundSupplementalFacts;
-  supplemental?: SupplementalContextFacts;
-  media?: readonly InboundMediaFacts[];
-  finalize?: FinalizeInboundContextFn;
-  finalizeOptions?: FinalizeInboundContextOptions;
-}): FinalizeChannelInboundContextResult<T> {
-  const mediaPayload = params.media
-    ? definedFields(buildChannelInboundMediaPayload([...params.media]))
-    : {};
-  const baseContext = {
-    ...params.originalContext,
-    SupplementalContext: params.supplemental,
-    ...mediaPayload,
-  };
-  const untrustedStructuredContext = resolveUntrustedStructuredContext({
-    supplemental: params.supplemental,
-    extra: baseContext,
-  });
-  const finalize = params.finalize ?? finalizeCoreInboundContext;
-  const context = finalize(
-    {
-      ...baseContext,
-      UntrustedStructuredContext: untrustedStructuredContext,
-    },
-    params.finalizeOptions,
-  ) as T & FinalizedMsgContext;
-  return {
-    context,
-    supplemental: params.supplemental,
-    quoteHidden: Boolean(params.rawSupplemental?.quote && !params.supplemental?.quote),
-    forwardedHidden: Boolean(params.rawSupplemental?.forwarded && !params.supplemental?.forwarded),
-    threadHidden: Boolean(params.rawSupplemental?.thread && !params.supplemental?.thread),
-  };
+  return filterSupplementalContext(contextVisibility, "quote", quote);
 }
 
 /**
@@ -367,76 +247,137 @@ export function finalizeChannelInboundContext<T extends Record<string, unknown>>
 ): MaybePromise<FinalizeChannelInboundContextResult<T>> {
   const contextSupplemental = (params.context as { SupplementalContext?: SupplementalContextFacts })
     .SupplementalContext;
-  const prepared = resolveChannelInboundSupplementalForFinalizer({
-    supplemental: params.supplemental ?? contextSupplemental,
-    contextVisibility: params.contextVisibility,
-    media: params.media,
-    resolveSupplementalMedia: params.resolveSupplementalMedia,
-    suppressSelfQuoteBody: params.suppressSelfQuoteBody,
-    suppressSelfQuoteMedia: params.suppressSelfQuoteMedia,
-  });
-  const finish = (result: Awaited<typeof prepared>) =>
-    finalizePreparedChannelInboundContext({
-      originalContext: params.context,
-      finalize: params.finalize,
-      finalizeOptions: params.finalizeOptions,
-      ...result,
+  const prepareSupplemental = () => {
+    const rawSupplemental = params.supplemental ?? contextSupplemental;
+    const {
+      contextVisibility,
+      media: inputMedia,
+      resolveSupplementalMedia,
+      suppressSelfQuoteBody: suppressSelfQuoteBodyOption,
+      suppressSelfQuoteMedia: suppressSelfQuoteMediaOption,
+    } = params;
+    const filtered = filterChannelInboundSupplementalContext({
+      supplemental: rawSupplemental,
+      contextVisibility,
     });
+    const media = [...(inputMedia ?? [])];
+    if (!rawSupplemental?.quote || !filtered?.quote) {
+      return { rawSupplemental, supplemental: filtered, media };
+    }
+
+    const quote = filtered.quote as ChannelInboundSupplementalQuoteFacts;
+    const selfQuote = quote.isSelf === true;
+    const suppressSelfQuoteBody = suppressSelfQuoteBodyOption ?? false;
+    const suppressSelfQuoteMedia = suppressSelfQuoteMediaOption ?? true;
+    const finalizeQuote = (quoteMedia?: readonly InboundMediaFacts[] | null) => {
+      if (!(selfQuote && suppressSelfQuoteMedia)) {
+        media.push(...(quoteMedia ?? []));
+      }
+      const { media: _media, isSelf: _isSelf, ...stripped } = quote;
+      const visibleQuote =
+        selfQuote && suppressSelfQuoteBody
+          ? (({ body: _body, ...withoutBody }) => withoutBody)(stripped)
+          : stripped;
+      return {
+        rawSupplemental,
+        supplemental: {
+          ...filtered,
+          quote: visibleQuote,
+        },
+        media,
+      };
+    };
+
+    if (selfQuote && suppressSelfQuoteMedia) {
+      return finalizeQuote(undefined);
+    }
+    if (!resolveSupplementalMedia) {
+      return finalizeQuote(Array.isArray(quote.media) ? quote.media : undefined);
+    }
+    if (typeof quote.media !== "function") {
+      return finalizeQuote(quote.media);
+    }
+    const resolved = quote.media();
+    return isPromiseLike(resolved) ? resolved.then(finalizeQuote) : finalizeQuote(resolved);
+  };
+  const prepared = prepareSupplemental();
+  const finish = (result: Awaited<typeof prepared>): FinalizeChannelInboundContextResult<T> => {
+    const { context: originalContext, finalize: customFinalize, finalizeOptions } = params;
+    const { rawSupplemental, supplemental, media } = result;
+    const mediaPayload = Object.fromEntries(
+      Object.entries(buildChannelInboundMediaPayload(media)).filter(
+        ([, value]) => value !== undefined,
+      ),
+    );
+    const baseContext = {
+      ...originalContext,
+      SupplementalContext: supplemental,
+      media: [...media],
+      ...mediaPayload,
+    };
+    const entries: ChannelStructuredContextEntries = [];
+    const extraEntries =
+      baseContext.ChannelStructuredContext ?? baseContext.UntrustedStructuredContext;
+    if (Array.isArray(extraEntries)) {
+      entries.push(...(extraEntries as ChannelStructuredContextEntries));
+    }
+    const supplementalEntries =
+      supplemental?.channelStructuredContext ?? supplemental?.untrustedContext;
+    if (supplementalEntries !== undefined) {
+      entries.push(...supplementalEntries);
+    }
+
+    // User-controlled group prompt metadata must stay out of GroupSystemPrompt.
+    // Keeping it with untrusted context preserves its user-role boundary.
+    const groupPrompt = normalizeUntrustedGroupPrompt(supplemental?.untrustedGroupSystemPrompt);
+    if (groupPrompt) {
+      entries.push({
+        label: "Group prompt context",
+        type: "group_prompt_context",
+        payload: { text: groupPrompt },
+      });
+    }
+
+    const contextProvided =
+      extraEntries !== undefined || supplementalEntries !== undefined || groupPrompt !== undefined;
+    const channelStructuredContext = contextProvided ? entries : undefined;
+    const finalize = customFinalize ?? finalizeCoreInboundContext;
+    const context = finalize(
+      {
+        ...baseContext,
+        ...(channelStructuredContext !== undefined
+          ? { ChannelStructuredContext: channelStructuredContext }
+          : {}),
+      },
+      finalizeOptions,
+    ) as T & FinalizedMsgContext;
+    return {
+      context,
+      supplemental,
+      quoteHidden: Boolean(rawSupplemental?.quote && !supplemental?.quote),
+      forwardedHidden: Boolean(rawSupplemental?.forwarded && !supplemental?.forwarded),
+      threadHidden: Boolean(rawSupplemental?.thread && !supplemental?.thread),
+    };
+  };
   if (params.resolveSupplementalMedia) {
     return Promise.resolve(prepared).then(finish);
   }
   return isPromiseLike(prepared) ? prepared.then(finish) : finish(prepared);
 }
 
-function resolveAccessFactsCommandAuthorized(
-  access: BuildAccessFacts | undefined,
-): boolean | undefined {
-  const commands = access?.commands;
-  return typeof commands?.authorized === "boolean"
-    ? commands.authorized
-    : commands?.authorizers?.some((entry) => entry.allowed);
-}
-
 function normalizeUntrustedGroupPrompt(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
-  const normalized = sanitizeInboundSystemTags(normalizeInboundTextNewlines(value));
+  const normalized = normalizeInboundTextNewlines(value);
   return normalized.trim().length > 0 ? normalized : undefined;
-}
-
-function resolveUntrustedStructuredContext(params: {
-  supplemental?: SupplementalContextFacts;
-  extra?: Record<string, unknown>;
-}): UntrustedStructuredContextEntries | undefined {
-  const entries: UntrustedStructuredContextEntries = [];
-  const extraEntries = params.extra?.UntrustedStructuredContext;
-  if (Array.isArray(extraEntries)) {
-    entries.push(...(extraEntries as UntrustedStructuredContextEntries));
-  }
-  entries.push(...(params.supplemental?.untrustedContext ?? []));
-
-  // User-controlled group prompt metadata must stay out of GroupSystemPrompt.
-  // Keeping it with untrusted context prevents spoofed system markers from gaining prompt authority.
-  const groupPrompt = normalizeUntrustedGroupPrompt(
-    params.supplemental?.untrustedGroupSystemPrompt,
-  );
-  if (groupPrompt) {
-    entries.push({
-      label: "Group prompt context",
-      type: "group_prompt_context",
-      payload: { text: groupPrompt },
-    });
-  }
-
-  return entries.length > 0 ? entries : undefined;
 }
 
 function resolveChannelCommandContext(params: {
   command?: CommandFacts;
   commandTurn?: CommandTurnContext;
   message: MessageFacts;
-  access?: BuildAccessFacts;
+  access?: BuildChannelInboundEventAccess;
 }): CommandTurnContext | undefined {
   if (params.commandTurn) {
     return params.commandTurn;
@@ -450,7 +391,7 @@ function resolveChannelCommandContext(params: {
     authorized:
       command.kind === "normal"
         ? false
-        : (command.authorized ?? resolveAccessFactsCommandAuthorized(params.access) === true),
+        : (command.authorized ?? params.access?.commands?.authorized === true),
     commandName: command.name,
     body,
   });
@@ -466,19 +407,43 @@ export function buildChannelInboundEventContext(
   params: BuildChannelInboundEventContextParams &
     Partial<ChannelInboundSupplementalResolutionOptions>,
 ): MaybePromise<BuiltChannelInboundEventContext> {
+  return buildChannelInboundEventContextValue(params);
+}
+
+const buildHostChannelInboundEventContextValue = createHostChannelInboundEventContextBuilder(
+  buildChannelInboundEventContextValue,
+);
+
+/** Core-only ownerless boundary for explicit unsupported or unknown evidence. */
+export function buildHostChannelInboundEventContext(
+  params: BuildChannelInboundEventContextAsyncParams,
+): Promise<BuiltChannelInboundEventContext>;
+export function buildHostChannelInboundEventContext(
+  params: BuildChannelInboundEventContextParams,
+): BuiltChannelInboundEventContext;
+export function buildHostChannelInboundEventContext(
+  params: BuildChannelInboundEventContextParams &
+    Partial<ChannelInboundSupplementalResolutionOptions>,
+): MaybePromise<BuiltChannelInboundEventContext> {
+  return buildHostChannelInboundEventContextValue(params);
+}
+
+function buildChannelInboundEventContextValue(
+  params: BuildChannelInboundEventContextParams &
+    Partial<ChannelInboundSupplementalResolutionOptions>,
+): MaybePromise<BuiltChannelInboundEventContext> {
   const body = params.message.body ?? params.message.rawBody;
-  const commandTurn = resolveChannelCommandContext({
-    command: params.command,
-    commandTurn: params.commandTurn,
-    message: params.message,
-    access: params.access,
-  });
+  const commandTurn = resolveChannelCommandContext(params);
 
   const context = {
     Body: body,
     InboundEventKind: params.message.inboundEventKind ?? "user_request",
     BodyForAgent: params.message.bodyForAgent ?? params.message.rawBody,
     InboundHistory: params.message.inboundHistory,
+    SessionTranscriptContext:
+      params.sessionTranscript && params.sessionTranscript.historyLimit > 0
+        ? params.sessionTranscript
+        : undefined,
     SourceModality: params.message.sourceModality,
     RawBody: params.message.rawBody,
     CommandBody: params.message.commandBody ?? params.message.rawBody,
@@ -487,6 +452,7 @@ export function buildChannelInboundEventContext(
     To: params.reply.to,
     SessionKey: params.route.dispatchSessionKey ?? params.route.routeSessionKey,
     AgentId: params.route.agentId,
+    DmScope: params.route.dmScope,
     AccountId: params.route.accountId ?? params.accountId,
     ParentSessionKey: params.route.parentSessionKey,
     ModelParentSessionKey: params.route.modelParentSessionKey,
@@ -496,6 +462,7 @@ export function buildChannelInboundEventContext(
     ReplyToIdFull: params.reply.replyToIdFull,
     ChatType: params.conversation.kind,
     ChatId: params.conversation.id,
+    ConversationRoutePeerId: params.conversation.routePeer?.id,
     ConversationLabel: params.conversation.label,
     GroupSubject: params.conversation.kind !== "direct" ? params.conversation.label : undefined,
     GroupSpace: params.conversation.spaceId,
@@ -503,26 +470,36 @@ export function buildChannelInboundEventContext(
     SenderId: params.sender.id,
     SenderUsername: params.sender.username,
     SenderTag: params.sender.tag,
+    SenderIsBot: params.sender.isBot,
+    SenderIsSelf: params.sender.isSelf === true ? true : undefined,
     MemberRoleIds: params.sender.roles,
     Timestamp: params.timestamp,
     Provider: params.provider ?? params.channel,
     Surface: params.surface ?? params.provider ?? params.channel,
     WasMentioned: params.access?.mentions?.wasMentioned,
+    GroupRequireMention: params.access?.mentions?.requireMention,
     ExplicitlyMentionedBot: params.access?.mentions?.explicitlyMentionedBot,
     MentionedUserIds: params.access?.mentions?.mentionedUserIds,
     MentionedSubteamIds: params.access?.mentions?.mentionedSubteamIds,
     ImplicitMentionKinds: params.access?.mentions?.implicitMentionKinds,
     MentionSource: params.access?.mentions?.mentionSource,
-    CommandAuthorized: resolveAccessFactsCommandAuthorized(params.access) === true,
+    CommandAuthorized: params.access?.commands?.authorized === true,
+    ConversationToolPolicy: params.access?.toolPolicy,
     CommandTurn: commandTurn,
     MessageThreadId: params.reply.messageThreadId ?? params.conversation.threadId,
     NativeChannelId: params.reply.nativeChannelId ?? params.conversation.nativeChannelId,
+    ConversationAvatar: params.conversation.avatar,
     ChannelContext: params.channelContext,
     OriginatingChannel: params.channel,
     OriginatingTo: params.reply.originatingTo ?? params.reply.to,
     ThreadParentId: params.reply.threadParentId ?? params.conversation.parentId,
+    // This builder is the post-admission boundary for channel events. Preserve
+    // that fact so interceptors cannot bypass sender, route, or pairing gates.
+    InboundAccessAuthorized: true,
+    ConversationRouteContextObserved: params.conversation.routePeer ? true : undefined,
     ...params.extra,
   };
+  copyConversationBindingRouteFacts(params.route, context);
   const finalizeParams = {
     finalize: params.finalize,
     finalizeOptions: params.finalizeOptions,
@@ -539,7 +516,7 @@ export function buildChannelInboundEventContext(
         suppressSelfQuoteMedia: params.suppressSelfQuoteMedia,
       })
     : finalizeChannelInboundContext(finalizeParams);
-  return isPromiseLike(result)
-    ? result.then((finalized) => finalized.context as BuiltChannelInboundEventContext)
-    : (result.context as BuiltChannelInboundEventContext);
+  const unwrap = (finalized: FinalizeChannelInboundContextResult<typeof context>) =>
+    finalized.context as BuiltChannelInboundEventContext;
+  return isPromiseLike(result) ? result.then(unwrap) : unwrap(result);
 }

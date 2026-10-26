@@ -10,38 +10,25 @@ export type ReadByteStreamWithLimitOptions = {
   onOverflow?: (params: ByteStreamLimitOverflow) => Error;
 };
 
-function normalizeByteChunk(chunk: unknown): Buffer {
-  if (Buffer.isBuffer(chunk)) {
-    return chunk;
-  }
-  if (typeof chunk === "string") {
-    return Buffer.from(chunk);
-  }
-  if (chunk instanceof ArrayBuffer) {
-    return Buffer.from(chunk);
-  }
-  if (ArrayBuffer.isView(chunk)) {
-    return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-  }
-  throw new TypeError(`Unsupported byte stream chunk: ${typeof chunk}`);
-}
-
 function destroyReadableOnOverflow(stream: unknown, err: Error): void {
   const readable = stream as {
-    destroy?: (error?: Error) => unknown;
+    destroy?: () => unknown;
     cancel?: (reason?: unknown) => unknown;
   };
   // Stop upstream producers immediately after overflow; otherwise large media
   // streams can continue buffering after the caller has already failed.
   if (typeof readable.destroy === "function") {
     try {
-      readable.destroy(err);
+      // The helper already throws the overflow error to its caller. Passing the
+      // same error to destroy() also emits it on Node streams, which can become
+      // an unrelated uncaught exception after the awaited rejection settles.
+      readable.destroy();
     } catch {}
     return;
   }
   if (typeof readable.cancel === "function") {
     try {
-      void readable.cancel(err);
+      void Promise.resolve(readable.cancel(err)).catch(() => undefined);
     } catch {}
   }
 }
@@ -64,7 +51,18 @@ export async function readByteStreamWithLimit(
   let total = 0;
 
   for await (const chunk of stream) {
-    const buffer = normalizeByteChunk(chunk);
+    let buffer: Buffer;
+    if (Buffer.isBuffer(chunk)) {
+      buffer = chunk;
+    } else if (typeof chunk === "string") {
+      buffer = Buffer.from(chunk);
+    } else if (chunk instanceof ArrayBuffer) {
+      buffer = Buffer.from(chunk);
+    } else if (ArrayBuffer.isView(chunk)) {
+      buffer = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    } else {
+      throw new TypeError(`Unsupported byte stream chunk: ${typeof chunk}`);
+    }
     if (buffer.byteLength === 0) {
       continue;
     }

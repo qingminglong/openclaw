@@ -1,34 +1,31 @@
-// Openai plugin module implements embedding batch behavior.
+import { coerceErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
-  applyEmbeddingBatchOutputLine,
   buildBatchHeaders,
   buildEmbeddingBatchGroupOptions,
   EMBEDDING_BATCH_ENDPOINT,
   extractBatchErrorMessage,
+  formatBatchErrorDetail,
   formatUnavailableBatchError,
-  normalizeBatchBaseUrl,
   postJsonWithRetry,
-  resolveBatchCompletionFromStatus,
-  resolveCompletedBatchResult,
-  runEmbeddingBatchGroups,
-  throwIfBatchTerminalFailure,
+  resolveEmbeddingEndpointUrl,
+  runEmbeddingBatches,
+  type EmbeddingBatchExecutionParams,
   type EmbeddingBatchStatus,
-  type BatchCompletionResult,
   type ProviderBatchOutputLine,
   uploadBatchJsonlFile,
+  waitForEmbeddingBatch,
   withRemoteHttpResponse,
 } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
-import { readResponseTextLimited } from "openclaw/plugin-sdk/provider-http";
+import {
+  assertOkOrThrowProviderError,
+  createProviderOperationDeadline,
+  readProviderJsonResponse,
+  readProviderTextResponse,
+  resolveProviderOperationTimeoutMs,
+  waitProviderOperationPollInterval,
+} from "openclaw/plugin-sdk/provider-http";
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { OpenAiEmbeddingClient } from "./embedding-provider.js";
-
-type EmbeddingBatchExecutionParams = {
-  wait: boolean;
-  pollIntervalMs: number;
-  timeoutMs: number;
-  concurrency: number;
-  debug?: (message: string, data?: Record<string, unknown>) => void;
-};
 
 type OpenAiBatchRequest = {
   custom_id: string;
@@ -47,7 +44,6 @@ type OpenAiBatchStatus = EmbeddingBatchStatus & {
     failed?: number;
   };
 };
-type OpenAiBatchOutputLine = ProviderBatchOutputLine;
 
 export const OPENAI_BATCH_ENDPOINT = EMBEDDING_BATCH_ENDPOINT;
 const OPENAI_BATCH_COMPLETION_WINDOW = "24h";
@@ -56,14 +52,12 @@ const OPENAI_BATCH_MAX_REQUESTS = 50000;
 // splitter avoids boundary-size uploads while preserving source-wide batching.
 const OPENAI_BATCH_MAX_JSONL_BYTES = 190 * 1024 * 1024;
 const OPENAI_BATCH_MAX_POLL_BACKOFF_MS = 5 * 60_000;
-const OPENAI_BATCH_ERROR_BODY_LIMIT_BYTES = 8 * 1024;
 
 async function submitOpenAiBatch(params: {
   openAi: OpenAiEmbeddingClient;
   requests: OpenAiBatchRequest[];
   agentId: string;
 }): Promise<OpenAiBatchStatus> {
-  const baseUrl = normalizeBatchBaseUrl(params.openAi);
   const inputFileId = await uploadBatchJsonlFile({
     client: params.openAi,
     requests: params.requests,
@@ -71,10 +65,11 @@ async function submitOpenAiBatch(params: {
   });
 
   return await postJsonWithRetry<OpenAiBatchStatus>({
-    url: `${baseUrl}/batches`,
+    url: resolveEmbeddingEndpointUrl(params.openAi.baseUrl, "batches"),
     headers: buildBatchHeaders(params.openAi, { json: true }),
     ssrfPolicy: params.openAi.ssrfPolicy,
     fetchImpl: params.openAi.fetchImpl,
+    resolveRequestHeaders: params.openAi.resolveRequestHeaders,
     body: {
       input_file_id: inputFileId,
       endpoint: OPENAI_BATCH_ENDPOINT,
@@ -88,60 +83,38 @@ async function submitOpenAiBatch(params: {
   });
 }
 
-async function fetchOpenAiBatchStatus(params: {
-  openAi: OpenAiEmbeddingClient;
-  batchId: string;
-}): Promise<OpenAiBatchStatus> {
-  return await fetchOpenAiBatchResource({
-    openAi: params.openAi,
-    path: `/batches/${params.batchId}`,
-    errorPrefix: "openai batch status",
-    parse: async (res) => (await res.json()) as OpenAiBatchStatus,
-  });
-}
-
-async function fetchOpenAiFileContent(params: {
-  openAi: OpenAiEmbeddingClient;
-  fileId: string;
-}): Promise<string> {
-  return await fetchOpenAiBatchResource({
-    openAi: params.openAi,
-    path: `/files/${params.fileId}/content`,
-    errorPrefix: "openai batch file content",
-    parse: async (res) => await res.text(),
-  });
-}
-
 async function fetchOpenAiBatchResource<T>(params: {
   openAi: OpenAiEmbeddingClient;
   path: string;
-  errorPrefix: string;
+  label: string;
+  signal?: AbortSignal;
   parse: (res: Response) => Promise<T>;
 }): Promise<T> {
-  const baseUrl = normalizeBatchBaseUrl(params.openAi);
   return await withRemoteHttpResponse({
-    url: `${baseUrl}${params.path}`,
+    url: resolveEmbeddingEndpointUrl(params.openAi.baseUrl, params.path),
     ssrfPolicy: params.openAi.ssrfPolicy,
     fetchImpl: params.openAi.fetchImpl,
+    resolveRequestHeaders: params.openAi.resolveRequestHeaders,
+    signal: params.signal,
     init: {
       headers: buildBatchHeaders(params.openAi, { json: true }),
     },
-    onResponse: async (res) => {
-      if (!res.ok) {
-        const text = await readResponseTextLimited(res, OPENAI_BATCH_ERROR_BODY_LIMIT_BYTES);
-        throw new Error(`${params.errorPrefix} failed: ${res.status} ${text}`);
-      }
+    onResponse: async (res, requestHeaders) => {
+      await assertOkOrThrowProviderError(res, params.label, {
+        requestHeaders,
+        signal: params.signal,
+      });
       return await params.parse(res);
     },
   });
 }
 
-function formatOpenAiBatchError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function formatOpenAiBatchDiagnostic(error: unknown): string {
+  return formatBatchErrorDetail(coerceErrorMessage(error)) ?? "unknown error";
 }
 
 function isOpenAiBatchUploadTooLargeError(error: unknown): boolean {
-  const message = formatOpenAiBatchError(error);
+  const message = coerceErrorMessage(error);
   if (!/openai batch file upload failed/i.test(message)) {
     return false;
   }
@@ -155,17 +128,16 @@ function isOpenAiBatchUploadTooLargeError(error: unknown): boolean {
   );
 }
 
-export function parseOpenAiBatchOutput(text: string): OpenAiBatchOutputLine[] {
-  if (!text.trim()) {
-    return [];
+function parseOpenAiBatchOutput(text: string): ProviderBatchOutputLine[] {
+  return normalizeStringEntries(text.split("\n")).map(parseOpenAiBatchOutputLine);
+}
+
+function parseOpenAiBatchOutputLine(line: string): ProviderBatchOutputLine {
+  try {
+    return JSON.parse(line) as ProviderBatchOutputLine;
+  } catch {
+    throw new Error("OpenAI embedding batch output contained malformed JSONL");
   }
-  return normalizeStringEntries(text.split("\n")).map((line) => {
-    try {
-      return JSON.parse(line) as OpenAiBatchOutputLine;
-    } catch {
-      throw new Error("OpenAI embedding batch output contained malformed JSONL");
-    }
-  });
 }
 
 async function readOpenAiBatchError(params: {
@@ -173,32 +145,17 @@ async function readOpenAiBatchError(params: {
   errorFileId: string;
 }): Promise<string | undefined> {
   try {
-    const content = await fetchOpenAiFileContent({
+    const content = await fetchOpenAiBatchResource({
       openAi: params.openAi,
-      fileId: params.errorFileId,
+      path: `/files/${params.errorFileId}/content`,
+      label: "openai.batch-file-content",
+      parse: (res) => readProviderTextResponse(res, "openai.batch-file-content"),
     });
     const lines = parseOpenAiBatchOutput(content);
-    return extractBatchErrorMessage(lines);
+    return formatBatchErrorDetail(extractBatchErrorMessage(lines));
   } catch (err) {
     return formatUnavailableBatchError(err);
   }
-}
-
-function createOpenAiBatchPollBackoff(params: { pollIntervalMs: number; timeoutMs: number }): {
-  nextDelayMs: () => number;
-} {
-  const maxDelayMs = Math.max(
-    params.pollIntervalMs,
-    Math.min(params.timeoutMs, OPENAI_BATCH_MAX_POLL_BACKOFF_MS),
-  );
-  let delayMs = params.pollIntervalMs;
-  return {
-    nextDelayMs: () => {
-      const current = delayMs;
-      delayMs = Math.min(maxDelayMs, current * 2);
-      return current;
-    },
-  };
 }
 
 function formatOpenAiBatchProgress(status: OpenAiBatchStatus): string {
@@ -211,94 +168,19 @@ function formatOpenAiBatchProgress(status: OpenAiBatchStatus): string {
   return `; progress ${completed}/${counts.total} failed=${failed}`;
 }
 
-function formatOpenAiBatchPollError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 function isRetryableOpenAiBatchPollError(error: unknown): boolean {
-  const message = formatOpenAiBatchPollError(error);
+  const message = coerceErrorMessage(error);
+  const status =
+    error && typeof error === "object" ? (error as { status?: unknown }).status : undefined;
   return (
-    /openai batch status failed: (408|409|425|429|5\d\d)\b/i.test(message) ||
+    (typeof status === "number" &&
+      (status === 408 ||
+        status === 409 ||
+        status === 425 ||
+        status === 429 ||
+        (status >= 500 && status <= 599))) ||
     /\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN)\b|fetch failed|network error/i.test(message)
   );
-}
-
-async function waitForOpenAiBatch(params: {
-  openAi: OpenAiEmbeddingClient;
-  batchId: string;
-  wait: boolean;
-  pollIntervalMs: number;
-  timeoutMs: number;
-  debug?: (message: string, data?: Record<string, unknown>) => void;
-  initial?: OpenAiBatchStatus;
-}): Promise<BatchCompletionResult> {
-  const start = Date.now();
-  const pollBackoff = createOpenAiBatchPollBackoff(params);
-  let current: OpenAiBatchStatus | undefined = params.initial;
-  while (true) {
-    let status: OpenAiBatchStatus;
-    try {
-      status =
-        current ??
-        (await fetchOpenAiBatchStatus({
-          openAi: params.openAi,
-          batchId: params.batchId,
-        }));
-    } catch (error) {
-      if (!params.wait || !isRetryableOpenAiBatchPollError(error)) {
-        throw error;
-      }
-      if (Date.now() - start > params.timeoutMs) {
-        throw new Error(`openai batch ${params.batchId} timed out after ${params.timeoutMs}ms`, {
-          cause: error,
-        });
-      }
-      const delayMs = pollBackoff.nextDelayMs();
-      params.debug?.(
-        `openai batch ${params.batchId} status check failed: ${formatOpenAiBatchPollError(
-          error,
-        )}; waiting ${delayMs}ms`,
-      );
-      await new Promise((resolve) => {
-        setTimeout(resolve, delayMs);
-      });
-      current = undefined;
-      continue;
-    }
-    const state = status.status ?? "unknown";
-    if (state === "completed") {
-      return resolveBatchCompletionFromStatus({
-        provider: "openai",
-        batchId: params.batchId,
-        status,
-      });
-    }
-    await throwIfBatchTerminalFailure({
-      provider: "openai",
-      status: { ...status, id: params.batchId },
-      readError: async (errorFileId) =>
-        await readOpenAiBatchError({
-          openAi: params.openAi,
-          errorFileId,
-        }),
-    });
-    if (!params.wait) {
-      throw new Error(`openai batch ${params.batchId} still ${state}; wait disabled`);
-    }
-    if (Date.now() - start > params.timeoutMs) {
-      throw new Error(`openai batch ${params.batchId} timed out after ${params.timeoutMs}ms`);
-    }
-    const delayMs = pollBackoff.nextDelayMs();
-    params.debug?.(
-      `openai batch ${params.batchId} ${state}${formatOpenAiBatchProgress(
-        status,
-      )}; waiting ${delayMs}ms`,
-    );
-    await new Promise((resolve) => {
-      setTimeout(resolve, delayMs);
-    });
-    current = undefined;
-  }
 }
 
 export async function runOpenAiEmbeddingBatches(
@@ -309,7 +191,8 @@ export async function runOpenAiEmbeddingBatches(
     maxJsonlBytes?: number;
   } & EmbeddingBatchExecutionParams,
 ): Promise<Map<string, number[]>> {
-  return await runEmbeddingBatchGroups({
+  return await runEmbeddingBatches({
+    provider: "openai",
     ...buildEmbeddingBatchGroupOptions(params, {
       maxRequests: OPENAI_BATCH_MAX_REQUESTS,
       maxJsonlBytes: params.maxJsonlBytes ?? OPENAI_BATCH_MAX_JSONL_BYTES,
@@ -321,64 +204,54 @@ export async function runOpenAiEmbeddingBatches(
         requests: group.length,
         parts: parts.map((part) => part.length),
         depth,
-        error: formatOpenAiBatchError(error),
+        error: formatOpenAiBatchDiagnostic(error),
       });
     },
-    runGroup: async ({ group, groupIndex, groups, byCustomId, pollIntervalMs, timeoutMs }) => {
-      const batchInfo = await submitOpenAiBatch({
+    submit: (group) =>
+      submitOpenAiBatch({ openAi: params.openAi, requests: group, agentId: params.agentId }),
+    readError: (errorFileId) => readOpenAiBatchError({ openAi: params.openAi, errorFileId }),
+    readOutput: (fileId, parse) =>
+      fetchOpenAiBatchResource({
         openAi: params.openAi,
-        requests: group,
-        agentId: params.agentId,
-      });
-      if (!batchInfo.id) {
-        throw new Error("openai batch create failed: missing batch id");
-      }
+        path: `/files/${fileId}/content`,
+        label: "openai.batch-file-content",
+        parse,
+      }),
+    waitForBatch: async (batchInfo, pollIntervalMs, timeoutMs) => {
       const batchId = batchInfo.id;
-
-      params.debug?.("memory embeddings: openai batch created", {
-        batchId: batchInfo.id,
-        status: batchInfo.status,
-        group: groupIndex + 1,
-        groups,
-        requests: group.length,
+      const { openAi, wait, debug } = params;
+      const deadline = createProviderOperationDeadline({
+        label: `openai batch ${batchId}`,
+        timeoutMs,
       });
-
-      const completed = await resolveCompletedBatchResult({
+      return await waitForEmbeddingBatch({
         provider: "openai",
-        status: batchInfo,
-        wait: params.wait,
-        waitForBatch: async () =>
-          await waitForOpenAiBatch({
-            openAi: params.openAi,
-            batchId,
-            wait: params.wait,
-            pollIntervalMs,
-            timeoutMs,
-            debug: params.debug,
-            initial: batchInfo,
+        batchId,
+        wait,
+        pollIntervalMs,
+        timeoutMs,
+        debug,
+        initial: batchInfo,
+        fetchStatus: (signal) =>
+          fetchOpenAiBatchResource({
+            openAi,
+            path: `/batches/${batchId}`,
+            label: "openai.batch-status",
+            signal,
+            parse: (res) => readProviderJsonResponse<OpenAiBatchStatus>(res, "openai.batch-status"),
           }),
+        resolveTimeoutMs: () =>
+          resolveProviderOperationTimeoutMs({ deadline, defaultTimeoutMs: timeoutMs }),
+        waitForPoll: (delayMs) =>
+          waitProviderOperationPollInterval({ deadline, pollIntervalMs: delayMs }),
+        readError: async (errorFileId) => await readOpenAiBatchError({ openAi, errorFileId }),
+        backoff: {
+          maxDelayMs: OPENAI_BATCH_MAX_POLL_BACKOFF_MS,
+          shouldRetry: isRetryableOpenAiBatchPollError,
+          formatError: formatOpenAiBatchDiagnostic,
+          formatProgress: formatOpenAiBatchProgress,
+        },
       });
-
-      const content = await fetchOpenAiFileContent({
-        openAi: params.openAi,
-        fileId: completed.outputFileId,
-      });
-      const outputLines = parseOpenAiBatchOutput(content);
-      const errors: string[] = [];
-      const remaining = new Set(group.map((request) => request.custom_id));
-
-      for (const line of outputLines) {
-        applyEmbeddingBatchOutputLine({ line, remaining, errors, byCustomId });
-      }
-
-      if (errors.length > 0) {
-        throw new Error(`openai batch ${batchInfo.id} failed: ${errors.join("; ")}`);
-      }
-      if (remaining.size > 0) {
-        throw new Error(
-          `openai batch ${batchInfo.id} missing ${remaining.size} embedding responses`,
-        );
-      }
     },
   });
 }

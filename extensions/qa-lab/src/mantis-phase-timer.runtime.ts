@@ -1,5 +1,4 @@
-// Qa Lab plugin module implements shared Mantis phase timing behavior.
-export type MantisPhaseTiming = {
+type MantisPhaseTiming = {
   durationMs: number;
   finishedAt: string;
   name: string;

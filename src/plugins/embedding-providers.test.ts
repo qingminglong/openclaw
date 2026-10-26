@@ -1,110 +1,96 @@
-// Covers plugin embedding provider registration and lookup.
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, expect, it } from "vitest";
+import { collectRegisteredEmbeddingProviderIds } from "./channel-plugin-ids.js";
+import { CORE_EMBEDDING_PROVIDERS } from "./core-embedding-providers.js";
 import {
-  clearEmbeddingProviders,
-  getEmbeddingProvider,
   getRegisteredEmbeddingProvider,
-  listEmbeddingProviders,
   listRegisteredEmbeddingProviders,
   registerEmbeddingProvider,
-  restoreEmbeddingProviders,
   restoreRegisteredEmbeddingProviders,
   type EmbeddingProviderAdapter,
 } from "./embedding-providers.js";
-
-const EMBEDDING_PROVIDERS_KEY = Symbol.for("openclaw.embeddingProviders");
-const INITIAL_REGISTERED_EMBEDDING_PROVIDERS = listRegisteredEmbeddingProviders();
+import { createEmptyPluginRegistry } from "./registry-empty.js";
+import {
+  captureActivePluginRegistrySnapshot,
+  rollbackStagedPluginRegistry,
+  stageActivePluginRegistry,
+  withPluginRegistrationContext,
+} from "./runtime.js";
 
 function createAdapter(id: string): EmbeddingProviderAdapter {
-  return {
-    id,
-    create: async () => ({ provider: null }),
-  };
+  return { id, create: async () => ({ provider: null }) };
 }
 
-beforeEach(() => {
-  clearEmbeddingProviders();
+beforeEach(({ onTestFinished }) => {
+  const previous = captureActivePluginRegistrySnapshot();
+  onTestFinished(() => {
+    rollbackStagedPluginRegistry(previous);
+  });
+  stageActivePluginRegistry(createEmptyPluginRegistry(), null, "default");
 });
 
-afterEach(() => {
-  restoreRegisteredEmbeddingProviders(INITIAL_REGISTERED_EMBEDDING_PROVIDERS);
+it("preserves owner metadata in registered snapshots", () => {
+  const adapter = createAdapter("local-compatible");
+  const entry = { adapter, ownerPluginId: "local-compatible" };
+
+  restoreRegisteredEmbeddingProviders([entry]);
+
+  expect(getRegisteredEmbeddingProvider("local-compatible")).toEqual(entry);
+  expect(listRegisteredEmbeddingProviders()).toEqual([...CORE_EMBEDDING_PROVIDERS, entry]);
 });
 
-describe("embedding provider registry", () => {
-  it("registers and lists adapters in insertion order", () => {
-    const alpha = createAdapter("alpha");
-    const beta = createAdapter("beta");
-
-    registerEmbeddingProvider(alpha);
-    registerEmbeddingProvider(beta);
-
-    expect(listEmbeddingProviders().map((adapter) => adapter.id)).toEqual([
-      "openai-compatible",
-      "alpha",
-      "beta",
-    ]);
-    expect(getEmbeddingProvider("alpha")).toBe(alpha);
-  });
-
-  it("restores adapter snapshots", () => {
-    const alpha = createAdapter("alpha");
-    const beta = createAdapter("beta");
-    registerEmbeddingProvider(alpha);
-
-    restoreEmbeddingProviders([beta]);
-
-    expect(getEmbeddingProvider("alpha")).toBeUndefined();
-    expect(getEmbeddingProvider("beta")).toBe(beta);
-    expect(listEmbeddingProviders().map((adapter) => adapter.id)).toEqual([
-      "openai-compatible",
-      "beta",
-    ]);
-  });
-
-  it("preserves owner metadata in registered snapshots", () => {
-    const adapter = createAdapter("local-compatible");
-    const entry = {
-      adapter,
-      ownerPluginId: "local-compatible",
-    };
-
-    restoreRegisteredEmbeddingProviders([entry]);
-
-    expect(getRegisteredEmbeddingProvider("local-compatible")).toEqual(entry);
-    expect(listRegisteredEmbeddingProviders()).toEqual([
-      INITIAL_REGISTERED_EMBEDDING_PROVIDERS[0],
-      entry,
-    ]);
-  });
-
-  it("keeps core providers from being shadowed by restored snapshots", () => {
-    const adapter = createAdapter("openai-compatible");
+it.each(CORE_EMBEDDING_PROVIDERS)(
+  "keeps core provider $adapter.id from being shadowed by restored snapshots",
+  (coreEntry) => {
+    const adapter = createAdapter(coreEntry.adapter.id);
 
     expect(() =>
-      restoreRegisteredEmbeddingProviders([
-        {
-          adapter,
-          ownerPluginId: "shadow",
-        },
-      ]),
-    ).toThrow("embedding provider already registered: openai-compatible (owner: core)");
+      restoreRegisteredEmbeddingProviders([{ adapter, ownerPluginId: "shadow" }]),
+    ).toThrow(`embedding provider already registered: ${adapter.id} (owner: core)`);
 
-    expect(getRegisteredEmbeddingProvider("openai-compatible")).toEqual(
-      INITIAL_REGISTERED_EMBEDDING_PROVIDERS[0],
-    );
+    expect(getRegisteredEmbeddingProvider(adapter.id)).toBe(coreEntry);
+  },
+);
+
+it("uses builder ownership without displacing another plugin's adapter", () => {
+  const building = createEmptyPluginRegistry();
+  const original = createAdapter("shared");
+  building.embeddingProviders.push({
+    pluginId: "first-plugin",
+    provider: original,
+    source: "runtime",
   });
 
-  it("stores adapters in a process-global singleton map", () => {
-    const adapter = createAdapter("local-protocol");
-    registerEmbeddingProvider(adapter, { ownerPluginId: "local-protocol" });
+  expect(() =>
+    withPluginRegistrationContext(building, "failing-plugin", () => {
+      registerEmbeddingProvider(createAdapter("shared"));
+    }),
+  ).toThrow("embedding provider shared already registered by first-plugin");
+  expect(building.embeddingProviders[0]?.provider).toBe(original);
 
-    const globalRegistry = (globalThis as Record<PropertyKey, unknown>)[
-      EMBEDDING_PROVIDERS_KEY
-    ] as Map<string, { adapter: EmbeddingProviderAdapter; ownerPluginId?: string }>;
-
-    expect(globalRegistry.get("local-protocol")).toEqual({
-      adapter,
-      ownerPluginId: "local-protocol",
-    });
+  withPluginRegistrationContext(building, "builder-plugin", () => {
+    registerEmbeddingProvider(createAdapter("owned"));
   });
+  expect(building.embeddingProviders[1]?.pluginId).toBe("builder-plugin");
 });
+
+// /status and the boot warning must agree on registered providers.
+it("unions registered embedding provider ids and aliases for startup diagnostics", () => {
+  const adapter = { ...createAdapter("global-embed"), aliases: ["global-alias"] };
+  registerEmbeddingProvider(adapter, { ownerPluginId: "p" });
+  const ids = collectRegisteredEmbeddingProviderIds({
+    embeddingProviders: [{ provider: { id: "gen-embed", aliases: ["gen-alias"] } }],
+  } as never);
+
+  expect(getRegisteredEmbeddingProvider("global-embed")).toEqual({ adapter, ownerPluginId: "p" });
+  expect(ids).toEqual(
+    new Set(["gen-embed", "gen-alias", "global-embed", "global-alias", ...registeredIds()]),
+  );
+});
+
+it("returns only the global registry ids when the runtime registry omits embedding providers", () => {
+  expect(collectRegisteredEmbeddingProviderIds({})).toEqual(new Set(registeredIds()));
+});
+
+function registeredIds() {
+  return listRegisteredEmbeddingProviders().map((entry) => entry.adapter.id);
+}

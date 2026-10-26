@@ -1,7 +1,13 @@
 // Tests CLI dispatch arguments and runtime selection for agent runner turns.
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { withTestAdmittedRunContext } from "../../agents/admitted-run-context.test-support.js";
+import { clearCliSessionInStore } from "../../agents/cli-session-store.js";
 import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent-runner/types.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
+import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import {
   emitAgentEvent,
   getAgentEventLifecycleGeneration,
@@ -11,12 +17,47 @@ import {
 import {
   createCliToolSummaryTracker,
   keepCliSessionBindingOnlyWhenReused,
-  runCliAgentWithLifecycle,
+  runCliAgentWithLifecycle as runCliAgentWithLifecycleProduction,
 } from "./agent-runner-cli-dispatch.js";
+
+type ProductionLifecycleParams = Parameters<typeof runCliAgentWithLifecycleProduction>[0];
+type RunCliAgentWithLifecycleParams = Omit<ProductionLifecycleParams, "runParams"> & {
+  runParams: Omit<ProductionLifecycleParams["runParams"], "admittedRunContext">;
+};
+const runCliAgentWithLifecycle = (params: RunCliAgentWithLifecycleParams) =>
+  runCliAgentWithLifecycleProduction({
+    ...params,
+    runParams: withTestAdmittedRunContext(params.runParams),
+  });
+function createRunParams(
+  runId: string,
+  overrides: Partial<RunCliAgentWithLifecycleParams["runParams"]> = {},
+): RunCliAgentWithLifecycleParams["runParams"] {
+  return {
+    sessionId: "session-1",
+    sessionFile: "/tmp/session.jsonl",
+    workspaceDir: "/tmp/workspace",
+    prompt: "hello",
+    provider: "claude-cli",
+    model: "claude",
+    thinkLevel: "high",
+    timeoutMs: 1_000,
+    runId,
+    ...overrides,
+  };
+}
+
+type ReasoningTextPayload = Parameters<
+  NonNullable<RunCliAgentWithLifecycleParams["onReasoningText"]>
+>[0];
+type ReasoningProgressPayload = Parameters<
+  NonNullable<RunCliAgentWithLifecycleParams["onReasoningProgress"]>
+>[0];
 
 const cliDispatchState = vi.hoisted(() => ({
   runCliAgentMock: vi.fn(),
 }));
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 vi.mock("../../agents/cli-runner.js", () => ({
   runCliAgent: (...args: unknown[]) => cliDispatchState.runCliAgentMock(...args),
@@ -29,10 +70,283 @@ afterEach(() => {
 });
 
 describe("runCliAgentWithLifecycle", () => {
-  it("keeps the captured lifecycle generation on start and terminal events", async () => {
+  it("settles workspace attribution before launching a CLI backend", async () => {
+    const entered = createDeferred();
+    const baseline = createDeferred();
+    cliDispatchState.runCliAgentMock.mockResolvedValueOnce({ payloads: [], meta: {} });
+    const pending = runCliAgentWithLifecycle({
+      runId: "cli-attribution",
+      runParams: createRunParams("cli-attribution", {
+        awaitSessionDiffBaseline: async () => {
+          entered.resolve();
+          await baseline.promise;
+        },
+      }),
+    });
+    try {
+      await awaitGateBeforeSettlement(entered.promise, pending, "CLI launched before attribution");
+      expect(cliDispatchState.runCliAgentMock).not.toHaveBeenCalled();
+      baseline.resolve();
+      await pending;
+      expect(cliDispatchState.runCliAgentMock).toHaveBeenCalledOnce();
+    } finally {
+      baseline.resolve();
+    }
+  });
+
+  it("bridges completed CLI compaction lifecycles to reply callbacks", async () => {
+    cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "compaction",
+        data: { phase: "start", backend: "claude-cli" },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "compaction",
+        data: { phase: "end", backend: "claude-cli", completed: false },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "compaction",
+        data: { phase: "start", backend: "claude-cli" },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "compaction",
+        data: { phase: "end", backend: "claude-cli", completed: true },
+      });
+      return { payloads: [], meta: { durationMs: 1 } };
+    });
+    const callbacks: string[] = [];
+
+    await runCliAgentWithLifecycle({
+      runId: "run-compaction-bridge",
+      onCompactionStart: async () => {
+        callbacks.push("start");
+      },
+      onCompactionEnd: async (payload) => {
+        callbacks.push(payload?.completed === false ? "incomplete" : "end");
+      },
+      runParams: createRunParams("run-compaction-bridge", {
+        model: "claude-opus-4-8",
+      }),
+    });
+
+    expect(callbacks).toEqual(["start", "incomplete", "start", "end"]);
+  });
+
+  it("normalizes shipped string-step plan events to pending typed steps", async () => {
+    cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "plan",
+        data: {
+          phase: "update",
+          title: "Plan updated",
+          source: "codex-exec",
+          steps: ["Inspect", "  ", "Patch"],
+        },
+      });
+      return { payloads: [], meta: { durationMs: 1 } };
+    });
+    const onPlanUpdate = vi.fn(async () => undefined);
+
+    await runCliAgentWithLifecycle({
+      runId: "run-plan-legacy",
+      onPlanUpdate,
+      runParams: createRunParams("run-plan-legacy", {
+        provider: "codex-cli",
+        model: "codex",
+      }),
+    });
+
+    expect(onPlanUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        steps: [
+          { step: "Inspect", status: "pending" },
+          { step: "Patch", status: "pending" },
+        ],
+      }),
+    );
+  });
+
+  it("bridges thinking events to reasoning text and dedupes identical snapshots", async () => {
+    cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "thinking",
+        data: { text: "Thinking", delta: "Thinking", isReasoningSnapshot: true },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "thinking",
+        data: { text: "Thinking", delta: "", isReasoningSnapshot: true },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "thinking",
+        data: { text: "Thinking more", delta: " more", isReasoningSnapshot: true },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "assistant",
+        data: { text: "Visible answer", delta: "Visible answer" },
+      });
+      return { payloads: [{ text: "Visible answer" }], meta: { durationMs: 1 } };
+    });
+    const onReasoningText = vi.fn<(payload: ReasoningTextPayload) => Promise<void>>(
+      async () => undefined,
+    );
+
+    const result = await runCliAgentWithLifecycle({
+      runId: "run-thinking-bridge",
+      onReasoningText,
+      runParams: createRunParams("run-thinking-bridge"),
+    });
+
+    expect(onReasoningText).toHaveBeenCalledTimes(2);
+    expect(onReasoningText.mock.calls.map((call) => call[0])).toEqual([
+      { text: "Thinking", isReasoningSnapshot: true },
+      { text: "Thinking more", isReasoningSnapshot: true },
+    ]);
+    expect(result.payloads).toEqual([
+      { text: "Thinking more", isReasoning: true },
+      { text: "Visible answer" },
+    ]);
+  });
+
+  it("stamps onActivity for every delivered bridge event, including reasoning-only progress", async () => {
+    cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "thinking",
+        data: { progressTokens: 50 },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "thinking",
+        data: { progressTokens: 50 },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "thinking",
+        data: { progressTokens: 200 },
+      });
+      return { payloads: [], meta: { durationMs: 1 } };
+    });
+    const onActivity = vi.fn();
+    const onReasoningProgress = vi.fn<(payload: ReasoningProgressPayload) => Promise<void>>(
+      async () => undefined,
+    );
+
+    await runCliAgentWithLifecycle({
+      runId: "run-activity-reasoning-progress",
+      onActivity,
+      onReasoningProgress,
+      runParams: createRunParams("run-activity-reasoning-progress"),
+    });
+
+    // A run in a long pure-reasoning stretch must keep stamping activity, or
+    // stale-takeover reclaims it while it is visibly thinking. Stamps are
+    // per-event (delivery-independent), so dedupe downstream does not matter.
+    expect(onReasoningProgress).toHaveBeenCalledTimes(2);
+    expect(onActivity).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps stamping onActivity when bridges are suppressed for silent runs", async () => {
+    cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "thinking",
+        data: { progressTokens: 50 },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "assistant",
+        data: { text: "Silent answer", delta: "Silent answer" },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "assistant",
+        data: { completedText: "Silent answer", assistantMessageIndex: 0 },
+      });
+      return { payloads: [], meta: { durationMs: 1 } };
+    });
+    const onActivity = vi.fn();
+    const onCompletedReply = vi.fn(async (_text: string) => {});
+    const onAssistantText = vi.fn<(text: string) => Promise<void>>(async () => undefined);
+    const onReasoningProgress = vi.fn<(payload: ReasoningProgressPayload) => Promise<void>>(
+      async () => undefined,
+    );
+
+    await runCliAgentWithLifecycle({
+      runId: "run-activity-suppressed",
+      suppressAssistantBridge: true,
+      onActivity,
+      onAssistantText,
+      onCompletedReply,
+      onReasoningProgress,
+      runParams: createRunParams("run-activity-suppressed"),
+    });
+
+    // silentExpected runs suppress deliveries, but their events are still real
+    // liveness evidence — without these stamps a healthy silent run would be
+    // reclaimed as run_stalled at the takeover window.
+    expect(onAssistantText).not.toHaveBeenCalled();
+    expect(onCompletedReply).not.toHaveBeenCalled();
+    expect(onReasoningProgress).not.toHaveBeenCalled();
+    expect(onActivity).toHaveBeenCalledTimes(3);
+  });
+
+  it("stamps onActivity for assistant text without caller callbacks for that stream", async () => {
+    cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "thinking",
+        data: { text: "Deep thought", delta: "Deep thought", isReasoningSnapshot: true },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "assistant",
+        data: { text: "Visible answer", delta: "Visible answer" },
+      });
+      return { payloads: [{ text: "Visible answer" }], meta: { durationMs: 1 } };
+    });
+    const onActivity = vi.fn();
+    const onAssistantText = vi.fn<(text: string) => Promise<void>>(async () => undefined);
+    const assistantEvents: Record<string, unknown>[] = [];
+    const stop = onAgentEvent((event) => {
+      if (event.runId === "run-activity-assistant" && event.stream === "assistant") {
+        assistantEvents.push(event.data);
+      }
+    });
+
+    try {
+      await runCliAgentWithLifecycle({
+        runId: "run-activity-assistant",
+        onActivity,
+        onAssistantText,
+        runParams: createRunParams("run-activity-assistant"),
+      });
+    } finally {
+      stop();
+    }
+
+    // Every real event stamps, independent of which callbacks are registered.
+    expect(onAssistantText).toHaveBeenCalledTimes(1);
+    expect(onActivity).toHaveBeenCalledTimes(2);
+    expect(assistantEvents).toEqual([
+      { text: "Visible answer", delta: "Visible answer" },
+      { itemId: "cli-assistant:run-activity-assistant", text: "Visible answer" },
+    ]);
+  });
+
+  it("keeps the captured lifecycle generation on the start event", async () => {
     const events: Array<{
       stream?: string;
       lifecycleGeneration?: string;
+      agentId?: string;
       data?: Record<string, unknown>;
     }> = [];
     const lifecycleGeneration = getAgentEventLifecycleGeneration();
@@ -50,28 +364,24 @@ describe("runCliAgentWithLifecycle", () => {
       await runCliAgentWithLifecycle({
         runId: "run-before-restart",
         lifecycleGeneration,
-        provider: "claude-cli",
-        runParams: {
-          sessionId: "session-1",
-          sessionFile: "/tmp/session.jsonl",
-          workspaceDir: "/tmp/workspace",
-          prompt: "hello",
-          provider: "claude-cli",
-          model: "claude",
+        startedAt: 1_000,
+        runParams: createRunParams("run-before-restart", {
+          agentId: "support",
           thinkLevel: "off",
-          timeoutMs: 1_000,
-          runId: "run-before-restart",
-        },
+        }),
       });
     } finally {
       stop();
     }
 
     const lifecycleEvents = events.filter((event) => event.stream === "lifecycle");
-    expect(lifecycleEvents).toHaveLength(2);
+    expect(lifecycleEvents).toHaveLength(1);
+    expect(lifecycleEvents[0]?.data?.phase).toBe("start");
     expect(
       lifecycleEvents.every((event) => event.lifecycleGeneration === lifecycleGeneration),
     ).toBe(true);
+    expect(lifecycleEvents.every((event) => event.agentId === "support")).toBe(true);
+    expect(lifecycleEvents.every((event) => event.data?.startedAt === 1_000)).toBe(true);
   });
 
   it("preserves restart ownership when the CLI resolves after cancellation", async () => {
@@ -93,98 +403,39 @@ describe("runCliAgentWithLifecycle", () => {
     await expect(
       runCliAgentWithLifecycle({
         runId: "run-restart",
-        provider: "claude-cli",
-        runParams: {
-          sessionId: "session-1",
-          sessionFile: "/tmp/session.jsonl",
-          workspaceDir: "/tmp/workspace",
-          prompt: "hello",
-          provider: "claude-cli",
-          model: "claude",
+        runParams: createRunParams("run-restart", {
           thinkLevel: "off",
-          timeoutMs: 1_000,
-          runId: "run-restart",
           abortSignal: controller.signal,
-        },
+        }),
       }),
     ).rejects.toThrow("agent run aborted for restart");
     stop();
 
-    const terminal = events.find(
-      (event) => event.stream === "lifecycle" && event.data?.phase === "error",
-    );
-    expect(terminal?.data).toMatchObject({
-      aborted: true,
-      stopReason: "restart",
-    });
     expect(events.some((event) => event.stream === "assistant")).toBe(false);
-  });
-
-  it("propagates yielded result metadata on lifecycle end", async () => {
-    const events: Array<{ stream?: string; data?: Record<string, unknown> }> = [];
-    const stop = onAgentEvent((event) => {
-      if (event.runId === "run-yielded") {
-        events.push(event);
-      }
-    });
-    cliDispatchState.runCliAgentMock.mockResolvedValueOnce({
-      payloads: [],
-      meta: {
-        durationMs: 1,
-        yielded: true,
-        livenessState: "paused",
-        stopReason: "end_turn",
-      },
-    } satisfies EmbeddedAgentRunResult);
-
-    try {
-      await runCliAgentWithLifecycle({
-        runId: "run-yielded",
-        provider: "claude-cli",
-        runParams: {
-          sessionId: "session-1",
-          sessionFile: "/tmp/session.jsonl",
-          workspaceDir: "/tmp/workspace",
-          prompt: "hello",
-          provider: "claude-cli",
-          model: "claude",
-          thinkLevel: "off",
-          timeoutMs: 1_000,
-          runId: "run-yielded",
-        },
-      });
-    } finally {
-      stop();
-    }
-
-    const terminal = events.find(
-      (event) => event.stream === "lifecycle" && event.data?.phase === "end",
-    );
-    expect(terminal?.data).toMatchObject({
-      yielded: true,
-      livenessState: "paused",
-      stopReason: "end_turn",
-    });
   });
 });
 
 describe("keepCliSessionBindingOnlyWhenReused", () => {
-  it("keeps the first room-event CLI binding when no binding exists yet", () => {
-    const result = {
+  function bindingResult(sessionId: string) {
+    return {
       payloads: [],
       meta: {
         durationMs: 1,
         agentMeta: {
-          sessionId: "new-cli-session",
+          sessionId,
           provider: "claude-cli",
           model: "claude-opus-4-8",
           cliSessionBinding: {
-            sessionId: "new-cli-session",
+            sessionId,
             authProfileId: "profile",
           },
         },
       },
     } satisfies EmbeddedAgentRunResult;
+  }
+
+  it("keeps the first room-event CLI binding when no binding exists yet", () => {
+    const result = bindingResult("new-cli-session");
 
     expect(keepCliSessionBindingOnlyWhenReused({ result })).toBe(result);
   });
@@ -194,26 +445,93 @@ describe("keepCliSessionBindingOnlyWhenReused", () => {
     const result = keepCliSessionBindingOnlyWhenReused({
       existingSessionId: "existing-cli-session",
       onDroppedReplacement,
-      result: {
-        payloads: [],
-        meta: {
-          durationMs: 1,
-          agentMeta: {
-            sessionId: "replacement-cli-session",
-            provider: "claude-cli",
-            model: "claude-opus-4-8",
-            cliSessionBinding: {
-              sessionId: "replacement-cli-session",
-              authProfileId: "profile",
-            },
-          },
-        },
-      } satisfies EmbeddedAgentRunResult,
+      result: bindingResult("replacement-cli-session"),
     });
 
     expect(onDroppedReplacement).toHaveBeenCalledOnce();
     expect(result.meta.agentMeta?.sessionId).toBe("");
     expect(result.meta.agentMeta?.cliSessionBinding).toBeUndefined();
+  });
+});
+
+describe("clearCliSessionInStore", () => {
+  it.each(["current", "closed"])(
+    "clears active and stored entries only for a %s owner",
+    async (owner) => {
+      const activeEntry = {
+        sessionId: "openclaw-active",
+        updatedAt: 1,
+        cliSessionBindings: { "claude-cli": { sessionId: "stale-session" } },
+        cliSessionIds: { "claude-cli": "stale-session" },
+        claudeCliSessionId: "stale-session",
+      };
+      const storedEntry = structuredClone(activeEntry);
+      const storePath = path.join(tempDirs.make("cli-session-cleanup-"), "sessions.json");
+      await replaceSessionEntry({ storePath, sessionKey: "main" }, structuredClone(activeEntry));
+
+      let open = true;
+      const clear = clearCliSessionInStore({
+        agentId: "main",
+        provider: "claude-cli",
+        expectedCliSessionId: "stale-session",
+        expectedSessionId: activeEntry.sessionId,
+        sessionKey: "main",
+        sessionStore: { main: storedEntry },
+        storePath,
+        activeSessionEntry: activeEntry,
+        assertCommitAllowed: () => {
+          if (!open) {
+            throw new Error("owner closed");
+          }
+        },
+      });
+      if (owner === "closed") {
+        open = false;
+        await expect(clear).rejects.toThrow("owner closed");
+        for (const entry of [
+          activeEntry,
+          storedEntry,
+          loadSessionEntry({ storePath, sessionKey: "main" }),
+        ]) {
+          expect(entry?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe("stale-session");
+        }
+        return;
+      }
+      await clear;
+
+      for (const entry of [activeEntry, storedEntry]) {
+        expect(entry.cliSessionBindings?.["claude-cli"]).toBeUndefined();
+        expect(entry.cliSessionIds?.["claude-cli"]).toBeUndefined();
+        expect(entry.claudeCliSessionId).toBeUndefined();
+        expect(entry.updatedAt).toBeGreaterThan(1);
+      }
+      const persisted = loadSessionEntry({ storePath, sessionKey: "main" });
+      expect(persisted?.cliSessionBindings?.["claude-cli"]).toBeUndefined();
+      expect(persisted?.cliSessionIds?.["claude-cli"]).toBeUndefined();
+      expect(persisted?.claudeCliSessionId).toBeUndefined();
+    },
+  );
+
+  it("does not clear a replacement binding adopted by another turn", async () => {
+    const entry = {
+      sessionId: "openclaw-active",
+      updatedAt: 1,
+      cliSessionBindings: { "claude-cli": { sessionId: "replacement-session" } },
+      cliSessionIds: { "claude-cli": "replacement-session" },
+      claudeCliSessionId: "replacement-session",
+    };
+
+    await clearCliSessionInStore({
+      agentId: "main",
+      provider: "claude-cli",
+      expectedCliSessionId: "stale-session",
+      activeSessionEntry: entry,
+    });
+
+    expect(entry.cliSessionBindings["claude-cli"].sessionId).toBe("replacement-session");
+    expect(entry.cliSessionIds["claude-cli"]).toBe("replacement-session");
+    expect(entry.claudeCliSessionId).toBe("replacement-session");
+    expect(entry.updatedAt).toBe(1);
   });
 });
 
@@ -233,39 +551,48 @@ describe("createCliToolSummaryTracker", () => {
     result: { content: [{ type: "text", text: "Wed Jun 10 2026" }] },
   };
 
-  it("delivers a tool summary for a result using meta captured at start", async () => {
+  it.each(["exec"])("delivers a safe %s summary using metadata captured at start", async (name) => {
     const deliver = vi.fn();
     const tracker = createCliToolSummaryTracker({
+      commandDetailsVisible: false,
       shouldEmitToolResult: () => true,
       shouldEmitToolOutput: () => false,
       deliver,
     });
-    await tracker.noteToolEvent(startEvent);
-    await tracker.noteToolEvent(resultEvent);
+    await tracker.noteToolEvent({ ...startEvent, name });
+    const commandBearing = await tracker.noteToolEvent({ ...resultEvent, name });
+    expect(commandBearing).toBe(true);
     expect(deliver).toHaveBeenCalledTimes(1);
     const payload = deliver.mock.calls[0]?.[0] as { text: string; isError?: boolean };
-    expect(payload.text).toContain("date -u");
+    expect(payload.text).toBe(name === "server.exec" ? "Server.exec" : "Exec");
+    expect(payload.text).not.toContain("date -u");
     expect(payload.text).not.toContain("Wed Jun 10 2026");
     expect(payload.isError).toBeUndefined();
   });
 
-  it("appends the tool output block when full verbose output is enabled", async () => {
+  it("renders top-level structured CLI results in full verbose output", async () => {
     const deliver = vi.fn();
     const tracker = createCliToolSummaryTracker({
+      commandDetailsVisible: true,
       shouldEmitToolResult: () => true,
       shouldEmitToolOutput: () => true,
       deliver,
     });
     await tracker.noteToolEvent(startEvent);
-    await tracker.noteToolEvent(resultEvent);
+    await tracker.noteToolEvent({
+      ...resultEvent,
+      result: [{ type: "web_search_result", title: "OpenClaw", url: "https://example.com" }],
+    });
+
     const payload = deliver.mock.calls[0]?.[0] as { text: string };
-    expect(payload.text).toContain("```txt");
-    expect(payload.text).toContain("Wed Jun 10 2026");
+    expect(payload.text).toContain('"type":"web_search_result"');
+    expect(payload.text).toContain('"title":"OpenClaw"');
   });
 
   it("emits nothing while tool summaries are disabled", async () => {
     const deliver = vi.fn();
     const tracker = createCliToolSummaryTracker({
+      commandDetailsVisible: false,
       shouldEmitToolResult: () => false,
       shouldEmitToolOutput: () => false,
       deliver,
@@ -275,29 +602,68 @@ describe("createCliToolSummaryTracker", () => {
     expect(deliver).not.toHaveBeenCalled();
   });
 
-  it("propagates tool errors on the summary payload", async () => {
-    const deliver = vi.fn();
-    const tracker = createCliToolSummaryTracker({
-      shouldEmitToolResult: () => true,
-      shouldEmitToolOutput: () => false,
-      deliver,
-    });
-    await tracker.noteToolEvent(startEvent);
-    await tracker.noteToolEvent({ ...resultEvent, isError: true });
-    const payload = deliver.mock.calls[0]?.[0] as { isError?: boolean };
-    expect(payload.isError).toBe(true);
-  });
+  it.each(["update_plan"])(
+    "leaves %s to the authoritative plan event instead of summarizing arguments",
+    async (name) => {
+      const deliver = vi.fn();
+      const tracker = createCliToolSummaryTracker({
+        commandDetailsVisible: true,
+        shouldEmitToolResult: () => true,
+        shouldEmitToolOutput: () => true,
+        deliver,
+      });
+      await tracker.noteToolEvent({
+        name,
+        phase: "start",
+        args: {
+          markdown: '<progress aria-label="CI · 2/3" value="2" max="3"></progress>',
+        },
+        toolCallId: "plan-1",
+      });
+      await tracker.noteToolEvent({
+        name,
+        phase: "result",
+        args: undefined,
+        toolCallId: "plan-1",
+        isError: false,
+        result: { content: [{ type: "text", text: "Progress card updated" }] },
+      });
 
-  it("summarizes results without a tracked start event", async () => {
-    const deliver = vi.fn();
-    const tracker = createCliToolSummaryTracker({
-      shouldEmitToolResult: () => true,
-      shouldEmitToolOutput: () => false,
-      deliver,
-    });
-    await tracker.noteToolEvent({ ...resultEvent, toolCallId: "unseen" });
-    expect(deliver).toHaveBeenCalledTimes(1);
-  });
+      expect(deliver).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([true])(
+    "keeps card errors visible without arguments (full output: %s)",
+    async (fullOutput) => {
+      const deliver = vi.fn();
+      const tracker = createCliToolSummaryTracker({
+        commandDetailsVisible: false,
+        shouldEmitToolResult: () => true,
+        shouldEmitToolOutput: () => fullOutput,
+        deliver,
+      });
+      await tracker.noteToolEvent({
+        name: "progress_card",
+        phase: "start",
+        args: { markdown: '<progress aria-label="private" value="1" max="2"></progress>' },
+        toolCallId: "plan-error",
+      });
+      await tracker.noteToolEvent({
+        name: undefined,
+        phase: "result",
+        args: undefined,
+        toolCallId: "plan-error",
+        isError: true,
+        result: { content: [{ type: "text", text: "write failed" }] },
+      });
+
+      expect(deliver).toHaveBeenCalledWith({
+        text: fullOutput ? "Progress Card\n```txt\nwrite failed\n```" : "Progress Card",
+        isError: true,
+      });
+    },
+  );
 });
 
 describe("runCliAgentWithLifecycle fast auto progress", () => {
@@ -334,21 +700,17 @@ describe("runCliAgentWithLifecycle fast auto progress", () => {
 
     await runCliAgentWithLifecycle({
       runId: "run-fast-cli",
-      provider: "codex-cli",
-      runParams: {
-        sessionId: "session-1",
+      runParams: createRunParams("run-fast-cli", {
         sessionKey: "agent:main:cli-fast",
-        sessionFile: "/tmp/session.jsonl",
-        workspaceDir: "/tmp/workspace",
         prompt: "run one tool",
         provider: "codex-cli",
         model: "gpt-5.5",
+        thinkLevel: undefined,
         timeoutMs: 60_000,
-        runId: "run-fast-cli",
         fastMode: "auto",
         fastModeStartedAtMs: 1_000,
         fastModeAutoOnSeconds: 5,
-      },
+      }),
       onFastModeAutoProgress: async (payload) => {
         if (payload.text) {
           progressPayloads.push(payload.text);

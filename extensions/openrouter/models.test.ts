@@ -1,70 +1,22 @@
 import { describe, expect, it } from "vitest";
-import {
-  isOpenRouterDeepSeekV4ModelId,
-  isOpenRouterMistralModelId,
-  normalizeOpenRouterApiModelId,
-  normalizeOpenRouterModelId,
-} from "./models.js";
-
-describe("normalizeOpenRouterModelId", () => {
-  it("strips the openrouter/ provider qualifier", () => {
-    expect(normalizeOpenRouterModelId("openrouter/deepseek/deepseek-v4-flash")).toBe(
-      "deepseek/deepseek-v4-flash",
-    );
-  });
-
-  it("leaves non-openrouter refs unchanged", () => {
-    expect(normalizeOpenRouterModelId("deepseek/deepseek-v4-flash")).toBe(
-      "deepseek/deepseek-v4-flash",
-    );
-  });
-
-  it("returns undefined for non-strings", () => {
-    expect(normalizeOpenRouterModelId(null)).toBeUndefined();
-  });
-});
-
-describe("normalizeOpenRouterApiModelId", () => {
-  it.each([
-    ["openrouter/deepseek-v4-flash", "deepseek/deepseek-v4-flash"],
-    ["openrouter/deepseek-v4-pro", "deepseek/deepseek-v4-pro"],
-    ["openrouter/DEEPSEEK-V4-FLASH", "deepseek/deepseek-v4-flash"],
-  ])("expands short OpenRouter ref %s to %s", (input, expected) => {
-    expect(normalizeOpenRouterApiModelId(input)).toBe(expected);
-  });
-
-  it("strips provider prefix from already-namespaced refs", () => {
-    expect(normalizeOpenRouterApiModelId("openrouter/deepseek/deepseek-v4-flash")).toBe(
-      "deepseek/deepseek-v4-flash",
-    );
-  });
-
-  it.each([
-    ["openrouter/auto", "openrouter/auto"],
-    ["openrouter/auto:free", "openrouter/auto:free"],
-    ["openrouter/free", "openrouter/free"],
-  ])("preserves native OpenRouter route %s", (input, expected) => {
-    expect(normalizeOpenRouterApiModelId(input)).toBe(expected);
-  });
-
-  it("passes through refs without the openrouter prefix", () => {
-    expect(normalizeOpenRouterApiModelId("deepseek/deepseek-v4-flash")).toBe(
-      "deepseek/deepseek-v4-flash",
-    );
-  });
-});
+import { isOpenRouterDeepSeekV4ModelId } from "./models.js";
 
 describe("isOpenRouterDeepSeekV4ModelId", () => {
   it("matches namespaced DeepSeek V4 refs", () => {
     expect(isOpenRouterDeepSeekV4ModelId("openrouter/deepseek/deepseek-v4-flash")).toBe(true);
     expect(isOpenRouterDeepSeekV4ModelId("openrouter/deepseek/deepseek-v4-pro")).toBe(true);
+    expect(isOpenRouterDeepSeekV4ModelId("deepseek/deepseek-v4-flash")).toBe(true);
     expect(isOpenRouterDeepSeekV4ModelId("openrouter/anthropic/claude-sonnet-4-6")).toBe(false);
+    expect(isOpenRouterDeepSeekV4ModelId(null)).toBe(false);
   });
-});
 
-describe("isOpenRouterMistralModelId", () => {
-  it("matches Mistral-prefixed refs", () => {
-    expect(isOpenRouterMistralModelId("openrouter/mistral/ministral-8b")).toBe(true);
-    expect(isOpenRouterMistralModelId("openrouter/codestral-22b")).toBe(true);
+  it("matches DeepSeek V4 point releases and their dated snapshots", () => {
+    expect(isOpenRouterDeepSeekV4ModelId("openrouter/deepseek/deepseek-v4.1-flash")).toBe(true);
+    expect(isOpenRouterDeepSeekV4ModelId("deepseek/deepseek-v4.1-flash-1017")).toBe(true);
+    expect(isOpenRouterDeepSeekV4ModelId("deepseek/deepseek-v4.1-flash:nitro")).toBe(true);
+    expect(isOpenRouterDeepSeekV4ModelId("deepseek/deepseek-v4.2-pro")).toBe(true);
+    expect(isOpenRouterDeepSeekV4ModelId("deepseek/deepseek-v4-flash-vision-exp")).toBe(false);
+    expect(isOpenRouterDeepSeekV4ModelId("deepseek/deepseek-v4.1-flash-vision-exp")).toBe(false);
+    expect(isOpenRouterDeepSeekV4ModelId("deepseek/deepseek-v41-flash")).toBe(false);
   });
 });

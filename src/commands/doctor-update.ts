@@ -1,16 +1,14 @@
-/** Optional pre-doctor update prompt for source checkouts and package installs. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { note } from "../../packages/terminal-core/src/note.js";
 import { formatCliCommand } from "../cli/command-format.js";
-import { createUpdateProgress } from "../cli/update-cli/progress.js";
 import { isTruthyEnvValue } from "../infra/env.js";
-import { runGatewayUpdate } from "../infra/update-runner.js";
-import type { UpdateRunResult } from "../infra/update-runner.js";
+import { formatInstallOwnerMessage, readInstallOwner } from "../infra/install-owner.js";
+import { UPDATE_RUNNER_TIMEOUT_MS } from "../infra/update-run-timeouts.js";
 import { runCommandWithTimeout } from "../process/exec.js";
-import type { RuntimeEnv } from "../runtime.js";
 import type { DoctorOptions } from "./doctor-prompter.js";
+import { isServiceRepairDeferred } from "./doctor-service-repair-policy.js";
 
 async function resolveComparablePath(target: string): Promise<string> {
   return await fs.realpath(target).catch(() => path.resolve(target));
@@ -37,14 +35,17 @@ async function detectOpenClawGitCheckout(root: string): Promise<"git" | "not-git
     : "not-git";
 }
 
-/** Offers to update OpenClaw before doctor when running interactively from an updatable install. */
 export async function maybeOfferUpdateBeforeDoctor(params: {
-  runtime: RuntimeEnv;
   options: DoctorOptions;
   root: string | null;
   confirm: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
   outro: (message: string) => void;
-}) {
+}): Promise<boolean> {
+  const installOwner = await readInstallOwner(params.root);
+  if (installOwner) {
+    note(formatInstallOwnerMessage(installOwner), "Update");
+    return false;
+  }
   const updateInProgress = isTruthyEnvValue(process.env.OPENCLAW_UPDATE_IN_PROGRESS);
   const canOfferUpdate =
     !updateInProgress &&
@@ -53,46 +54,46 @@ export async function maybeOfferUpdateBeforeDoctor(params: {
     params.options.repair !== true &&
     process.stdin.isTTY;
   if (!canOfferUpdate || !params.root) {
-    return { updated: false };
+    return false;
   }
 
   const git = await detectOpenClawGitCheckout(params.root);
   if (git === "git") {
+    if (isServiceRepairDeferred()) {
+      note(
+        "Update through the external supervisor's stop/update/finalize/restart workflow. Continuing Doctor without updating OpenClaw.",
+        "Update",
+      );
+      return false;
+    }
     const shouldUpdate = await params.confirm({
       message: "Update OpenClaw from git before running doctor?",
       initialValue: true,
     });
     if (!shouldUpdate) {
-      return { updated: false };
+      return false;
     }
-    note("Running update…", "Update");
-    const { progress, stop } = createUpdateProgress(process.stdout.isTTY);
-    let result: UpdateRunResult;
-    try {
-      result = await runGatewayUpdate({
-        cwd: params.root,
-        argv1: process.argv[1],
-        progress,
-      });
-    } finally {
-      stop();
+    const { updateCommand } = await import("../cli/update-cli/update-command.js");
+    let handled = false;
+    let readinessUnverified = false;
+    await updateCommand({
+      sourceUpdate: { root: params.root },
+      timeout: String(UPDATE_RUNNER_TIMEOUT_MS / 1000),
+      onResult: (result) => {
+        readinessUnverified =
+          result.status === "skipped" &&
+          (result.reason === "gateway-readiness-unverified" || result.reason === "still-starting");
+        handled = result.status === "ok" || readinessUnverified;
+      },
+    });
+    if (handled) {
+      params.outro(
+        readinessUnverified
+          ? "OpenClaw installed; Gateway readiness remains unverified. Keep recovery backups and check `openclaw gateway status --deep`."
+          : "Update completed (doctor already ran as part of the update).",
+      );
     }
-    note(
-      [
-        `Status: ${result.status}`,
-        `Mode: ${result.mode}`,
-        result.root ? `Root: ${result.root}` : null,
-        result.reason ? `Reason: ${result.reason}` : null,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      "Update result",
-    );
-    if (result.status === "ok") {
-      params.outro("Update completed (doctor already ran as part of the update).");
-      return { updated: true, handled: true };
-    }
-    return { updated: true, handled: false };
+    return handled;
   }
 
   if (git === "not-git") {
@@ -105,5 +106,5 @@ export async function maybeOfferUpdateBeforeDoctor(params: {
     );
   }
 
-  return { updated: false };
+  return false;
 }

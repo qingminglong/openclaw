@@ -1,128 +1,100 @@
-// Chat transcript parent-id tests protect gateway-injected assistant appends so
-// compaction history remains connected and transcript listeners receive updates.
-import fs from "node:fs";
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
+import { createSolidPngBuffer } from "../../../test/helpers/image-fixtures.js";
+import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
+import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import {
+  loadTranscriptEvents,
+  replaceSessionEntry,
+} from "../../config/sessions/session-accessor.js";
+import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import { onSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import {
+  attachManagedOutgoingMediaToMessage,
+  createManagedOutgoingMediaBlocks,
+} from "../managed-image-attachments.js";
+import { listManagedImageRecordEntries } from "../managed-image-record-store.js";
 import { appendInjectedAssistantMessageToTranscript } from "./chat-transcript-inject.js";
-import { createTranscriptFixtureSync } from "./chat.test-helpers.js";
 
-function readTranscriptLines(transcriptPath: string): string[] {
-  const lines: string[] = [];
-  for (const line of fs.readFileSync(transcriptPath, "utf-8").split(/\r?\n/)) {
-    if (line.length > 0) {
-      lines.push(line);
-    }
-  }
-  return lines;
-}
-
-async function appendHelloAndRequireId(transcriptPath: string): Promise<string> {
-  const appended = await appendInjectedAssistantMessageToTranscript({
-    transcriptPath,
-    message: "hello",
-  });
-  expect(appended.ok).toBe(true);
-  expect(appended.messageId).toBeTypeOf("string");
-  const messageId = appended.messageId;
-  if (!messageId) {
-    throw new Error("expected appended message id");
-  }
-  expect(messageId.length).toBeGreaterThan(0);
-  return messageId;
-}
-
-function readLastTranscriptRecord(transcriptPath: string): Record<string, unknown> {
-  const lines = readTranscriptLines(transcriptPath);
-  expect(lines.length).toBeGreaterThanOrEqual(2);
-  return JSON.parse(lines.at(-1) as string) as Record<string, unknown>;
-}
-
-// Guardrail: Gateway-injected assistant transcript messages must attach to the
-// current leaf with a `parentId` and must not sever compaction history.
-describe("gateway chat.inject transcript writes", () => {
-  it("appends a agent session entry that includes parentId", async () => {
-    const { dir, transcriptPath } = createTranscriptFixtureSync({
-      prefix: "openclaw-chat-inject-",
-      sessionId: "sess-1",
-    });
-
-    try {
-      await appendHelloAndRequireId(transcriptPath);
-      const last = readLastTranscriptRecord(transcriptPath);
-      expect(last.type).toBe("message");
-
-      // The regression we saw: raw jsonl appends omitted this field entirely.
-      expect(Object.hasOwn(last, "parentId")).toBe(true);
-      expect(last).toHaveProperty("id");
-      expect(last).toHaveProperty("message");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("uses raw append for oversized append-only transcripts", async () => {
-    const { dir, transcriptPath } = createTranscriptFixtureSync({
-      prefix: "openclaw-chat-inject-large-",
-      sessionId: "sess-1",
-    });
-
-    try {
-      fs.appendFileSync(
-        transcriptPath,
-        `${JSON.stringify({
-          type: "message",
-          id: "legacy-large-message",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "x".repeat(9 * 1024 * 1024) }],
-          },
-        })}\n`,
-        "utf-8",
-      );
-
-      const messageId = await appendHelloAndRequireId(transcriptPath);
-      const last = readLastTranscriptRecord(transcriptPath);
-
-      expect(last.type).toBe("message");
-      expect(last).toHaveProperty("id", messageId);
-      expect(last).toHaveProperty("message");
-      expect(Object.hasOwn(last, "parentId")).toBe(false);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("emits and returns the redacted injected assistant message", async () => {
-    const { dir, transcriptPath } = createTranscriptFixtureSync({
-      prefix: "openclaw-chat-inject-redact-",
-      sessionId: "sess-redact",
-    });
-    const fakeApiKey = "sk-proj-FAKEKEYFORTESTINGONLY1234567890";
+it("joins committed media before publication and preserves source text", (test) =>
+  withOpenClawTestState({ label: "chat-inject", scenario: "minimal" }, async (state) => {
+    const fixture = {
+      dir: state.stateDir,
+      agentId: "main",
+      sessionKey: "main",
+      sessionId: "inject-session",
+      storePath: state.statePath("sessions.json"),
+    };
+    setRuntimeConfigSnapshot({});
+    await replaceSessionEntry(fixture, { sessionId: fixture.sessionId, updatedAt: Date.now() });
     const updates: Array<{ message?: unknown; sessionKey?: string; agentId?: string }> = [];
     const unsubscribe = onSessionTranscriptUpdate((update) => updates.push(update));
-
+    const entered = createDeferred();
+    const release = createDeferred();
+    const message = "Here is your key: sk-proj-FAKEKEYFORTESTINGONLY1234567890";
+    const content = [{ type: "text", text: message }];
+    const bytes = createSolidPngBuffer(1, 1, { r: 34, g: 51, b: 68 });
+    let pending: ReturnType<typeof appendInjectedAssistantMessageToTranscript> | undefined;
     try {
-      const appended = await appendInjectedAssistantMessageToTranscript({
-        transcriptPath,
-        sessionKey: "global",
-        agentId: "work",
-        message: `Here is your key: ${fakeApiKey}`,
-        config: { logging: { redactSensitive: "tools" } },
+      const blocks = await createManagedOutgoingMediaBlocks({
+        sessionKey: fixture.sessionKey,
+        agentId: fixture.agentId,
+        stateDir: fixture.dir,
+        items: [{ url: `data:image/png;base64,${bytes.toString("base64")}`, trustedLocal: false }],
       });
-
-      expect(appended.ok).toBe(true);
-      expect(JSON.stringify(appended.message)).not.toContain(fakeApiKey);
+      pending = appendInjectedAssistantMessageToTranscript({
+        ...fixture,
+        sessionKey: "global",
+        message,
+        config: {},
+        content: [...content, ...blocks],
+        stopReason: "aborted",
+        onMessageCommitted: (receipt, acceptCompletion) => {
+          acceptCompletion(async () => {
+            entered.resolve();
+            await release.promise;
+            expect(
+              await attachManagedOutgoingMediaToMessage({
+                messageId: receipt.messageId,
+                blocks,
+                stateDir: fixture.dir,
+              }),
+            ).toBe(true);
+          });
+        },
+      });
+      await racePromiseWithAbortSignal(
+        awaitGateBeforeSettlement(
+          entered.promise,
+          pending,
+          "Injection never accepted media completion",
+        ),
+        test.signal,
+      );
+      expect(updates).toEqual([]);
+      release.resolve();
+      expect(await pending).toMatchObject({
+        ok: true,
+        message: { content: [...content, ...blocks], stopReason: "aborted" },
+      });
       expect(updates).toHaveLength(1);
-      expect(updates[0]).toMatchObject({ sessionKey: "global", agentId: "work" });
-
-      const lines = readTranscriptLines(transcriptPath);
-      const last = JSON.parse(lines.at(-1) as string) as { message?: unknown };
-      expect(JSON.stringify(last.message)).not.toContain(fakeApiKey);
-      expect(updates[0]?.message).toEqual(last.message);
-      expect(JSON.stringify(updates[0]?.message)).not.toContain(fakeApiKey);
+      const entries = await listManagedImageRecordEntries({ stateDir: fixture.dir });
+      expect(entries.map(({ record }) => record)).toMatchObject([
+        { messageId: expect.any(String), retentionClass: "history" },
+      ]);
+      const last = (await loadTranscriptEvents(fixture)).at(-1);
+      expect(last).toMatchObject({
+        message: {
+          content,
+          openclawDisplayContent: [...content, ...blocks],
+          stopReason: "aborted",
+        },
+      });
+      expect(updates[0]).toMatchObject({ sessionKey: "agent:main:main", agentId: "main" });
+      expect(last).toHaveProperty("message", updates[0]?.message);
     } finally {
+      release.resolve();
+      await Promise.allSettled([pending]);
       unsubscribe();
-      fs.rmSync(dir, { recursive: true, force: true });
     }
-  });
-});
+  }));

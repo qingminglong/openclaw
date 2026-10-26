@@ -3,244 +3,177 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  collectTempCreationFindingsFromDiff,
+  collectTempCreationFindingsFromDiff as collectFindings,
   formatGithubWarning,
-} from "../../scripts/report-test-temp-creations.mjs";
-import { createTempDirTracker } from "../helpers/temp-dir.js";
+} from "../../scripts/report-test-temp-creations.mts";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { createNestedGitEnv } from "../helpers/temp-repo.js";
 
 const repoRoot = process.cwd();
-const tempDirs = createTempDirTracker();
-const nestedGitEnvKeys = [
-  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-  "GIT_DIR",
-  "GIT_INDEX_FILE",
-  "GIT_OBJECT_DIRECTORY",
-  "GIT_QUARANTINE_PATH",
-  "GIT_WORK_TREE",
-] as const;
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-function createNestedGitEnv(): NodeJS.ProcessEnv {
-  const env = {
-    ...process.env,
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_TERMINAL_PROMPT: "0",
-  };
-  for (const key of nestedGitEnvKeys) {
-    delete env[key];
-  }
-  return env;
+function diffHeader(file: string) {
+  return [`diff --git a/${file} b/${file}`, `--- a/${file}`, `+++ b/${file}`];
 }
 
-afterEach(() => {
-  tempDirs.cleanup();
-});
+function addedDiff(file: string, lines: readonly string[], startLine = 1) {
+  return [
+    ...diffHeader(file),
+    `@@ -1,0 +${startLine},${lines.length} @@`,
+    ...lines.map((line) => `+${line}`),
+  ].join("\n");
+}
+
+const rawReason = "new mkdtemp temp directory creation";
+function collect(file: string, lines: string[]) {
+  return collectFindings(addedDiff(file, lines), { fileTextByPath: { [file]: lines.join("\n") } });
+}
+
+function finding(file: string, line: number, source: string, reason = rawReason) {
+  return { file, line, reason, source };
+}
+
+function createGitFixture(prefix: string) {
+  const root = tempDirs.make(prefix);
+  const env = createNestedGitEnv();
+  const git = (...args: string[]) =>
+    execFileSync(
+      "git",
+      ["-c", "user.email=test@example.com", "-c", "user.name=Test User", ...args],
+      { cwd: root, env },
+    );
+  const report = (...args: string[]) => {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(repoRoot, "scripts", "report-test-temp-creations.mjs"), ...args, "--json"],
+      { cwd: root, encoding: "utf8", env },
+    );
+    expect(result.status, result.stderr.split("\n")[0]).toBe(0);
+    return JSON.parse(result.stdout);
+  };
+  const write = (file: string, contents: string | Buffer) => {
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    fs.writeFileSync(path.join(root, file), contents);
+  };
+  git("init", "-q", "--initial-branch=main");
+  return { write, git, report };
+}
 
 describe("report-test-temp-creations", () => {
-  it("keeps a non-executed warning fixture for changed-gate proof", () => {
-    // openclaw-temp-dir: allow test fixture for the temp warning report
-    const warningFixture = 'fs.mkdtempSync("openclaw-warning-fixture-")';
-
-    expect(warningFixture).toContain("mkdtempSync");
-  });
-
-  it("reports added bare temp creation lines using changed-lane test path scope", () => {
-    const bareTempSource = [
-      "const tempRoot = fs.",
-      "mkdtemp",
-      'Sync(path.join(os.tmpdir(), "case-"));',
-    ].join("");
-    const mkdtempSource = ["const tempRoot = fs.", "mkdtemp", 'Sync("case-");'].join("");
-    const diff = [
-      "diff --git a/src/example.test.ts b/src/example.test.ts",
-      "--- a/src/example.test.ts",
-      "+++ b/src/example.test.ts",
-      "@@ -10,0 +11,3 @@",
-      `+${bareTempSource}`,
-      '+const helperRoot = makeTempDir(tempDirs, "case-");',
-      "+console.log(tempRoot, helperRoot);",
-      "diff --git a/src/example.ts b/src/example.ts",
-      "--- a/src/example.ts",
-      "+++ b/src/example.ts",
-      "@@ -4,0 +5,1 @@",
-      `+${["const productionTemp = fs.", "mkdtemp", 'Sync("case-");'].join("")}`,
-      "diff --git a/test/helper.test-support.mjs b/test/helper.test-support.mjs",
-      "--- a/test/helper.test-support.mjs",
-      "+++ b/test/helper.test-support.mjs",
-      "@@ -1,0 +2,1 @@",
-      `+${mkdtempSource}`,
-      "diff --git a/test/helpers/temp-fixture.ts b/test/helpers/temp-fixture.ts",
-      "--- a/test/helpers/temp-fixture.ts",
-      "+++ b/test/helpers/temp-fixture.ts",
-      "@@ -1,0 +2,1 @@",
-      `+${mkdtempSource}`,
-      "diff --git a/test/helpers/temp-dir.ts b/test/helpers/temp-dir.ts",
-      "--- a/test/helpers/temp-dir.ts",
-      "+++ b/test/helpers/temp-dir.ts",
-      "@@ -1,0 +2,1 @@",
-      `+${mkdtempSource}`,
-      "diff --git a/packages/foo/__tests__/helper.ts b/packages/foo/__tests__/helper.ts",
-      "--- a/packages/foo/__tests__/helper.ts",
-      "+++ b/packages/foo/__tests__/helper.ts",
-      "@@ -1,0 +2,1 @@",
-      `+${mkdtempSource}`,
-      "diff --git a/extensions/discord/src/monitor/message-handler.test-helpers.ts b/extensions/discord/src/monitor/message-handler.test-helpers.ts",
-      "--- a/extensions/discord/src/monitor/message-handler.test-helpers.ts",
-      "+++ b/extensions/discord/src/monitor/message-handler.test-helpers.ts",
-      "@@ -1,0 +2,1 @@",
-      `+${mkdtempSource}`,
-    ].join("\n");
-
-    expect(collectTempCreationFindingsFromDiff(diff)).toEqual([
-      {
-        file: "src/example.test.ts",
-        line: 11,
-        reason: "new mkdtemp temp directory creation",
-        source: bareTempSource,
-      },
-      {
-        file: "test/helper.test-support.mjs",
-        line: 2,
-        reason: "new mkdtemp temp directory creation",
-        source: mkdtempSource,
-      },
-      {
-        file: "test/helpers/temp-fixture.ts",
-        line: 2,
-        reason: "new mkdtemp temp directory creation",
-        source: mkdtempSource,
-      },
-      {
-        file: "packages/foo/__tests__/helper.ts",
-        line: 2,
-        reason: "new mkdtemp temp directory creation",
-        source: mkdtempSource,
-      },
-    ]);
-  });
-
   it("honors explicit allow comments with reasons", () => {
     const mkdtempCall = ["fs.", "mkdtemp", 'Sync("case-")'].join("");
     const tmpDirCall = ["tmp.", "dir", 'Sync({ prefix: "case-" })'].join("");
-    const allowedSource = `const allowed = ${mkdtempCall};`;
-    const inlineAllowedSource = `const inlineAllowed = ${tmpDirCall}; // openclaw-temp-dir: allow verifies tmp API behavior`;
-    const blockedSource = `const blocked = ${mkdtempCall};`;
-    const stringMarkerSource = `const stringMarker = ${mkdtempCall}; const note = "openclaw-temp-dir: allow quoted text";`;
+    const lines = [
+      "// openclaw-temp-dir: allow verifies raw fs cleanup behavior",
+      `const allowed = ${mkdtempCall};`,
+      `const inlineAllowed = ${tmpDirCall}; // openclaw-temp-dir: allow verifies tmp API behavior`,
+      `const blocked = ${mkdtempCall};`,
+      `const stringMarker = ${mkdtempCall}; const note = "openclaw-temp-dir: allow quoted text";`,
+    ] as const;
     const emptyReasonSource = `const emptyReason = ${mkdtempCall};`;
-    const diff = [
-      "diff --git a/test/helpers/raw-temp.test.ts b/test/helpers/raw-temp.test.ts",
-      "--- a/test/helpers/raw-temp.test.ts",
-      "+++ b/test/helpers/raw-temp.test.ts",
-      "@@ -1,0 +2,5 @@",
-      "+// openclaw-temp-dir: allow verifies raw fs cleanup behavior",
-      `+${allowedSource}`,
-      `+${inlineAllowedSource}`,
-      `+${blockedSource}`,
-      `+${stringMarkerSource}`,
-      "diff --git a/test/helpers/empty-allow.test.ts b/test/helpers/empty-allow.test.ts",
-      "--- a/test/helpers/empty-allow.test.ts",
-      "+++ b/test/helpers/empty-allow.test.ts",
-      "@@ -1,0 +2,2 @@",
-      "+// openclaw-temp-dir: allow",
-      `+${emptyReasonSource}`,
-    ].join("\n");
-
-    expect(collectTempCreationFindingsFromDiff(diff)).toEqual([
-      {
-        file: "test/helpers/raw-temp.test.ts",
-        line: 5,
-        reason: "new mkdtemp temp directory creation",
-        source: blockedSource,
-      },
-      {
-        file: "test/helpers/raw-temp.test.ts",
-        line: 6,
-        reason: "new mkdtemp temp directory creation",
-        source: stringMarkerSource,
-      },
-      {
-        file: "test/helpers/empty-allow.test.ts",
-        line: 3,
-        reason: "new mkdtemp temp directory creation",
-        source: emptyReasonSource,
-      },
+    expect(
+      collectFindings(
+        addedDiff(
+          "test/helpers/raw-temp.test.ts",
+          [...lines, "// openclaw-temp-dir: allow", emptyReasonSource],
+          2,
+        ),
+      ),
+    ).toEqual([
+      finding("test/helpers/raw-temp.test.ts", 5, lines[3]),
+      finding("test/helpers/raw-temp.test.ts", 6, lines[4]),
+      finding("test/helpers/raw-temp.test.ts", 8, emptyReasonSource),
     ]);
   });
 
-  it("prints help with usage, outputs, and examples", () => {
-    const output = execFileSync(
-      process.execPath,
-      [path.join(repoRoot, "scripts", "report-test-temp-creations.mjs"), "--help"],
-      {
-        cwd: repoRoot,
-        encoding: "utf8",
-      },
-    );
+  it("reports added imports and calls for manual temp-dir helpers", () => {
+    const file = "test/scripts/manual-temp.test.ts";
+    const lines = [
+      'import { makeTempDir } from "../helpers/temp-dir.js";',
+      'const workspace = makeTempDir(tempDirs, "case-");',
+    ];
+    expect(collect(file, lines)).toEqual([
+      finding(file, 1, lines[0]!, "new manual temp-dir helper import"),
+      finding(file, 2, lines[1]!, "new manual temp-dir helper usage"),
+    ]);
+  });
 
-    expect(output).toContain("Usage: node scripts/report-test-temp-creations.mjs");
-    expect(output).toContain("Outputs:");
-    expect(output).toContain("--no-merge-base");
-    expect(output).toContain("Examples:");
+  it("reports manual helpers added to existing multiline imports", () => {
+    const file = "test/scripts/manual-temp.test.ts";
+    const lines = [
+      "import {",
+      "  useAutoCleanupTempDirTracker,",
+      "  makeTempDir,",
+      '} from "../helpers/temp-dir.js";',
+    ];
+    const diff = [
+      ...diffHeader(file),
+      "@@ -1,3 +1,4 @@",
+      ...lines.slice(0, 4).map((line, index) => `${index === 2 ? "+" : " "}${line}`),
+    ].join("\n");
+
+    expect(collectFindings(diff, { fileTextByPath: { [file]: lines.join("\n") } })).toEqual([
+      finding(
+        file,
+        3,
+        'import { useAutoCleanupTempDirTracker, makeTempDir, } from "../helpers/temp-dir.js";',
+        "new manual temp-dir helper import",
+      ),
+    ]);
+  });
+
+  it("ignores manual helper fixture strings and the helper test file", () => {
+    expect(
+      collect("test/scripts/report-test-temp-creations.test.ts", [
+        'const importFixture = "import { makeTempDir } from \\"../helpers/temp-dir.js\\";";',
+        'const callFixture = "makeTempDir(tempDirs, \\"case-\\")";',
+      ]),
+    ).toEqual([]);
+    expect(
+      collect("test/helpers/temp-dir.test.ts", [
+        'import { createTempDirTracker } from "./temp-dir.js";',
+        "const tempDirs = createTempDirTracker();",
+      ]),
+    ).toEqual([]);
   });
 
   it("formats GitHub warning annotations for CI report mode", () => {
-    expect(
-      formatGithubWarning({
-        file: "test/helpers/temp,fixture.ts",
-        line: 12,
-        reason: "new mkdtemp temp directory creation",
-        // openclaw-temp-dir: allow test fixture for GitHub warning formatting
-        source: "const tempRoot = fs.mkdtempSync();",
-      }),
-    ).toBe(
-      "::warning file=test/helpers/temp%2Cfixture.ts,line=12::new mkdtemp temp directory creation: prefer test/helpers/temp-dir.ts for new test-owned temp directories.",
-    );
+    const warning = formatGithubWarning(finding("test/helpers/temp,fixture.ts", 12, ""));
+    expect(warning).toMatch(/^::warning file=test\/helpers\/temp%2Cfixture.ts,line=12::.+$/u);
   });
 
-  it("exits non-zero for staged findings when requested", () => {
-    const root = tempDirs.make("openclaw-temp-report-");
-    const env = createNestedGitEnv();
-    execFileSync("git", ["init", "-q", "--initial-branch=main"], { cwd: root, env });
-    fs.mkdirSync(path.join(root, "test", "helpers"), { recursive: true });
-    fs.writeFileSync(path.join(root, "test", "helpers", "case.ts"), "const value = 1;\n", "utf8");
-    execFileSync("git", ["add", "test/helpers/case.ts"], { cwd: root, env });
-    execFileSync(
-      "git",
-      [
-        "-c",
-        "user.email=test@example.com",
-        "-c",
-        "user.name=Test User",
-        "commit",
-        "-q",
-        "-m",
-        "initial",
-      ],
-      { cwd: root, env },
-    );
+  it("handles large data and test-directory docs in staged and branch reports", () => {
+    const { write, git, report } = createGitFixture("openclaw-temp-report-large-diff-");
+    git("commit", "--allow-empty", "-q", "-m", "base");
+    write("generated/catalog.json", Buffer.alloc(65 * 1024 * 1024, "x"));
+    const doc = "docs/reference/test/runner-internals.md";
+    write(doc, "# Test runner\n\nManual setup notes.\n");
+    git("add", "generated/catalog.json", doc);
+    expect(report("--staged")).toEqual([]);
 
-    const source = [
-      "const tempRoot = fs.",
-      "mkdtemp",
-      'Sync(path.join(os.tmpdir(), "case-"));\n',
-    ].join("");
-    fs.appendFileSync(path.join(root, "test", "helpers", "case.ts"), source, "utf8");
-    execFileSync("git", ["add", "test/helpers/case.ts"], { cwd: root, env });
+    const file = "src/case[1].test.ts";
+    const source = ["const root = fs.", "mkdtemp", 'Sync("case-");'].join("");
+    write(file, `${source}\n`);
+    git("--literal-pathspecs", "add", "--", file);
+    const expected = [finding(file, 1, source)];
+    expect(report("--staged")).toEqual(expected);
+    git("commit", "-q", "-m", "generated data and test");
+    expect(report("--staged")).toEqual([]);
+    expect(report("--staged", "--base", "HEAD^")).toEqual(expected);
+    expect(report("--base", "HEAD^", "--head", "HEAD")).toEqual(expected);
+    expect(report("--base", "HEAD^", "--head", "HEAD", "--no-merge-base")).toEqual(expected);
+  });
 
-    const result = spawnSync(
-      process.execPath,
-      [
-        path.join(repoRoot, "scripts", "report-test-temp-creations.mjs"),
-        "--staged",
-        "--fail-on-findings",
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env,
-      },
-    );
+  it("falls back to a two-dot diff when refs have no merge base", () => {
+    const { write, git, report } = createGitFixture("openclaw-temp-report-no-merge-base-");
+    git("commit", "--allow-empty", "-q", "-m", "base");
+    git("checkout", "--orphan", "feature", "-q");
+    const file = "test/scripts/feature.test.ts";
+    const source = 'const tempRoot = fs.mkdtempSync("case-");';
+    write(file, `${source}\n`);
+    git("add", file);
+    git("commit", "-q", "-m", "feature");
 
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("test/helpers/case.ts");
+    expect(report("--base", "main", "--head", "feature")).toEqual([finding(file, 1, source)]);
   });
 });

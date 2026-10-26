@@ -1,60 +1,52 @@
-// OC Path module implements edit behavior.
 import {
-  Document,
   isMap,
   isScalar,
   isSeq,
   LineCounter,
   parseDocument,
+  visit,
+  type Document,
   type Node,
-  type Pair,
+  type Scalar,
+  type ScalarTag,
 } from "yaml";
+import { OcPathEditError } from "../edit-error.js";
 import type { OcPath } from "../oc-path.js";
-import {
-  formatOcPath,
-  isPositionalSeg,
-  isQuotedSeg,
-  parseArrayIndexSegment,
-  resolvePositionalSeg,
-  splitRespectingBrackets,
-  unquoteSeg,
-} from "../oc-path.js";
+import { formatOcPath } from "../oc-path.js";
 import { guardSentinel } from "../sentinel.js";
 import type { YamlAst } from "./ast.js";
+import { resolveYamlOcPath } from "./resolve.js";
 
-export type YamlEditResult =
-  | { readonly ok: true; readonly ast: YamlAst }
-  | {
-      readonly ok: false;
-      readonly reason: "unresolved" | "no-root" | "parse-error";
-    };
-
-export function setYamlOcPath(ast: YamlAst, path: OcPath, newValue: unknown): YamlEditResult {
-  if (hasYamlParseErrors(ast)) {
-    return { ok: false, reason: "parse-error" };
+export function setYamlOcPath(ast: YamlAst, path: OcPath, newValue: unknown): YamlAst {
+  if (ast.doc.errors.length > 0) {
+    throw new OcPathEditError("parse-error");
   }
   if (ast.doc.contents === null) {
-    return { ok: false, reason: "no-root" };
+    throw new OcPathEditError("no-root");
   }
   guardYamlSentinel(newValue, formatOcPath(path));
 
-  const rawSegments = pathSegments(path);
-  if (rawSegments.length === 0) {
-    return { ok: false, reason: "unresolved" };
+  // Keep read/write addressing aligned for positional tokens and YAML key coercion.
+  const match = resolveYamlOcPath(ast, path);
+  if (match === null || match.kind === "root") {
+    throw new OcPathEditError("unresolved");
   }
-
-  const segments = resolvePositionalSegments(ast.doc.contents as Node, rawSegments);
-  if (segments === null) {
-    return { ok: false, reason: "unresolved" };
+  const segments = match.path;
+  // Object-valued keys cannot retain their identity when the document is cloned.
+  if (segments.some((segment) => segment !== null && typeof segment === "object")) {
+    throw new OcPathEditError("unresolved");
   }
-
   if (!ast.doc.hasIn(segments)) {
-    return { ok: false, reason: "unresolved" };
+    throw new OcPathEditError("unresolved");
   }
 
-  const { doc: cloned, lineCounter } = cloneDoc(ast.doc);
+  const { doc: cloned, lineCounter, numericSources } = cloneDoc(ast);
+  const previous = cloned.getIn(segments, true);
+  if (isScalar(previous)) {
+    numericSources.delete(previous);
+  }
   cloned.setIn(segments, newValue);
-  return { ok: true, ast: { kind: "yaml", raw: cloned.toString(), doc: cloned, lineCounter } };
+  return { kind: "yaml", raw: cloned.toString(), doc: cloned, lineCounter };
 }
 
 export function insertYamlOcPath(
@@ -62,45 +54,42 @@ export function insertYamlOcPath(
   parentPath: OcPath,
   marker: "+" | { kind: "keyed"; key: string } | { kind: "indexed"; index: number },
   newValue: unknown,
-): YamlEditResult {
-  if (hasYamlParseErrors(ast)) {
-    return { ok: false, reason: "parse-error" };
+): YamlAst {
+  if (ast.doc.errors.length > 0) {
+    throw new OcPathEditError("parse-error");
   }
   if (ast.doc.contents === null) {
-    return { ok: false, reason: "no-root" };
+    throw new OcPathEditError("no-root");
   }
   guardYamlSentinel(newValue, `${formatOcPath(parentPath)}/${formatInsertionMarker(marker)}`);
 
-  const rawParentSegments = pathSegments(parentPath);
-  const segments =
-    rawParentSegments.length === 0
-      ? rawParentSegments
-      : resolvePositionalSegments(ast.doc.contents as Node, rawParentSegments);
-  if (segments === null) {
-    return { ok: false, reason: "unresolved" };
+  const match = resolveYamlOcPath(ast, parentPath);
+  if (match === null) {
+    throw new OcPathEditError("unresolved");
   }
-  const { doc: cloned, lineCounter } = cloneDoc(ast.doc);
+  const segments = match.kind === "root" ? [] : match.path;
+  const { doc: cloned, lineCounter } = cloneDoc(ast);
 
   const parent = segments.length === 0 ? cloned.contents : cloned.getIn(segments, false);
   if (parent === undefined || parent === null) {
-    return { ok: false, reason: "unresolved" };
+    throw new OcPathEditError("unresolved");
   }
 
   if (isMap(parent)) {
     if (typeof marker !== "object" || marker.kind !== "keyed") {
-      return { ok: false, reason: "unresolved" };
+      throw new OcPathEditError("unresolved");
     }
     guardSentinel(marker.key, `${formatOcPath(parentPath)}/${formatInsertionMarker(marker)}`);
     if (cloned.hasIn([...segments, marker.key])) {
-      return { ok: false, reason: "unresolved" };
+      throw new OcPathEditError("unresolved");
     }
     cloned.setIn([...segments, marker.key], newValue);
-    return { ok: true, ast: { kind: "yaml", raw: cloned.toString(), doc: cloned, lineCounter } };
+    return { kind: "yaml", raw: cloned.toString(), doc: cloned, lineCounter };
   }
 
   if (isSeq(parent)) {
     if (typeof marker === "object" && marker.kind === "keyed") {
-      return { ok: false, reason: "unresolved" };
+      throw new OcPathEditError("unresolved");
     }
     if (marker === "+") {
       cloned.addIn(segments, newValue);
@@ -108,77 +97,10 @@ export function insertYamlOcPath(
       const idx = Math.min(marker.index, parent.items.length);
       parent.items.splice(idx, 0, cloned.createNode(newValue) as Node);
     }
-    return { ok: true, ast: { kind: "yaml", raw: cloned.toString(), doc: cloned, lineCounter } };
+    return { kind: "yaml", raw: cloned.toString(), doc: cloned, lineCounter };
   }
 
-  return { ok: false, reason: "unresolved" };
-}
-
-function resolvePositionalSegments(root: Node, segments: readonly string[]): string[] | null {
-  const out: string[] = [];
-  let node: Node | null = root;
-  for (const seg of segments) {
-    if (node === null) {
-      return null;
-    }
-    let segNorm = seg;
-    if (isPositionalSeg(seg)) {
-      const concrete = positionalForYamlNode(node, seg);
-      if (concrete === null) {
-        return null;
-      }
-      segNorm = concrete;
-    }
-    out.push(segNorm);
-    if (isMap(node)) {
-      const pairs: readonly Pair[] = (node as { items: readonly Pair[] }).items;
-      const pair: Pair | undefined = pairs.find((p) => {
-        const k = isScalar(p.key) ? p.key.value : p.key;
-        return String(k) === segNorm;
-      });
-      node = (pair?.value as Node | undefined) ?? null;
-      continue;
-    }
-    if (isSeq(node)) {
-      const idx = parseArrayIndexSegment(segNorm, node.items.length);
-      if (idx === null) {
-        return null;
-      }
-      node = (node.items[idx] as Node | null) ?? null;
-      continue;
-    }
-    node = null;
-  }
-  return out;
-}
-
-function positionalForYamlNode(node: Node, seg: string): string | null {
-  if (isMap(node)) {
-    const pairs: readonly Pair[] = (node as { items: readonly Pair[] }).items;
-    const keys: readonly string[] = pairs.map((p) => String(isScalar(p.key) ? p.key.value : p.key));
-    return resolvePositionalSeg(seg, { indexable: false, size: keys.length, keys });
-  }
-  if (isSeq(node)) {
-    const items: readonly Node[] = (node as { items: readonly Node[] }).items;
-    return resolvePositionalSeg(seg, { indexable: true, size: items.length });
-  }
-  return null;
-}
-
-function pathSegments(path: OcPath): string[] {
-  const segs: string[] = [];
-  const collect = (slot: string | undefined) => {
-    if (slot === undefined) {
-      return;
-    }
-    for (const sub of splitRespectingBrackets(slot, ".")) {
-      segs.push(isQuotedSeg(sub) ? unquoteSeg(sub) : sub);
-    }
-  };
-  collect(path.section);
-  collect(path.item);
-  collect(path.field);
-  return segs;
+  throw new OcPathEditError("unresolved");
 }
 
 function formatInsertionMarker(
@@ -204,16 +126,46 @@ function guardYamlSentinel(value: unknown, ocPath: string): void {
   }
 }
 
-function hasYamlParseErrors(ast: YamlAst): boolean {
-  return ast.doc.errors.length > 0;
-}
-
-function cloneDoc(doc: Document.Parsed): { doc: Document.Parsed; lineCounter: LineCounter } {
+function cloneDoc(ast: YamlAst): {
+  doc: Document.Parsed;
+  lineCounter: LineCounter;
+  numericSources: WeakMap<Scalar, { value: number; source: string }>;
+} {
   const lineCounter = new LineCounter();
-  const cloned = parseDocument(doc.toString(), {
+  const numericSources = new WeakMap<Scalar, { value: number; source: string }>();
+  const cloned = parseDocument(ast.raw, {
     keepSourceTokens: true,
     prettyErrors: false,
     lineCounter,
+    customTags: (tags) =>
+      tags.map((tag) => {
+        if (
+          typeof tag === "string" ||
+          tag.collection !== undefined ||
+          !["tag:yaml.org,2002:int", "tag:yaml.org,2002:float"].includes(tag.tag)
+        ) {
+          return tag;
+        }
+        const stringify = tag.stringify;
+        if (typeof stringify !== "function") {
+          return tag;
+        }
+        const preserveSource: NonNullable<ScalarTag["stringify"]> = (item, ...args) => {
+          const original = numericSources.get(item);
+          return original && Object.is(item.value, original.value)
+            ? original.source
+            : stringify(item, ...args);
+        };
+        return { ...tag, stringify: preserveSource };
+      }),
   });
-  return { doc: cloned, lineCounter };
+  // Retain exact numeric tokens without changing the parser's Number read contract.
+  visit(cloned, {
+    Scalar(_key, node) {
+      if (typeof node.value === "number" && node.source !== undefined) {
+        numericSources.set(node, { value: node.value, source: node.source });
+      }
+    },
+  });
+  return { doc: cloned, lineCounter, numericSources };
 }

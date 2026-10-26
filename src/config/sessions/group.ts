@@ -1,10 +1,8 @@
-// Group session keys convert channel-specific group metadata into stable store ids.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import { normalizeHyphenSlug } from "@openclaw/normalization-core/string-normalization";
 import type { MsgContext } from "../../auto-reply/templating.js";
 import { listChannelPlugins } from "../../channels/plugins/registry.js";
 import { normalizeSessionPeerId } from "../../sessions/session-key-utils.js";
@@ -13,17 +11,11 @@ import type { GroupKeyResolution } from "./types.js";
 
 const getGroupSurfaces = () => new Set<string>([...listDeliverableMessageChannels(), "webchat"]);
 
-type LegacyGroupSessionSurface = {
-  resolveLegacyGroupSessionKey?: (ctx: MsgContext) => GroupKeyResolution | null;
-};
-
 function resolveLegacyGroupSessionKey(ctx: MsgContext): GroupKeyResolution | null {
   // Legacy plugin resolvers stay first-class because some channels still expose native group ids
   // only through channel-owned context parsing.
   for (const plugin of listChannelPlugins()) {
-    const resolved = (
-      plugin.messaging as LegacyGroupSessionSurface | undefined
-    )?.resolveLegacyGroupSessionKey?.(ctx);
+    const resolved = plugin.messaging?.resolveLegacyGroupSessionKey?.(ctx);
     if (resolved) {
       return resolved;
     }
@@ -31,8 +23,8 @@ function resolveLegacyGroupSessionKey(ctx: MsgContext): GroupKeyResolution | nul
   return null;
 }
 
-function normalizeGroupLabel(raw?: string) {
-  return normalizeHyphenSlug(raw);
+function joinOpaqueTail(parts: string[], start: number): string | null {
+  return normalizeOptionalString(parts[start]) ? parts.slice(start).join(":") : null;
 }
 
 function resolveOriginatingGroupTargetId(params: {
@@ -43,7 +35,7 @@ function resolveOriginatingGroupTargetId(params: {
   if (!target) {
     return null;
   }
-  const parts = target.split(":").filter(Boolean);
+  const parts = target.split(":");
   if (parts.length < 2) {
     return null;
   }
@@ -54,59 +46,12 @@ function resolveOriginatingGroupTargetId(params: {
   const second = normalizeOptionalLowercaseString(parts[1]);
   const secondIsKind = second === "group" || second === "channel";
   if (secondIsKind && (head === params.provider || getGroupSurfaces().has(head))) {
-    return parts.slice(2).join(":") || null;
+    return joinOpaqueTail(parts, 2);
   }
-  if (head === params.provider || head === "chat" || head === "room" || head === "group") {
-    return parts.slice(1).join(":") || null;
-  }
-  if (head === "channel") {
-    return parts.slice(1).join(":") || null;
+  if (head === params.provider || ["chat", "room", "group", "channel"].includes(head)) {
+    return joinOpaqueTail(parts, 1);
   }
   return null;
-}
-
-function shortenGroupId(value?: string) {
-  const trimmed = normalizeOptionalString(value) ?? "";
-  if (!trimmed) {
-    return "";
-  }
-  if (trimmed.length <= 14) {
-    return trimmed;
-  }
-  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
-}
-
-/** Builds a compact display label for group sessions from channel metadata or ids. */
-export function buildGroupDisplayName(params: {
-  provider?: string;
-  subject?: string;
-  groupChannel?: string;
-  space?: string;
-  id?: string;
-  key: string;
-}) {
-  const providerKey = normalizeOptionalLowercaseString(params.provider) ?? "group";
-  const groupChannel = normalizeOptionalString(params.groupChannel);
-  const space = normalizeOptionalString(params.space);
-  const subject = normalizeOptionalString(params.subject);
-  const detail =
-    (groupChannel && space
-      ? `${space}${groupChannel.startsWith("#") ? "" : "#"}${groupChannel}`
-      : groupChannel || subject || space || "") || "";
-  const fallbackId = normalizeOptionalString(params.id) ?? params.key;
-  const rawLabel = detail || fallbackId;
-  let token = normalizeGroupLabel(rawLabel);
-  // Very long opaque ids become a readable stable token instead of leaking full route ids into UI.
-  if (!token) {
-    token = normalizeGroupLabel(shortenGroupId(rawLabel));
-  }
-  if (!params.groupChannel && token.startsWith("#")) {
-    token = token.replace(/^#+/, "");
-  }
-  if (token && !/^[@#]/.test(token) && !token.startsWith("g-") && !token.includes("#")) {
-    token = `g-${token}`;
-  }
-  return token ? `${providerKey}:${token}` : providerKey;
 }
 
 /**
@@ -134,7 +79,7 @@ export function resolveGroupSessionKey(ctx: MsgContext): GroupKeyResolution | nu
 
   const providerHint = normalizeOptionalLowercaseString(ctx.Provider);
 
-  const parts = from.split(":").filter(Boolean);
+  const parts = from.split(":");
   const head = normalizeLowercaseStringOrEmpty(parts[0]);
   const headIsSurface = head ? getGroupSurfaces().has(head) : false;
 
@@ -164,9 +109,12 @@ export function resolveGroupSessionKey(ctx: MsgContext): GroupKeyResolution | nu
     ? originatingGroupTargetId
     : headIsSurface
       ? secondIsKind
-        ? parts.slice(2).join(":")
-        : parts.slice(1).join(":")
+        ? joinOpaqueTail(parts, 2)
+        : joinOpaqueTail(parts, 1)
       : from;
+  if (!id) {
+    return null;
+  }
   const finalId = normalizeSessionPeerId({ channel: provider, peerKind: kind, peerId: id });
   if (!finalId) {
     return null;

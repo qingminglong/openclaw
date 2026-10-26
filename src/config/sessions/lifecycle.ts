@@ -1,19 +1,26 @@
 // Session lifecycle timestamps prefer store metadata and fall back to transcript headers.
-import fs from "node:fs";
-import fsp from "node:fs/promises";
-import { asDateTimestampMs } from "../../shared/number-coercion.js";
-import { canonicalizeMainSessionAlias } from "./main-session.js";
 import {
-  resolveSessionFilePath,
-  resolveSessionFilePathOptions,
-  type SessionFilePathOptions,
-} from "./paths.js";
+  resolveTimestamp,
+  resolveSessionLifecycleTimestampsWithHeader,
+} from "./lifecycle-timestamps.js";
+import type { SessionLifecycleTimestamps } from "./lifecycle.types.js";
+import { canonicalizeMainSessionAlias } from "./main-session.js";
+import { loadTranscriptHeaderSync } from "./session-accessor.js";
 import { isTerminalSessionStatus, type SessionEntry, type SessionScope } from "./types.js";
+export {
+  createSessionWorkStartChangedError,
+  isSessionWorkStartInvalidatedError,
+  SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE,
+  SessionRestartRecoveryTombstoneError,
+  SessionWorkStartChangedError,
+  SessionWorkStartInvalidatedError,
+} from "./work-start-error.js";
 
-type SessionLifecycleEntry = Pick<
-  SessionEntry,
-  "sessionId" | "sessionFile" | "sessionStartedAt" | "lastInteractionAt" | "updatedAt"
->;
+export {
+  isRestartRecoveryTombstone,
+  resolveSessionWorkStartError,
+  SESSION_LIFECYCLE_CHANGED_ERROR_REASON,
+} from "./session-work-start.js";
 
 // Transcript headers are read lazily to recover startedAt without parsing full files.
 
@@ -31,113 +38,23 @@ type TerminalMainSessionTranscriptRegistryCheck = {
   registryTimestampMs: number;
 };
 
-function resolveTimestamp(value: number | undefined): number | undefined {
-  const timestampMs = asDateTimestampMs(value);
-  return timestampMs !== undefined && timestampMs >= 0 ? timestampMs : undefined;
-}
-
 function resolvePositiveTimestamp(value: number | undefined): number | undefined {
   const timestampMs = resolveTimestamp(value);
   return timestampMs !== undefined && timestampMs > 0 ? timestampMs : undefined;
 }
 
-function parseTimestampMs(value: unknown): number | undefined {
-  if (typeof value === "number") {
-    return resolveTimestamp(value);
-  }
-  if (typeof value !== "string" || !value.trim()) {
-    return undefined;
-  }
-  const parsed = Date.parse(value);
-  return resolveTimestamp(parsed);
-}
-
-function readFirstLine(filePath: string): string | undefined {
-  try {
-    const fd = fs.openSync(filePath, "r");
-    try {
-      const buffer = Buffer.alloc(8192);
-      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
-      if (bytesRead <= 0) {
-        return undefined;
-      }
-      const chunk = buffer.subarray(0, bytesRead).toString("utf8");
-      const newline = chunk.indexOf("\n");
-      return newline >= 0 ? chunk.slice(0, newline) : chunk;
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return undefined;
-  }
-}
-
-/** Reads session start time from a transcript header when store metadata is missing. */
-export function readSessionHeaderStartedAtMs(params: {
-  entry: SessionLifecycleEntry | undefined;
-  agentId?: string;
-  storePath?: string;
-  pathOptions?: SessionFilePathOptions;
-}): number | undefined {
-  const sessionId = params.entry?.sessionId?.trim();
-  if (!sessionId) {
-    return undefined;
-  }
-  const pathOptions =
-    params.pathOptions ??
-    resolveSessionFilePathOptions({
-      agentId: params.agentId,
-      storePath: params.storePath,
-    });
-  let sessionFile: string;
-  try {
-    sessionFile = resolveSessionFilePath(sessionId, params.entry, pathOptions);
-  } catch {
-    return undefined;
-  }
-  const firstLine = readFirstLine(sessionFile);
-  if (!firstLine) {
-    return undefined;
-  }
-  try {
-    const header = JSON.parse(firstLine) as {
-      type?: unknown;
-      id?: unknown;
-      timestamp?: unknown;
-    };
-    if (header.type !== "session") {
-      return undefined;
-    }
-    if (typeof header.id === "string" && header.id.trim() && header.id !== sessionId) {
-      return undefined;
-    }
-    return parseTimestampMs(header.timestamp);
-  } catch {
-    return undefined;
-  }
-}
-
 export function resolveSessionLifecycleTimestamps(params: {
-  entry: SessionLifecycleEntry | undefined;
+  entry: Parameters<typeof resolveSessionLifecycleTimestampsWithHeader>[0]["entry"];
   agentId?: string;
+  sessionKey?: string;
   storePath?: string;
-  pathOptions?: SessionFilePathOptions;
-}): { sessionStartedAt?: number; lastInteractionAt?: number } {
-  const entry = params.entry;
-  if (!entry) {
-    return {};
-  }
-  return {
-    sessionStartedAt:
-      resolveTimestamp(entry.sessionStartedAt) ??
-      readSessionHeaderStartedAtMs({
-        entry,
-        agentId: params.agentId,
-        storePath: params.storePath,
-        pathOptions: params.pathOptions,
-      }),
-    lastInteractionAt: resolveTimestamp(entry.lastInteractionAt),
-  };
+  readHeader?: (sessionId: string) => unknown;
+}): SessionLifecycleTimestamps {
+  return resolveSessionLifecycleTimestampsWithHeader({
+    ...params,
+    readHeader: (scope) =>
+      params.readHeader ? params.readHeader(scope.sessionId) : loadTranscriptHeaderSync(scope),
+  });
 }
 
 export function resolveTerminalMainSessionTranscriptRegistryCheck(
@@ -159,10 +76,12 @@ export function resolveTerminalMainSessionTranscriptRegistryCheck(
   if (candidateSessionKey !== configuredMainSessionKey) {
     return undefined;
   }
-  const hasTerminalLifecycle =
-    isTerminalSessionStatus(params.entry.status) ||
-    resolvePositiveTimestamp(params.entry.endedAt) !== undefined;
-  if (!hasTerminalLifecycle) {
+  if (!isTerminalSessionStatus(params.entry.status)) {
+    return undefined;
+  }
+  if (params.entry.status === "done") {
+    // Successful rows stay reusable: transcript writes can land after registry
+    // updates without making the session stale.
     return undefined;
   }
   if (params.entry.status === "failed") {
@@ -176,65 +95,9 @@ export function resolveTerminalMainSessionTranscriptRegistryCheck(
   if (registryTimestampMs === undefined) {
     return undefined;
   }
-  const sessionId = typeof params.entry.sessionId === "string" ? params.entry.sessionId.trim() : "";
+  const sessionId = params.entry.sessionId.trim();
   if (!sessionId) {
     return undefined;
   }
   return { sessionId, registryTimestampMs };
-}
-
-function isTranscriptMtimeNewerThanRegistry(params: {
-  transcriptMtimeMs: number;
-  registryTimestampMs: number;
-}): boolean {
-  const transcriptMtimeMs = Math.floor(params.transcriptMtimeMs);
-  const registryTimestampMs = Math.floor(params.registryTimestampMs);
-  return Number.isFinite(transcriptMtimeMs) && transcriptMtimeMs > registryTimestampMs;
-}
-
-export function hasTerminalMainSessionTranscriptNewerThanRegistrySync(
-  params: TerminalMainSessionTranscriptRegistryParams,
-): boolean {
-  const check = resolveTerminalMainSessionTranscriptRegistryCheck(params);
-  if (!check) {
-    return false;
-  }
-  const pathOptions = resolveSessionFilePathOptions({
-    agentId: params.agentId,
-    storePath: params.storePath,
-  });
-  try {
-    const sessionFile = resolveSessionFilePath(check.sessionId, params.entry, pathOptions);
-    const stats = fs.statSync(sessionFile);
-    return isTranscriptMtimeNewerThanRegistry({
-      transcriptMtimeMs: stats.mtimeMs,
-      registryTimestampMs: check.registryTimestampMs,
-    });
-  } catch {
-    return false;
-  }
-}
-
-export async function hasTerminalMainSessionTranscriptNewerThanRegistry(
-  params: TerminalMainSessionTranscriptRegistryParams,
-): Promise<boolean> {
-  const check = resolveTerminalMainSessionTranscriptRegistryCheck(params);
-  if (!check) {
-    return false;
-  }
-  const pathOptions = resolveSessionFilePathOptions({
-    agentId: params.agentId,
-    storePath: params.storePath,
-  });
-  try {
-    // Session admission owns this bounded stat as the terminal-main reconciliation gate.
-    const sessionFile = resolveSessionFilePath(check.sessionId, params.entry, pathOptions);
-    const stats = await fsp.stat(sessionFile);
-    return isTranscriptMtimeNewerThanRegistry({
-      transcriptMtimeMs: stats.mtimeMs,
-      registryTimestampMs: check.registryTimestampMs,
-    });
-  } catch {
-    return false;
-  }
 }

@@ -1,17 +1,21 @@
 {
   "name": "@openclaw/codex",
-  "version": "2026.6.10",
-  "description": "OpenClaw Codex app-server harness and model provider plugin with a Codex-managed GPT catalog.",
+  "version": "2026.10.7",
+  "description": "OpenClaw Codex app-server harness and native session supervision plugin.",
   "repository": {
     "type": "git",
     "url": "https://github.com/openclaw/openclaw"
   },
   "type": "module",
   "dependencies": {
-    "@openai/codex": "0.139.0",
-    "typebox": "1.1.39",
-    "ws": "8.21.0",
-    "zod": "4.4.3"
+    "@openai/codex": "0.164.0",
+    "@openclaw/fs-safe": "0.26.13",
+    "acorn": "8.19.0",
+    "semver": "7.8.5",
+    "smol-toml": "1.9.1",
+    "typebox": "1.4.1",
+    "ws": "8.22.0",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@openclaw/plugin-sdk": "workspace:*"
@@ -21,6 +25,7 @@
       "./index.ts"
     ],
     "install": {
+      "clawhubSpec": "clawhub:@openclaw/codex",
       "npmSpec": "@openclaw/codex",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.5.1-beta.1",
@@ -34,14 +39,21 @@
       ]
     },
     "compat": {
-      "pluginApi": ">=2026.6.10"
+      "pluginApi": ">=2026.10.7"
     },
     "build": {
-      "openclawVersion": "2026.6.10"
+      "openclawVersion": "2026.10.7",
+      "workerEntries": [
+        "./catalog-page.worker.ts",
+        "./session-history.worker.ts"
+      ]
     },
     "release": {
       "publishToClawHub": true,
       "publishToNpm": true,
+      "requireLatestDependencies": [
+        "@openai/codex"
+      ],
       "bundleRuntimeDependencies": false
     }
   }

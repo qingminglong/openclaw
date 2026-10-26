@@ -1,4 +1,3 @@
-// Command status runtime helpers collect agent/session state for plugin command status output.
 import { listAgentEntries, resolveSessionAgentId } from "../agents/agent-scope.js";
 import { resolveDefaultModelForAgent } from "../agents/model-selection.js";
 import { buildStatusReply } from "../auto-reply/reply/commands-status.js";
@@ -7,8 +6,9 @@ import { resolveDefaultModel } from "../auto-reply/reply/directive-handling.defa
 import { resolveCurrentDirectiveLevels } from "../auto-reply/reply/directive-handling.levels.js";
 import { createModelSelectionState } from "../auto-reply/reply/model-selection.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
+import { getRuntimeConfig } from "../config/io.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { loadSessionEntry } from "../gateway/session-utils.js";
+import { loadGatewaySessionEntryReadOnlyInWorker } from "../gateway/session-utils-store-worker.js";
 
 /** Inputs for rendering direct-session status replies outside the active channel turn. */
 export type ResolveDirectStatusReplyForSessionParams = {
@@ -35,7 +35,7 @@ export type ResolveDirectStatusReplyForSessionParams = {
  * Unauthorized requesters may see the session exists, but configured reasoning
  * state is masked so private agent/session defaults are not leaked.
  */
-export async function resolveDirectStatusReplyForSession(
+export async function resolveDirectStatusReplyForSessionCore(
   params: ResolveDirectStatusReplyForSessionParams,
 ): Promise<ReplyPayload | undefined> {
   const requestedSessionKey = params.sessionKey.trim();
@@ -43,7 +43,10 @@ export async function resolveDirectStatusReplyForSession(
     return undefined;
   }
 
-  const statusLoaded = loadSessionEntry(requestedSessionKey);
+  const statusLoaded = await loadGatewaySessionEntryReadOnlyInWorker({
+    cfg: getRuntimeConfig(),
+    key: requestedSessionKey,
+  });
   const statusCfg = statusLoaded.cfg ?? params.cfg;
   const statusSessionKey = statusLoaded.canonicalKey;
   const statusEntry = statusLoaded.entry;
@@ -96,6 +99,7 @@ export async function resolveDirectStatusReplyForSession(
     agentCfg,
     resolveDefaultThinkingLevel: () => modelState.resolveDefaultThinkingLevel(),
   });
+  const thinkingCatalog = await modelState.resolveThinkingCatalog();
   let resolvedReasoningLevel = currentReasoningLevel;
   const hasAgentReasoningDefault =
     (agentEntry?.reasoningDefault !== undefined && agentEntry.reasoningDefault !== null) ||
@@ -126,6 +130,7 @@ export async function resolveDirectStatusReplyForSession(
 
   return await buildStatusReply({
     cfg: statusCfg,
+    agentId: statusAgentId,
     command,
     sessionEntry: statusEntry,
     sessionKey: statusSessionKey,
@@ -135,6 +140,7 @@ export async function resolveDirectStatusReplyForSession(
     provider: selectedProvider,
     model: selectedModel,
     contextTokens: statusEntry?.contextTokens ?? 0,
+    thinkingCatalog,
     resolvedThinkLevel: currentThinkLevel,
     resolvedFastMode: currentFastMode,
     resolvedVerboseLevel: currentVerboseLevel ?? "off",

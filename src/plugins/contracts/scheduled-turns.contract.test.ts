@@ -5,30 +5,32 @@ import {
   registerTestPlugin,
 } from "openclaw/plugin-sdk/plugin-test-contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CronServiceContract } from "../../cron/service-contract.js";
 import type { CronJob, CronJobCreate } from "../../cron/types.js";
 import type {
   GatewayRequestHandler,
   GatewayRequestHandlerOptions,
 } from "../../gateway/server-methods/types.js";
 import { withEnv } from "../../test-utils/env.js";
-import { cleanupReplacedPluginHostRegistry } from "../host-hook-cleanup.js";
+import { createPluginHostRegistryRetirement } from "../host-hook-cleanup.js";
 import {
   clearPluginHostRuntimeState,
   cleanupPluginSessionSchedulerJobs,
-  listPluginSessionSchedulerJobs,
 } from "../host-hook-runtime.js";
+import { listPluginSessionSchedulerJobs } from "../host-hook-runtime.test-fixtures.js";
 import {
-  buildPluginSchedulerCronName,
   schedulePluginSessionTurn,
   unschedulePluginSessionTurnsByTag,
 } from "../host-hook-scheduled-turns.js";
-import { clearPluginLoaderCache, loadOpenClawPlugins } from "../loader.js";
-import { makeTempDir, writePlugin } from "../loader.test-fixtures.js";
-import { createEmptyPluginRegistry } from "../registry-empty.js";
-import { setActivePluginRegistry } from "../runtime.js";
+import { loadOpenClawPlugins } from "../loader.js";
+import {
+  clearPluginLoaderCache,
+  makePluginLoaderTempDir,
+  writePlugin,
+} from "../loader.test-fixtures.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../runtime.js";
 import { createPluginRecord } from "../status.test-helpers.js";
 import type { OpenClawPluginApi } from "../types.js";
+import { createMockCronService } from "./scheduled-turns.test-support.js";
 
 const workflowMocks = vi.hoisted(() => ({
   cronAdd: vi.fn(),
@@ -85,32 +87,6 @@ async function invokePluginGatewayHandler(params: {
   });
 }
 
-function createMockCronService(): CronServiceContract {
-  return {
-    start: vi.fn(async () => undefined),
-    stop: vi.fn(),
-    status: vi.fn(async () => ({
-      enabled: true,
-      storePath: "/tmp/openclaw-test-cron.json",
-      storage: "sqlite" as const,
-      sqlitePath: "/tmp/openclaw-test-state/state/openclaw.sqlite",
-      jobs: 0,
-      nextWakeAtMs: null,
-    })),
-    list: vi.fn(async () => []),
-    listPage: workflowMocks.cronListPage,
-    add: workflowMocks.cronAdd,
-    update: vi.fn(async (id, patch) => makeCronJob({ id, ...patch })),
-    remove: workflowMocks.cronRemove,
-    run: vi.fn(async () => ({ ok: true, ran: false, reason: "not-due" })),
-    enqueueRun: vi.fn(async () => ({ ok: true, ran: false, reason: "not-due" })),
-    getJob: vi.fn(() => undefined),
-    readJob: vi.fn(async () => undefined),
-    getDefaultAgentId: vi.fn(() => undefined),
-    wake: vi.fn(() => ({ ok: true })),
-  } as CronServiceContract;
-}
-
 function makeCronJob(input: Partial<CronJob> & { id: string }): CronJob {
   return {
     name: input.name ?? input.id,
@@ -127,10 +103,76 @@ function makeCronJob(input: Partial<CronJob> & { id: string }): CronJob {
   };
 }
 
-const cron = createMockCronService();
+const cron = createMockCronService(workflowMocks, makeCronJob);
 
 function mockCronAdd(response: CronJob) {
   workflowMocks.cronAdd.mockResolvedValue(response);
+}
+
+function cronPage(
+  jobs: CronJob[] = [],
+  overrides: Partial<Awaited<ReturnType<typeof cron.listPage>>> = {},
+) {
+  return {
+    jobs,
+    snapshotRevision: "fixture",
+    total: jobs.length,
+    offset: 0,
+    limit: 200,
+    hasMore: false,
+    nextOffset: null,
+    ...overrides,
+  };
+}
+
+function taggedJob(
+  id: string,
+  suffix: string,
+  pluginId = WORKFLOW_PLUGIN_ID,
+  sessionKey = MAIN_SESSION_KEY,
+) {
+  return makeCronJob({
+    id,
+    name: `plugin:${pluginId}:tag:nudge:${sessionKey}:${suffix}`,
+    sessionTarget: `session:${sessionKey}`,
+  });
+}
+
+function sessionTurnHandle(
+  id: string,
+  pluginId = WORKFLOW_PLUGIN_ID,
+  sessionKey = MAIN_SESSION_KEY,
+) {
+  return { id, pluginId, sessionKey, kind: "session-turn" };
+}
+
+function trackRemovedJobs() {
+  const removed: string[] = [];
+  workflowMocks.cronRemove.mockImplementation(async (id: string) => {
+    removed.push(id);
+    return { ok: true, removed: true };
+  });
+  return removed;
+}
+
+function loadSchedulerPlugin(bundledDir: string, pluginId: string) {
+  return withEnv(
+    { OPENCLAW_BUNDLED_PLUGINS_DIR: bundledDir, OPENCLAW_DISABLE_BUNDLED_PLUGINS: undefined },
+    () =>
+      loadOpenClawPlugins({
+        cache: false,
+        hostServices: { cron },
+        config: { plugins: { enabled: true, entries: { [pluginId]: { enabled: true } } } },
+      }),
+  );
+}
+
+function schedulerOwner(name?: string) {
+  const fixture = createPluginRegistryFixture();
+  fixture.registry.registry.plugins.push(
+    createPluginRecord({ id: WORKFLOW_PLUGIN_ID, ...(name ? { name } : {}), origin: "bundled" }),
+  );
+  return fixture;
 }
 
 function getCronAddBody() {
@@ -147,12 +189,7 @@ function expectSessionTurnHandle(
   pluginId = WORKFLOW_PLUGIN_ID,
   sessionKey = MAIN_SESSION_KEY,
 ) {
-  expect(handle).toEqual({
-    id,
-    pluginId,
-    sessionKey,
-    kind: "session-turn",
-  });
+  expect(handle).toEqual(sessionTurnHandle(id, pluginId, sessionKey));
 }
 
 async function scheduleWorkflowTurn(
@@ -191,14 +228,7 @@ describe("plugin scheduled turns", () => {
     workflowMocks.cronAdd.mockReset();
     workflowMocks.cronListPage.mockReset();
     workflowMocks.cronRemove.mockReset();
-    workflowMocks.cronListPage.mockResolvedValue({
-      jobs: [],
-      total: 0,
-      offset: 0,
-      limit: 200,
-      hasMore: false,
-      nextOffset: null,
-    });
+    workflowMocks.cronListPage.mockResolvedValue(cronPage([]));
     workflowMocks.cronRemove.mockResolvedValue({ ok: true, removed: true });
   });
 
@@ -206,25 +236,7 @@ describe("plugin scheduled turns", () => {
     vi.useRealTimers();
     clearPluginLoaderCache();
     clearPluginHostRuntimeState();
-    setActivePluginRegistry(createEmptyPluginRegistry());
-  });
-
-  it("builds tagged and untagged cron names", () => {
-    expect(
-      buildPluginSchedulerCronName({
-        pluginId: WORKFLOW_PLUGIN_ID,
-        sessionKey: MAIN_SESSION_KEY,
-        tag: "nudge",
-        uniqueId: "abc",
-      }),
-    ).toBe("plugin:workflow-plugin:tag:nudge:agent:main:main:abc");
-    expect(
-      buildPluginSchedulerCronName({
-        pluginId: WORKFLOW_PLUGIN_ID,
-        sessionKey: MAIN_SESSION_KEY,
-        uniqueId: "xyz",
-      }),
-    ).toBe("plugin:workflow-plugin:agent:main:main:xyz");
+    resetPluginRuntimeStateForTest();
   });
 
   it("schedules session turns with cron-compatible tagged cleanup metadata", async () => {
@@ -288,52 +300,37 @@ describe("plugin scheduled turns", () => {
   });
 
   it("pages through cron.list when unscheduling tagged turns", async () => {
-    const removed: string[] = [];
+    const removed = trackRemovedJobs();
     const listRequests: unknown[] = [];
     workflowMocks.cronListPage.mockImplementation(async (body: unknown) => {
       const offset = (body as { offset?: unknown }).offset;
       listRequests.push(body);
-      if (offset === undefined) {
+      if (offset === 0) {
         return {
-          jobs: [
+          jobs: Array.from({ length: 200 }, (_, index) =>
             makeCronJob({
-              id: "job-page-1",
-              name: "plugin:workflow-plugin:tag:nudge:agent:main:main:1",
+              id: `job-page-1-${index}`,
+              name: `plugin:workflow-plugin:tag:nudge:agent:main:main:${String(index).padStart(3, "0")}`,
               sessionTarget: "session:agent:main:main",
             }),
-          ],
-          total: 2,
+          ),
+          snapshotRevision: "fixture",
+          total: 201,
           offset: 0,
           limit: 200,
           hasMore: true,
           nextOffset: 200,
         };
       }
-      return {
-        jobs: [
-          makeCronJob({
-            id: "job-page-2",
-            name: "plugin:workflow-plugin:tag:nudge:agent:main:main:2",
-            sessionTarget: "session:agent:main:main",
-          }),
-        ],
-        total: 2,
-        offset: 200,
-        limit: 200,
-        hasMore: false,
-        nextOffset: null,
-      };
-    });
-    workflowMocks.cronRemove.mockImplementation(async (id: string) => {
-      removed.push(id);
-      return { ok: true, removed: true };
+      return cronPage([taggedJob("job-page-2", "2")], { total: 201, offset: 200 });
     });
 
-    await expect(unscheduleWorkflowTurnsByTag()).resolves.toEqual({ removed: 2, failed: 0 });
+    await expect(unscheduleWorkflowTurnsByTag()).resolves.toEqual({ removed: 201, failed: 0 });
     expect(listRequests).toEqual([
       {
         includeDisabled: true,
         limit: 200,
+        offset: 0,
         query: "plugin:workflow-plugin:tag:nudge:agent:main:main:",
         sortBy: "name",
         sortDir: "asc",
@@ -347,7 +344,8 @@ describe("plugin scheduled turns", () => {
         sortDir: "asc",
       },
     ]);
-    expect(removed.toSorted()).toEqual(["job-page-1", "job-page-2"]);
+    expect(new Set(removed).size).toBe(201);
+    expect(removed).toContain("job-page-2");
   });
 
   it("tracks scheduled session turns using cron.add's top-level job id", async () => {
@@ -387,12 +385,7 @@ describe("plugin scheduled turns", () => {
       scheduleWorkflowTurn({
         pluginName: "Workflow Plugin",
       }),
-    ).resolves.toEqual({
-      id: "one-shot-job",
-      pluginId: WORKFLOW_PLUGIN_ID,
-      sessionKey: MAIN_SESSION_KEY,
-      kind: "session-turn",
-    });
+    ).resolves.toEqual(sessionTurnHandle("one-shot-job"));
     expect(listPluginSessionSchedulerJobs(WORKFLOW_PLUGIN_ID)).toHaveLength(1);
 
     await vi.advanceTimersByTimeAsync(60_999);
@@ -411,54 +404,23 @@ describe("plugin scheduled turns", () => {
   });
 
   it("rejects invalid schedules, unsupported delivery modes, and ambiguous tags before cron.add", async () => {
-    await expect(
-      schedulePluginSessionTurn({
-        pluginId: "workflow-plugin",
-        origin: "bundled",
-        schedule: {
-          sessionKey: "agent:main:main",
-          message: "wake",
-          delayMs: -1,
-        },
-      }),
-    ).resolves.toBeUndefined();
-
-    await expect(
-      schedulePluginSessionTurn({
-        pluginId: "workflow-plugin",
-        origin: "bundled",
-        schedule: {
-          sessionKey: "agent:main:main",
-          message: "wake",
-          delayMs: 1_000,
-          deliveryMode: "unsupported" as never,
-        },
-      }),
-    ).resolves.toBeUndefined();
-    await expect(
-      schedulePluginSessionTurn({
-        pluginId: "workflow-plugin",
-        origin: "bundled",
-        schedule: {
-          sessionKey: "agent:main:main",
-          message: "wake",
-          cron: "*/5 * * * *",
-          deleteAfterRun: true,
-        } as never,
-      }),
-    ).resolves.toBeUndefined();
-    await expect(
-      schedulePluginSessionTurn({
-        pluginId: "workflow-plugin",
-        origin: "bundled",
-        schedule: {
-          sessionKey: "agent:main:main",
-          message: "wake",
-          delayMs: 1_000,
-          tag: "nudge:followup",
-        },
-      }),
-    ).resolves.toBeUndefined();
+    const reject = (schedule: SessionTurnSchedule) =>
+      expect(
+        schedulePluginSessionTurn({
+          pluginId: WORKFLOW_PLUGIN_ID,
+          origin: "bundled",
+          schedule,
+        }),
+      ).resolves.toBeUndefined();
+    await reject({ ...DEFAULT_TURN_SCHEDULE, delayMs: -1 });
+    await reject({ ...DEFAULT_TURN_SCHEDULE, deliveryMode: "unsupported" as never });
+    await reject({
+      sessionKey: MAIN_SESSION_KEY,
+      message: "wake",
+      cron: "*/5 * * * *",
+      deleteAfterRun: true,
+    } as never);
+    await reject({ ...DEFAULT_TURN_SCHEDULE, tag: "nudge:followup" });
     expect(workflowMocks.cronAdd).not.toHaveBeenCalled();
   });
 
@@ -485,14 +447,10 @@ describe("plugin scheduled turns", () => {
 
   it("removes a stale cron job when the plugin unloads after cron.add", async () => {
     let commit = true;
-    const removed: string[] = [];
+    const removed = trackRemovedJobs();
     workflowMocks.cronAdd.mockImplementation(async () => {
       commit = false;
       return makeCronJob({ id: "job-stale" });
-    });
-    workflowMocks.cronRemove.mockImplementation(async (id: string) => {
-      removed.push(id);
-      return { ok: true, removed: true };
     });
 
     await expect(
@@ -506,46 +464,21 @@ describe("plugin scheduled turns", () => {
   });
 
   it("allows bundled plugins to schedule turns during real plugin registration", async () => {
-    const bundledDir = makeTempDir();
+    const bundledDir = makePluginLoaderTempDir();
     writePlugin({
       id: "loader-scheduler",
       dir: bundledDir,
       filename: "index.cjs",
-      body: `module.exports = {
-  id: "loader-scheduler",
-  register(api) {
-    void api.session.workflow.scheduleSessionTurn({
-      sessionKey: "agent:main:main",
-      message: "wake",
-      delayMs: 1
-    });
-  }
-};`,
+      registration: `void api.session.workflow.scheduleSessionTurn({
+        sessionKey: "agent:main:main",
+        message: "wake",
+        delayMs: 1
+      });`,
     });
     workflowMocks.cronAdd.mockResolvedValue(makeCronJob({ id: "loader-scheduled-job" }));
     workflowMocks.cronRemove.mockResolvedValue({ ok: true, removed: true });
 
-    const registry = withEnv(
-      {
-        OPENCLAW_BUNDLED_PLUGINS_DIR: bundledDir,
-        OPENCLAW_DISABLE_BUNDLED_PLUGINS: undefined,
-      },
-      () =>
-        loadOpenClawPlugins({
-          cache: false,
-          hostServices: { cron },
-          config: {
-            plugins: {
-              enabled: true,
-              entries: {
-                "loader-scheduler": {
-                  enabled: true,
-                },
-              },
-            },
-          },
-        }),
-    );
+    const registry = loadSchedulerPlugin(bundledDir, "loader-scheduler");
 
     expect(registry.plugins.find((plugin) => plugin.id === "loader-scheduler")?.status).toBe(
       "loaded",
@@ -570,67 +503,57 @@ describe("plugin scheduled turns", () => {
       },
     });
     expect(listPluginSessionSchedulerJobs("loader-scheduler")).toEqual([
-      {
-        id: "loader-scheduled-job",
-        pluginId: "loader-scheduler",
-        sessionKey: "agent:main:main",
-        kind: "session-turn",
-      },
+      sessionTurnHandle("loader-scheduled-job", "loader-scheduler"),
     ]);
   });
 
   it("keeps late scheduled-turn helpers callable from real plugin gateway handlers", async () => {
-    const bundledDir = makeTempDir();
+    const bundledDir = makePluginLoaderTempDir();
     writePlugin({
       id: "loader-scheduler-runtime",
       dir: bundledDir,
       filename: "index.cjs",
-      body: `module.exports = {
-  id: "loader-scheduler-runtime",
-  register(api) {
-    const scheduleSessionTurn = api.session.workflow.scheduleSessionTurn;
-    const unscheduleSessionTurnsByTag = api.session.workflow.unscheduleSessionTurnsByTag;
-    api.registerGatewayMethod("loader-scheduler-runtime.exercise", async ({ respond }) => {
-      const first = await scheduleSessionTurn({
-        sessionKey: "agent:main:main",
-        message: "wake one",
-        delayMs: 1,
-        tag: "nudge",
-      });
-      const second = await scheduleSessionTurn({
-        sessionKey: "agent:main:main",
-        message: "wake two",
-        delayMs: 1,
-        tag: "nudge",
-        deliveryMode: "none",
-      });
-      const badTag = await scheduleSessionTurn({
-        sessionKey: "agent:main:main",
-        message: "bad tag",
-        delayMs: 1,
-        tag: "bad:tag",
-      });
-      const badDelete = await scheduleSessionTurn({
-        sessionKey: "agent:main:main",
-        message: "bad delete",
-        cron: "0 * * * *",
-        deleteAfterRun: true,
-        tag: "nudge",
-      });
-      const removed = await unscheduleSessionTurnsByTag({
-        sessionKey: "agent:main:main",
-        tag: "nudge",
-      });
-      respond(true, {
-        first,
-        second,
-        badTag: badTag ?? null,
-        badDelete: badDelete ?? null,
-        removed: removed ?? null,
-      });
-    });
-  },
-};`,
+      registration: `const scheduleSessionTurn = api.session.workflow.scheduleSessionTurn;
+      const unscheduleSessionTurnsByTag = api.session.workflow.unscheduleSessionTurnsByTag;
+      api.registerGatewayMethod("loader-scheduler-runtime.exercise", async ({ respond }) => {
+        const first = await scheduleSessionTurn({
+          sessionKey: "agent:main:main",
+          message: "wake one",
+          delayMs: 1,
+          tag: "nudge",
+        });
+        const second = await scheduleSessionTurn({
+          sessionKey: "agent:main:main",
+          message: "wake two",
+          delayMs: 1,
+          tag: "nudge",
+          deliveryMode: "none",
+        });
+        const badTag = await scheduleSessionTurn({
+          sessionKey: "agent:main:main",
+          message: "bad tag",
+          delayMs: 1,
+          tag: "bad:tag",
+        });
+        const badDelete = await scheduleSessionTurn({
+          sessionKey: "agent:main:main",
+          message: "bad delete",
+          cron: "0 * * * *",
+          deleteAfterRun: true,
+          tag: "nudge",
+        });
+        const removed = await unscheduleSessionTurnsByTag({
+          sessionKey: "agent:main:main",
+          tag: "nudge",
+        });
+        respond(true, {
+          first,
+          second,
+          badTag: badTag ?? null,
+          badDelete: badDelete ?? null,
+          removed: removed ?? null,
+        });
+      });`,
     });
     const addedJobs: Array<Record<string, unknown>> = [];
     const removedJobIds = new Set<string>();
@@ -642,19 +565,17 @@ describe("plugin scheduled turns", () => {
       });
       return makeCronJob({ id, ...body });
     });
-    workflowMocks.cronListPage.mockImplementation(async () => ({
-      jobs: addedJobs
-        .filter((job) => {
-          const id = typeof job.id === "string" ? job.id : "";
-          return id && !removedJobIds.has(id);
-        })
-        .map((job) => makeCronJob(job as Partial<CronJob> & { id: string })),
-      total: addedJobs.length,
-      offset: 0,
-      limit: 200,
-      hasMore: false,
-      nextOffset: null,
-    }));
+    workflowMocks.cronListPage.mockImplementation(async () =>
+      cronPage(
+        addedJobs
+          .filter((job) => {
+            const id = typeof job.id === "string" ? job.id : "";
+            return id && !removedJobIds.has(id);
+          })
+          .map((job) => makeCronJob(job as Partial<CronJob> & { id: string })),
+        { total: addedJobs.length },
+      ),
+    );
     workflowMocks.cronRemove.mockImplementation(async (id: string) => {
       if (id) {
         removedJobIds.add(id);
@@ -662,27 +583,7 @@ describe("plugin scheduled turns", () => {
       return { ok: true, removed: true };
     });
 
-    const registry = withEnv(
-      {
-        OPENCLAW_BUNDLED_PLUGINS_DIR: bundledDir,
-        OPENCLAW_DISABLE_BUNDLED_PLUGINS: undefined,
-      },
-      () =>
-        loadOpenClawPlugins({
-          cache: false,
-          hostServices: { cron },
-          config: {
-            plugins: {
-              enabled: true,
-              entries: {
-                "loader-scheduler-runtime": {
-                  enabled: true,
-                },
-              },
-            },
-          },
-        }),
-    );
+    const registry = loadSchedulerPlugin(bundledDir, "loader-scheduler-runtime");
 
     expect(
       registry.plugins.find((plugin) => plugin.id === "loader-scheduler-runtime")?.status,
@@ -699,23 +600,20 @@ describe("plugin scheduled turns", () => {
         method: "loader-scheduler-runtime.exercise",
       }),
     ).resolves.toEqual({
-      first: {
-        id: "loader-scheduled-job-1",
-        pluginId: "loader-scheduler-runtime",
-        sessionKey: "agent:main:main",
-        kind: "session-turn",
-      },
-      second: {
-        id: "loader-scheduled-job-2",
-        pluginId: "loader-scheduler-runtime",
-        sessionKey: "agent:main:main",
-        kind: "session-turn",
-      },
+      first: sessionTurnHandle(
+        "loader-scheduled-job-1",
+        "loader-scheduler-runtime",
+        "agent:main:main",
+      ),
+      second: sessionTurnHandle(
+        "loader-scheduled-job-2",
+        "loader-scheduler-runtime",
+        "agent:main:main",
+      ),
       badTag: null,
       badDelete: null,
       removed: { removed: 2, failed: 0 },
     });
-    const namePrefix = "plugin:loader-scheduler-runtime:tag:nudge:agent:main:main:";
     const addedNames = addedJobs.map((job) => job.name);
     expect(addedNames).toHaveLength(2);
     expect(addedNames[0]).toMatch(
@@ -724,8 +622,6 @@ describe("plugin scheduled turns", () => {
     expect(addedNames[1]).toMatch(
       /^plugin:loader-scheduler-runtime:tag:nudge:agent:main:main:[0-9a-f-]{36}$/u,
     );
-    expect(String(addedNames[0]).startsWith(namePrefix)).toBe(true);
-    expect(String(addedNames[1]).startsWith(namePrefix)).toBe(true);
     expect(addedNames[0]).not.toBe(addedNames[1]);
     expect(addedJobs.map((job) => job.delivery)).toEqual([
       { mode: "announce", channel: "last" },
@@ -772,12 +668,7 @@ describe("plugin scheduled turns", () => {
     expect(failures[0]?.pluginId).toBe(WORKFLOW_PLUGIN_ID);
     expect(failures[0]?.hookId).toBe("scheduler:cleanup-failure-job");
     expect(listPluginSessionSchedulerJobs(WORKFLOW_PLUGIN_ID)).toEqual([
-      {
-        id: "cleanup-failure-job",
-        pluginId: WORKFLOW_PLUGIN_ID,
-        sessionKey: MAIN_SESSION_KEY,
-        kind: "session-turn",
-      },
+      sessionTurnHandle("cleanup-failure-job"),
     ]);
   });
 
@@ -804,24 +695,13 @@ describe("plugin scheduled turns", () => {
   });
 
   it("preserves replacement-generation runtime scheduled turns during restart cleanup", async () => {
-    const removed: string[] = [];
+    const removed = trackRemovedJobs();
     const scheduledIds = ["old-runtime-job", "new-runtime-job"];
     workflowMocks.cronAdd.mockImplementation(async () =>
       makeCronJob({ id: scheduledIds.shift() ?? "unexpected-job" }),
     );
-    workflowMocks.cronRemove.mockImplementation(async (id: string) => {
-      removed.push(id);
-      return { ok: true, removed: true };
-    });
 
-    const previousFixture = createPluginRegistryFixture();
-    previousFixture.registry.registry.plugins.push(
-      createPluginRecord({
-        id: WORKFLOW_PLUGIN_ID,
-        name: "Workflow Plugin",
-        origin: "bundled",
-      }),
-    );
+    const previousFixture = schedulerOwner("Workflow Plugin");
     await scheduleWorkflowTurn({
       pluginName: "Workflow Plugin",
       ownerRegistry: previousFixture.registry.registry,
@@ -830,14 +710,7 @@ describe("plugin scheduled turns", () => {
       },
     });
 
-    const replacementFixture = createPluginRegistryFixture();
-    replacementFixture.registry.registry.plugins.push(
-      createPluginRecord({
-        id: WORKFLOW_PLUGIN_ID,
-        name: "Workflow Plugin",
-        origin: "bundled",
-      }),
-    );
+    const replacementFixture = schedulerOwner("Workflow Plugin");
     await scheduleWorkflowTurn({
       pluginName: "Workflow Plugin",
       ownerRegistry: replacementFixture.registry.registry,
@@ -846,21 +719,59 @@ describe("plugin scheduled turns", () => {
       },
     });
 
-    const cleanupResult = await cleanupReplacedPluginHostRegistry({
+    const cleanupResult = await createPluginHostRegistryRetirement({
       cfg: previousFixture.config,
       previousRegistry: previousFixture.registry.registry,
       nextRegistry: replacementFixture.registry.registry,
-    });
+    })();
     expect(cleanupResult.failures).toEqual([]);
     expect(removed).toEqual(["old-runtime-job"]);
     expect(listPluginSessionSchedulerJobs(WORKFLOW_PLUGIN_ID)).toEqual([
-      {
-        id: "new-runtime-job",
-        pluginId: WORKFLOW_PLUGIN_ID,
-        sessionKey: MAIN_SESSION_KEY,
-        kind: "session-turn",
-      },
+      sessionTurnHandle("new-runtime-job"),
     ]);
+  });
+
+  it("cleans only dynamic scheduled turns owned by the retiring registry", async () => {
+    const removed = trackRemovedJobs();
+    const scheduledIds = ["gateway-owned-job", "retiring-owned-job"];
+    workflowMocks.cronAdd.mockImplementation(async () =>
+      makeCronJob({ id: scheduledIds.shift() ?? "unexpected-job" }),
+    );
+
+    const gatewayFixture = schedulerOwner();
+    const retiringFixture = schedulerOwner();
+    const replacementFixture = createPluginRegistryFixture();
+
+    await scheduleWorkflowTurn({
+      ownerRegistry: gatewayFixture.registry.registry,
+      schedule: { cron: "* * * * *", tz: "UTC" },
+    });
+    await scheduleWorkflowTurn({
+      ownerRegistry: retiringFixture.registry.registry,
+      schedule: { cron: "* * * * *", tz: "UTC" },
+    });
+
+    await expect(
+      createPluginHostRegistryRetirement({
+        cfg: retiringFixture.config,
+        previousRegistry: retiringFixture.registry.registry,
+        nextRegistry: replacementFixture.registry.registry,
+      })(),
+    ).resolves.toMatchObject({ failures: [] });
+    expect(removed).toEqual(["retiring-owned-job"]);
+    expect(listPluginSessionSchedulerJobs(WORKFLOW_PLUGIN_ID)).toEqual([
+      sessionTurnHandle("gateway-owned-job"),
+    ]);
+
+    await expect(
+      createPluginHostRegistryRetirement({
+        cfg: gatewayFixture.config,
+        previousRegistry: gatewayFixture.registry.registry,
+        nextRegistry: replacementFixture.registry.registry,
+      })(),
+    ).resolves.toMatchObject({ failures: [] });
+    expect(removed).toEqual(["retiring-owned-job", "gateway-owned-job"]);
+    expect(listPluginSessionSchedulerJobs(WORKFLOW_PLUGIN_ID)).toEqual([]);
   });
 
   it("treats already-missing cron jobs as successful scheduled-turn cleanup", async () => {
@@ -885,43 +796,16 @@ describe("plugin scheduled turns", () => {
   });
 
   it("removes only matching plugin tag jobs in the requested session", async () => {
-    const removed: string[] = [];
+    const removed = trackRemovedJobs();
     const listQueries: unknown[] = [];
     workflowMocks.cronListPage.mockImplementation(async (body: unknown) => {
       listQueries.push((body as { query?: unknown }).query);
-      return {
-        jobs: [
-          makeCronJob({
-            id: "job-a",
-            name: "plugin:workflow-plugin:tag:nudge:agent:main:main:1",
-            sessionTarget: "session:agent:main:main",
-          }),
-          makeCronJob({
-            id: "job-b",
-            name: "plugin:workflow-plugin:tag:nudge:agent:main:main:2",
-            sessionTarget: "session:agent:main:main",
-          }),
-          makeCronJob({
-            id: "job-c",
-            name: "plugin:other-plugin:tag:nudge:agent:main:main:1",
-            sessionTarget: "session:agent:main:main",
-          }),
-          makeCronJob({
-            id: "job-d",
-            name: "plugin:workflow-plugin:tag:nudge:agent:other:main:1",
-            sessionTarget: "session:agent:other:main",
-          }),
-        ],
-        total: 4,
-        offset: 0,
-        limit: 200,
-        hasMore: false,
-        nextOffset: null,
-      };
-    });
-    workflowMocks.cronRemove.mockImplementation(async (id: string) => {
-      removed.push(id);
-      return { ok: true, removed: true };
+      return cronPage([
+        taggedJob("job-a", "1"),
+        taggedJob("job-b", "2"),
+        taggedJob("job-c", "1", "other-plugin"),
+        taggedJob("job-d", "1", "workflow-plugin", "agent:other:main"),
+      ]);
     });
 
     await expect(unscheduleWorkflowTurnsByTag()).resolves.toEqual({ removed: 2, failed: 0 });
@@ -935,25 +819,9 @@ describe("plugin scheduled turns", () => {
       addCount += 1;
       return makeCronJob({ id: `job-${addCount}` });
     });
-    workflowMocks.cronListPage.mockResolvedValue({
-      jobs: [
-        makeCronJob({
-          id: "job-1",
-          name: "plugin:workflow-plugin:tag:nudge:agent:main:main:first",
-          sessionTarget: "session:agent:main:main",
-        }),
-        makeCronJob({
-          id: "job-2",
-          name: "plugin:workflow-plugin:tag:nudge:agent:main:main:second",
-          sessionTarget: "session:agent:main:main",
-        }),
-      ],
-      total: 2,
-      offset: 0,
-      limit: 200,
-      hasMore: false,
-      nextOffset: null,
-    });
+    workflowMocks.cronListPage.mockResolvedValue(
+      cronPage([taggedJob("job-1", "first"), taggedJob("job-2", "second")]),
+    );
     workflowMocks.cronRemove.mockImplementation(async (id: string) => {
       expect(["job-1", "job-2"]).toContain(id);
       return { ok: true, removed: true };
@@ -984,25 +852,9 @@ describe("plugin scheduled turns", () => {
     await expect(unscheduleWorkflowTurnsByTag()).resolves.toEqual({ removed: 0, failed: 1 });
 
     workflowMocks.cronListPage.mockReset();
-    workflowMocks.cronListPage.mockResolvedValue({
-      jobs: [
-        makeCronJob({
-          id: "job-ok",
-          name: "plugin:workflow-plugin:tag:nudge:agent:main:main:1",
-          sessionTarget: "session:agent:main:main",
-        }),
-        makeCronJob({
-          id: "job-fail",
-          name: "plugin:workflow-plugin:tag:nudge:agent:main:main:2",
-          sessionTarget: "session:agent:main:main",
-        }),
-      ],
-      total: 2,
-      offset: 0,
-      limit: 200,
-      hasMore: false,
-      nextOffset: null,
-    });
+    workflowMocks.cronListPage.mockResolvedValue(
+      cronPage([taggedJob("job-ok", "1"), taggedJob("job-fail", "2")]),
+    );
     workflowMocks.cronRemove.mockImplementation(async (id: string) => {
       if (id === "job-fail") {
         throw new Error("remove failed");
@@ -1013,20 +865,7 @@ describe("plugin scheduled turns", () => {
     await expect(unscheduleWorkflowTurnsByTag()).resolves.toEqual({ removed: 1, failed: 1 });
 
     workflowMocks.cronListPage.mockReset();
-    workflowMocks.cronListPage.mockResolvedValue({
-      jobs: [
-        makeCronJob({
-          id: "job-missing",
-          name: "plugin:workflow-plugin:tag:nudge:agent:main:main:1",
-          sessionTarget: "session:agent:main:main",
-        }),
-      ],
-      total: 1,
-      offset: 0,
-      limit: 200,
-      hasMore: false,
-      nextOffset: null,
-    });
+    workflowMocks.cronListPage.mockResolvedValue(cronPage([taggedJob("job-missing", "1")]));
     workflowMocks.cronRemove.mockImplementation(async (id: string) => {
       expect(id).toBe("job-missing");
       return { ok: true, removed: false };
@@ -1050,56 +889,9 @@ describe("plugin scheduled turns", () => {
     expect(workflowMocks.cronRemove).not.toHaveBeenCalled();
   });
 
-  it("wires schedule and unschedule through the plugin API with stale-registry protection", async () => {
-    workflowMocks.cronAdd.mockResolvedValue(makeCronJob({ id: "job-live" }));
-    const { config, registry } = createPluginRegistryFixture({}, { hostServices: { cron } });
-    let capturedApi: OpenClawPluginApi | undefined;
-    registerTestPlugin({
-      registry,
-      config,
-      record: createPluginRecord({
-        id: "scheduler-plugin",
-        name: "Scheduler Plugin",
-        origin: "bundled",
-      }),
-      register(api) {
-        capturedApi = api;
-      },
-    });
-    setActivePluginRegistry(registry.registry);
-
-    const liveHandle = await capturedApi?.session.workflow.scheduleSessionTurn({
-      sessionKey: "agent:main:main",
-      message: "wake",
-      delayMs: 10,
-    });
-    expectSessionTurnHandle(liveHandle, "job-live", "scheduler-plugin");
-    await expect(
-      capturedApi?.session.workflow.unscheduleSessionTurnsByTag({
-        sessionKey: "agent:main:main",
-        tag: "nudge",
-      }),
-    ).resolves.toEqual({ removed: 0, failed: 0 });
-
-    setActivePluginRegistry(createEmptyPluginRegistry());
-    await expect(
-      capturedApi?.session.workflow.scheduleSessionTurn({
-        sessionKey: "agent:main:main",
-        message: "wake",
-        delayMs: 10,
-      }),
-    ).resolves.toBeUndefined();
-    await expect(
-      capturedApi?.session.workflow.unscheduleSessionTurnsByTag({
-        sessionKey: "agent:main:main",
-        tag: "nudge",
-      }),
-    ).resolves.toEqual({ removed: 0, failed: 0 });
-  });
-
   it("resolves live cron service for captured plugin scheduled-turn APIs", async () => {
-    const firstCron = createMockCronService();
-    const secondCron = createMockCronService();
+    const firstCron = createMockCronService(workflowMocks, makeCronJob);
+    const secondCron = createMockCronService(workflowMocks, makeCronJob);
     const firstAdd = vi.fn(async () => makeCronJob({ id: "first-cron-job" }));
     const secondAdd = vi.fn(async () => makeCronJob({ id: "second-cron-job" }));
     const firstListPage = vi.fn(async () => {
@@ -1108,20 +900,9 @@ describe("plugin scheduled turns", () => {
     const firstRemove = vi.fn(async () => {
       throw new Error("stale cron remove used");
     });
-    const secondListPage = vi.fn(async () => ({
-      jobs: [
-        makeCronJob({
-          id: "second-cron-existing-job",
-          name: "plugin:scheduler-plugin:tag:nudge:agent:main:main:1",
-          sessionTarget: "session:agent:main:main",
-        }),
-      ],
-      total: 1,
-      offset: 0,
-      limit: 200,
-      hasMore: false,
-      nextOffset: null,
-    }));
+    const secondListPage = vi.fn(async () =>
+      cronPage([taggedJob("second-cron-existing-job", "1", "scheduler-plugin")]),
+    );
     const secondRemove = vi.fn(async () => ({ ok: true, removed: true }) as const);
     firstCron.add = firstAdd;
     firstCron.listPage = firstListPage;
@@ -1157,12 +938,7 @@ describe("plugin scheduled turns", () => {
         message: "wake",
         delayMs: 10,
       }),
-    ).resolves.toEqual({
-      id: "first-cron-job",
-      pluginId: "scheduler-plugin",
-      sessionKey: "agent:main:main",
-      kind: "session-turn",
-    });
+    ).resolves.toEqual(sessionTurnHandle("first-cron-job", "scheduler-plugin"));
     liveCron = secondCron;
     await expect(
       capturedApi?.session.workflow.scheduleSessionTurn({
@@ -1170,12 +946,7 @@ describe("plugin scheduled turns", () => {
         message: "wake again",
         delayMs: 10,
       }),
-    ).resolves.toEqual({
-      id: "second-cron-job",
-      pluginId: "scheduler-plugin",
-      sessionKey: "agent:main:main",
-      kind: "session-turn",
-    });
+    ).resolves.toEqual(sessionTurnHandle("second-cron-job", "scheduler-plugin"));
     await expect(
       capturedApi?.session.workflow.unscheduleSessionTurnsByTag({
         sessionKey: "agent:main:main",

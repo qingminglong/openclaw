@@ -1,115 +1,52 @@
-// Plugin Sdk Surface Report tests cover plugin sdk surface report script behavior.
-import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import { beforeAll, beforeEach, expect, it } from "vitest";
+import {
+  collectPluginSdkSurfaceReport,
+  evaluatePluginSdkSurfaceReport,
+  readPluginSdkSurfaceBudgets,
+} from "../../scripts/plugin-sdk-surface-report.mts";
 
-function runSurfaceReport(env: Record<string, string>) {
-  return spawnSync(process.execPath, ["scripts/plugin-sdk-surface-report.mjs", "--check"], {
-    cwd: process.cwd(),
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      ...env,
-    },
-  });
+type SurfaceReport = Awaited<ReturnType<typeof collectPluginSdkSurfaceReport>>;
+let baseReport: SurfaceReport;
+let surfaceReport: SurfaceReport;
+function failures(budget?: string, value: number | Record<string, number> = 0) {
+  const env = budget ? { [`OPENCLAW_PLUGIN_SDK_MAX_${budget}`]: JSON.stringify(value) } : {};
+  return evaluatePluginSdkSurfaceReport(surfaceReport, readPluginSdkSurfaceBudgets(env));
 }
 
-function readDefaultPublicFunctionExportBudget() {
-  const source = readFileSync("scripts/plugin-sdk-surface-report.mjs", "utf8");
-  const match =
-    /publicFunctionExports:\s*readBudgetEnv\("OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_FUNCTION_EXPORTS",\s*(\d+)\)/u.exec(
-      source,
-    );
-  if (match === null || match[1] === undefined) {
-    throw new Error("failed to read default public function export budget");
-  }
-  return Number(match[1]);
-}
+beforeAll(async () => {
+  baseReport = await collectPluginSdkSurfaceReport();
+});
+beforeEach(() => {
+  surfaceReport = structuredClone(baseReport);
+});
 
-describe("plugin SDK surface report", () => {
-  it("rejects unknown CLI options before collecting SDK stats", () => {
-    const result = spawnSync(
-      process.execPath,
-      ["scripts/plugin-sdk-surface-report.mjs", "--chekc"],
-      {
-        cwd: process.cwd(),
-        encoding: "utf8",
-      },
-    );
+it("accepts frozen named facades while rejecting missing deprecated reexports", () => {
+  expect(surfaceReport.deprecatedBarrelWithoutReexports).toEqual([]);
+  surfaceReport.deprecatedBarrelWithoutReexports = ["fixture-facade"];
+  expect(failures()).toContain("deprecated barrel entrypoints without reexports: fixture-facade");
+});
 
-    expect(result.status).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr.trim()).toBe("Unknown plugin SDK surface report option: --chekc");
-    expect(result.stderr).not.toContain("at ");
-  });
+it("keeps approval store internals out of public approval helpers", () => {
+  const source = fs.readFileSync("src/plugin-sdk/exec-approvals-runtime.ts", "utf8");
+  expect(source).not.toMatch(/export\s+(?:type\s+)?\*\s+from\s+["'][^"']*exec-approvals/u);
 
-  it("prints help before collecting SDK stats", () => {
-    const result = spawnSync(
-      process.execPath,
-      ["scripts/plugin-sdk-surface-report.mjs", "--help"],
-      {
-        cwd: process.cwd(),
-        encoding: "utf8",
-      },
-    );
+  expect(source).not.toMatch(
+    /ensureExecApprovalsSnapshot|persistAllowAlwaysDecisionLocked|recordAllowlistMatchesUseLocked|resolveExecApprovalsLocked|restoreExecApprovalsSnapshotLocked|updateExecApprovals/u,
+  );
+});
 
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain("Usage: node scripts/plugin-sdk-surface-report.mjs");
-    expect(result.stderr).toBe("");
-    expect(result.stdout).not.toContain("all SDK entrypoints:");
-  });
+it("rejects callable surface growth from the canonical source graph", () => {
+  const callableExports = surfaceReport.publicStats.totals.callableExports;
+  expect(failures("PUBLIC_FUNCTION_EXPORTS", callableExports - 1)).toContain(
+    `public callable exports ${callableExports} > ${callableExports - 1}`,
+  );
+});
 
-  it("rejects loose numeric budget env vars before collecting SDK stats", () => {
-    const result = runSurfaceReport({
-      OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_EXPORTS: "1e9",
-    });
-
-    expect(result.status).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toContain(
-      "OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_EXPORTS must be a non-negative integer",
-    );
-    expect(result.stderr).not.toContain("at ");
-  });
-
-  it("rejects unsafe budget env vars before collecting SDK stats", () => {
-    const result = runSurfaceReport({
-      OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_EXPORTS: "9007199254740992",
-    });
-
-    expect(result.status).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toContain(
-      "OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_EXPORTS must be a safe non-negative integer",
-    );
-    expect(result.stderr).not.toContain("at ");
-  });
-
-  it("accepts exact deprecated export budget overrides by public entrypoint", () => {
-    const result = runSurfaceReport({
-      OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_DEPRECATED_EXPORTS_BY_ENTRYPOINT: JSON.stringify({ core: 2 }),
-    });
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-  });
-
-  it("keeps generated package declarations out of source surface counts", () => {
-    const budget = readDefaultPublicFunctionExportBudget();
-    const result = runSurfaceReport({
-      OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_FUNCTION_EXPORTS: String(budget - 1),
-    });
-
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain(`public callable exports ${budget} > ${budget - 1}`);
-  });
-
-  it("rejects deprecated export growth by public entrypoint", () => {
-    const result = runSurfaceReport({
-      OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_DEPRECATED_EXPORTS_BY_ENTRYPOINT: JSON.stringify({ core: 1 }),
-    });
-
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("public deprecated exports in core 2 > 1");
-  });
+it("rejects deprecated export growth by public entrypoint", () => {
+  const core = surfaceReport.publicStats.byEntrypoint.get("core")!;
+  surfaceReport.publicStats.byEntrypoint = new Map([["core", { ...core, deprecatedExports: 3 }]]);
+  expect(failures("PUBLIC_DEPRECATED_EXPORTS_BY_ENTRYPOINT", { core: 1 })).toContain(
+    "public deprecated exports in core 3 > 1",
+  );
 });

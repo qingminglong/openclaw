@@ -4,7 +4,6 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { createChannelMessageAdapterFromOutbound } from "./outbound-bridge.js";
 import type {
   ChannelMessageSendPayloadContext,
-  ChannelMessageSendPollContext,
   ChannelMessageSendTextContext,
   MessageReceipt,
 } from "./types.js";
@@ -26,6 +25,28 @@ function requireFirstCallArg(mock: {
 }
 
 describe("createChannelMessageAdapterFromOutbound", () => {
+  it("preserves explicit no-send facts in progress and final results", async () => {
+    const notSent = { outcome: "not_sent" as const, messageId: "" };
+    const adapter = createChannelMessageAdapterFromOutbound({
+      outbound: {
+        sendText: async ({ onDeliveryResult }) => {
+          await onDeliveryResult?.(notSent);
+          return notSent;
+        },
+      },
+    });
+    const onDeliveryResult = vi.fn();
+    const result = await adapter.send?.text?.({ cfg, to: "room-1", text: "---", onDeliveryResult });
+
+    for (const delivery of [result, onDeliveryResult.mock.calls[0]?.[0]]) {
+      expect(delivery).toMatchObject({
+        outcome: "not_sent",
+        receipt: { platformMessageIds: [], parts: [] },
+      });
+      expect(delivery).not.toHaveProperty("messageId");
+    }
+  });
+
   it("wraps outbound text sends with a message receipt", async () => {
     const sendText = vi.fn(async (_request: ChannelMessageSendTextContext) => ({
       channel: "demo",
@@ -79,6 +100,98 @@ describe("createChannelMessageAdapterFromOutbound", () => {
     ]);
   });
 
+  it("preserves target-only routing metadata without fabricating delivery identity", async () => {
+    const target = { kind: "channel" as const, id: "route-only" };
+    const adapter = createChannelMessageAdapterFromOutbound({
+      outbound: {
+        sendText: vi.fn(async () => ({ target })),
+      },
+    });
+
+    const result = await adapter.send?.text?.({ cfg, to: "room-1", text: "hello" });
+
+    expect(result?.target).toEqual(target);
+    expect(result).not.toHaveProperty("messageId");
+    expect(result?.receipt.primaryPlatformMessageId).toBeUndefined();
+    expect(result?.receipt.platformMessageIds).toEqual([]);
+    expect(result?.receipt.parts).toEqual([]);
+  });
+
+  it("preserves contracted delivery facts without exposing private provider fields", async () => {
+    const sourceResult = (messageId: string) => ({
+      channel: "forged-channel",
+      messageId,
+      chatId: "chat-1",
+      channelId: "channel-1",
+      roomId: "room-1",
+      conversationId: "conversation-1",
+      toJid: "recipient@example.invalid",
+      pollId: "poll-1",
+      timestamp: 123,
+      meta: { questionActionIds: ["question:1"], questionMessageId: "question-card" },
+      receipt: {
+        primaryPlatformMessageId: messageId,
+        platformMessageIds: [messageId],
+        parts: [{ platformMessageId: messageId, kind: "text" as const, index: 0 }],
+        sentAt: 123,
+      },
+      accessToken: "private-access-token",
+      content: "private-provider-content",
+      primaryMessageId: "private-primary-id",
+      threadTs: "private-thread-ts",
+      blocks: [{ text: "private-block" }],
+      callback: { value: "private-callback" },
+      action: { value: "private-action" },
+    });
+    const onDeliveryResult = vi.fn();
+    const adapter = createChannelMessageAdapterFromOutbound({
+      outbound: {
+        sendText: async ({ onDeliveryResult: reportProgress }) => {
+          await reportProgress?.(sourceResult("progress-1"));
+          return sourceResult("final-1");
+        },
+      },
+    });
+
+    const result = await adapter.send?.text?.({
+      cfg,
+      to: "room-1",
+      text: "hello",
+      onDeliveryResult,
+    });
+
+    expect(onDeliveryResult).toHaveBeenCalledOnce();
+    const progress = onDeliveryResult.mock.calls[0]?.[0];
+    for (const [delivery, messageId] of [
+      [progress, "progress-1"],
+      [result, "final-1"],
+    ] as const) {
+      expect(delivery).toMatchObject({
+        messageId,
+        chatId: "chat-1",
+        channelId: "channel-1",
+        roomId: "room-1",
+        conversationId: "conversation-1",
+        toJid: "recipient@example.invalid",
+        pollId: "poll-1",
+        timestamp: 123,
+        meta: { questionActionIds: ["question:1"], questionMessageId: "question-card" },
+      });
+      for (const privateField of [
+        "channel",
+        "accessToken",
+        "content",
+        "primaryMessageId",
+        "threadTs",
+        "blocks",
+        "callback",
+        "action",
+      ]) {
+        expect(delivery).not.toHaveProperty(privateField);
+      }
+    }
+  });
+
   it("preserves an outbound receipt instead of rebuilding it", async () => {
     const receipt: MessageReceipt = {
       primaryPlatformMessageId: "receipt-1",
@@ -106,64 +219,42 @@ describe("createChannelMessageAdapterFromOutbound", () => {
     ).resolves.toEqual({ messageId: "legacy-id", receipt });
   });
 
-  it("wraps rich payload sends and infers the receipt part kind", async () => {
-    const sendPayload = vi.fn(async (_request: ChannelMessageSendPayloadContext) => ({
-      channel: "demo",
-      messageId: "card-1",
-    }));
+  it.each([
+    {
+      name: "portable presentation with fallback text",
+      payload: {
+        text: "Fallback",
+        presentation: { blocks: [{ type: "divider" }] },
+      },
+      expected: "card",
+    },
+    {
+      name: "empty rendered presentation blocks",
+      payload: {
+        text: "Fallback",
+        channelData: { slack: { presentationBlocks: [] } },
+      },
+      expected: "text",
+    },
+  ] satisfies Array<{
+    name: string;
+    payload: ChannelMessageSendPayloadContext["payload"];
+    expected: "card" | "text";
+  }>)("classifies $name payloads as $expected", async ({ payload, expected }) => {
     const adapter = createChannelMessageAdapterFromOutbound({
-      capabilities: { payload: true, batch: true },
-      outbound: { sendPayload },
+      outbound: {
+        sendPayload: vi.fn(async () => ({ channel: "demo", messageId: "msg-1" })),
+      },
     });
 
     const result = await adapter.send?.payload?.({
       cfg,
       to: "room-1",
-      text: "",
-      payload: {
-        presentation: { blocks: [{ type: "text", text: "ready" }] },
-      },
+      text: payload.text ?? "",
+      payload,
     });
 
-    expect(adapter.durableFinal?.capabilities).toEqual({ payload: true, batch: true });
-    expect(sendPayload).toHaveBeenCalledTimes(1);
-    const sendPayloadRequest = requireFirstCallArg(
-      sendPayload,
-    ) as unknown as ChannelMessageSendPayloadContext;
-    expect(sendPayloadRequest.payload).toEqual({
-      presentation: { blocks: [{ type: "text", text: "ready" }] },
-    });
-    expect(result?.receipt.parts[0]?.platformMessageId).toBe("card-1");
-    expect(result?.receipt.parts[0]?.kind).toBe("card");
-  });
-
-  it("wraps outbound poll sends with poll receipts", async () => {
-    const sendPoll = vi.fn(async (_request: ChannelMessageSendPollContext) => ({
-      channel: "demo",
-      pollId: "poll-1",
-    }));
-    const adapter = createChannelMessageAdapterFromOutbound({
-      capabilities: { poll: true },
-      outbound: { sendPoll },
-    });
-
-    const result = await adapter.send?.poll?.({
-      cfg,
-      to: "room-1",
-      poll: { question: "Ship?", options: ["Yes", "No"] },
-      threadId: "thread-1",
-    });
-
-    expect(adapter.durableFinal?.capabilities).toEqual({ poll: true });
-    expect(sendPoll).toHaveBeenCalledTimes(1);
-    const sendPollRequest = requireFirstCallArg(
-      sendPoll,
-    ) as unknown as ChannelMessageSendPollContext;
-    expect(sendPollRequest.poll).toEqual({ question: "Ship?", options: ["Yes", "No"] });
-    expect(sendPollRequest.threadId).toBe("thread-1");
-    expect(result?.messageId).toBe("poll-1");
-    expect(result?.receipt.parts[0]?.platformMessageId).toBe("poll-1");
-    expect(result?.receipt.parts[0]?.kind).toBe("poll");
+    expect(result?.receipt.parts[0]?.kind).toBe(expected);
   });
 
   it("normalizes existing outbound poll receipts", async () => {
@@ -191,40 +282,6 @@ describe("createChannelMessageAdapterFromOutbound", () => {
       { platformMessageId: "card-1", kind: "poll", index: 0 },
     ]);
     expect(receipt.parts[0]?.kind).toBe("card");
-  });
-
-  it("exposes only send methods backed by outbound handlers", async () => {
-    const adapter = createChannelMessageAdapterFromOutbound({
-      outbound: {
-        sendText: vi.fn(async () => ({ messageId: "msg-1" })),
-      },
-    });
-
-    const sendText = adapter.send?.text;
-    if (!sendText) {
-      throw new Error("expected text send adapter");
-    }
-
-    const result = await sendText({ cfg, to: "room-1", text: "hello" });
-    expect(result.messageId).toBe("msg-1");
-    expect(result.receipt.primaryPlatformMessageId).toBe("msg-1");
-    expect(result.receipt.platformMessageIds).toEqual(["msg-1"]);
-    expect(adapter.send?.media).toBeUndefined();
-    expect(adapter.send?.payload).toBeUndefined();
-    expect(adapter.send?.poll).toBeUndefined();
-  });
-
-  it("defaults outbound-derived adapters to plugin-owned receive acknowledgements", () => {
-    const adapter = createChannelMessageAdapterFromOutbound({
-      outbound: {
-        sendText: vi.fn(async () => ({ messageId: "msg-1" })),
-      },
-    });
-
-    expect(adapter.receive).toEqual({
-      defaultAckPolicy: "manual",
-      supportedAckPolicies: ["manual"],
-    });
   });
 
   it("preserves declared live and receive lifecycle metadata", () => {

@@ -1,19 +1,36 @@
-/**
- * Gateway startup web fetch bind tests.
- */
-import http from "node:http";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../config/config.js";
-import { getFreePort, installGatewayTestHooks, startGatewayServer } from "./test-helpers.js";
-import { readClientResponseBody } from "./test-http-response.js";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { acquireTestPortBlock } from "../test-utils/port-claims.js";
+import { installGatewayTestHooks, startTestGatewayServer } from "./test-helpers.js";
 
 const webFetchProviderDiscovery = vi.hoisted(() => ({
-  resolveBundledWebFetchProvidersFromPublicArtifactsMock: vi.fn(() => {
+  bundled: vi.fn(() => {
     throw new Error("gateway startup must not discover bundled web fetch providers before bind");
   }),
-  resolvePluginWebFetchProvidersMock: vi.fn(() => {
+  plugin: vi.fn(() => {
     throw new Error("gateway startup must not discover plugin web fetch providers before bind");
   }),
+}));
+
+// This boundary proves that credential-free web fetch config reaches the HTTP
+// listener. Model publication, chat metadata, and orphan recovery have dedicated owners.
+vi.mock("../agents/prepared-model-runtime.js", () => ({
+  cancelPreparedModelRuntimeRefresh: vi.fn(),
+  publishPreparedModelRuntimeSnapshot: vi.fn(async () => ({})),
+  refreshPreparedModelRuntimeSnapshots: vi.fn(async () => {}),
+}));
+
+vi.mock("./server-chat-metadata-lifecycle.js", () => ({
+  createGatewayChatMetadataLifecycle: vi.fn(async () => ({
+    attachContext: vi.fn(async () => {}),
+    read: vi.fn(async () => {
+      throw new Error("chat metadata is outside this startup test");
+    }),
+    refresh: vi.fn(async () => {}),
+  })),
+}));
+
+vi.mock("../agents/main-session-recovery/main-session-restart-recovery-marking.js", () => ({
+  markStartupOrphanedMainSessionsForRecovery: vi.fn(async () => ({ marked: 0, skipped: 0 })),
 }));
 
 vi.mock("../secrets/runtime-web-tools-fallback.runtime.js", async () => {
@@ -24,100 +41,66 @@ vi.mock("../secrets/runtime-web-tools-fallback.runtime.js", async () => {
     ...actual,
     runtimeWebToolsFallbackProviders: {
       ...actual.runtimeWebToolsFallbackProviders,
-      resolvePluginWebFetchProviders: webFetchProviderDiscovery.resolvePluginWebFetchProvidersMock,
+      resolvePluginWebFetchProviders: webFetchProviderDiscovery.plugin,
     },
   };
 });
 
-vi.mock("../secrets/runtime-web-tools-public-artifacts.runtime.js", async () => {
+vi.mock("../plugins/web-provider-public-artifacts.js", async () => {
   const actual = await vi.importActual<
-    typeof import("../secrets/runtime-web-tools-public-artifacts.runtime.js")
-  >("../secrets/runtime-web-tools-public-artifacts.runtime.js");
+    typeof import("../plugins/web-provider-public-artifacts.js")
+  >("../plugins/web-provider-public-artifacts.js");
   return {
     ...actual,
-    resolveBundledWebFetchProvidersFromPublicArtifacts:
-      webFetchProviderDiscovery.resolveBundledWebFetchProvidersFromPublicArtifactsMock,
+    resolveBundledWebFetchProvidersFromPublicArtifacts: webFetchProviderDiscovery.bundled,
   };
 });
 
-installGatewayTestHooks();
+installGatewayTestHooks({ scope: "suite" });
 
 afterEach(() => {
-  webFetchProviderDiscovery.resolveBundledWebFetchProvidersFromPublicArtifactsMock.mockClear();
-  webFetchProviderDiscovery.resolvePluginWebFetchProvidersMock.mockClear();
+  webFetchProviderDiscovery.bundled.mockClear();
+  webFetchProviderDiscovery.plugin.mockClear();
 });
 
-async function requestHealthz(port: number): Promise<{ status: number; body: string }> {
-  return await new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        host: "127.0.0.1",
-        port,
-        path: "/healthz",
-      },
-      (res) => void readClientResponseBody(res).then(resolve, reject),
-    );
-    req.once("error", reject);
-    req.setTimeout(5_000, () => {
-      req.destroy(new Error("timeout waiting for /healthz"));
-    });
-    req.end();
-  });
-}
-
-async function writeConfig(config: OpenClawConfig): Promise<void> {
-  const { writeConfigFile } = await import("../config/config.js");
-  await writeConfigFile(config);
-}
-
 describe("gateway startup web fetch config", () => {
-  it("binds HTTP with credential-free tools.web.fetch config without fetch provider discovery", async () => {
-    const previousMinimal = process.env.OPENCLAW_TEST_MINIMAL_GATEWAY;
+  let port: number;
+  let previousMinimal: string | undefined;
+  let server: Awaited<ReturnType<typeof startTestGatewayServer>> | undefined;
+
+  beforeAll(async () => {
+    previousMinimal = process.env.OPENCLAW_TEST_MINIMAL_GATEWAY;
     process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = "0";
-    let server: Awaited<ReturnType<typeof startGatewayServer>> | undefined;
-    try {
-      await writeConfig({
-        gateway: {
-          mode: "local",
-          bind: "loopback",
-          auth: { mode: "none" },
-        },
-        plugins: {
-          enabled: true,
-          allow: [],
-          entries: {},
-        },
-        tools: {
-          web: {
-            fetch: {
-              enabled: true,
-              maxChars: 200_000,
-              maxCharsCap: 2_000_000,
-            },
-          },
-        },
-      } as OpenClawConfig);
+    const { writeConfigFile } = await import("../config/config.js");
+    await writeConfigFile({
+      gateway: { mode: "local", bind: "loopback", auth: { mode: "none" } },
+      plugins: { enabled: true, allow: [], entries: {} },
+      tools: { web: { fetch: { enabled: true, maxChars: 200_000, maxCharsCap: 2_000_000 } } },
+    });
 
-      const port = await getFreePort();
-      server = await startGatewayServer(port, {
-        auth: { mode: "none" },
-      });
+    const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+    port = portClaim.port;
+    server = await startTestGatewayServer(portClaim, { auth: { mode: "none" } });
+  });
 
-      const response = await requestHealthz(port);
-      expect(response.status).toBe(200);
-      expect(
-        webFetchProviderDiscovery.resolveBundledWebFetchProvidersFromPublicArtifactsMock,
-      ).not.toHaveBeenCalled();
-      expect(webFetchProviderDiscovery.resolvePluginWebFetchProvidersMock).not.toHaveBeenCalled();
-    } finally {
-      if (server) {
-        await server.close();
-      }
-      if (previousMinimal === undefined) {
-        delete process.env.OPENCLAW_TEST_MINIMAL_GATEWAY;
-      } else {
-        process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = previousMinimal;
-      }
+  afterAll(async () => {
+    await server?.close();
+    if (previousMinimal === undefined) {
+      delete process.env.OPENCLAW_TEST_MINIMAL_GATEWAY;
+    } else {
+      process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = previousMinimal;
     }
+  });
+
+  it("binds HTTP with credential-free tools.web.fetch config without fetch provider discovery", async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/healthz`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    await response.text();
+    expect(response.status).toBe(200);
+    expect([
+      webFetchProviderDiscovery.bundled.mock.calls,
+      webFetchProviderDiscovery.plugin.mock.calls,
+    ]).toEqual([[], []]);
   });
 });

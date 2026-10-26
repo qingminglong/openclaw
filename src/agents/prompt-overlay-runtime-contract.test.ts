@@ -10,7 +10,6 @@ import {
   CODEX_CONTRACT_PROVIDER_ID,
   OPENAI_CONTRACT_PROVIDER_ID,
   openAiPluginPersonalityConfig,
-  sharedGpt5PersonalityConfig,
 } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
 import { describe, expect, it } from "vitest";
 import { resolveGpt5SystemPromptContribution } from "./gpt5-prompt-overlay.js";
@@ -24,34 +23,23 @@ describe("GPT-5 prompt overlay runtime contract", () => {
 
     expect(contribution?.stablePrefix).toContain("<persona_latch>");
     expect(contribution?.sectionOverrides?.interaction_style).toContain(
-      "Live chat tone: short, natural, human.",
+      "Live chat: short, natural, human.",
     );
     expect(contribution?.sectionOverrides?.interaction_style).not.toContain(
-      "Use heartbeats to create useful proactive progress",
+      "Heartbeat = useful proactive progress",
     );
   });
 
-  it("adds heartbeat philosophy only for heartbeat-triggered GPT-5 turns", () => {
+  it("does not automatically add heartbeat philosophy to scheduled GPT-5 turns", () => {
     const contribution = resolveGpt5SystemPromptContribution({
       providerId: OPENAI_CONTRACT_PROVIDER_ID,
       modelId: GPT5_CONTRACT_MODEL_ID,
-      trigger: "heartbeat",
+      trigger: "cron",
     });
 
-    expect(contribution?.sectionOverrides?.interaction_style).toContain(
-      "Use heartbeats to create useful proactive progress",
+    expect(contribution?.sectionOverrides?.interaction_style).not.toContain(
+      "Heartbeat = useful proactive progress",
     );
-  });
-
-  it("lets the shared GPT-5 overlay config disable friendly style without removing the behavior contract", () => {
-    const contribution = resolveGpt5SystemPromptContribution({
-      providerId: NON_OPENAI_CONTRACT_PROVIDER_ID,
-      modelId: GPT5_PREFIXED_CONTRACT_MODEL_ID,
-      config: sharedGpt5PersonalityConfig("off"),
-    });
-
-    expect(contribution?.stablePrefix).toContain("<persona_latch>");
-    expect(contribution?.sectionOverrides).toStrictEqual({});
   });
 
   it("scopes OpenAI plugin personality fallback to OpenAI-family GPT-5 providers", () => {
@@ -70,7 +58,7 @@ describe("GPT-5 prompt overlay runtime contract", () => {
     expect(openAiContribution?.sectionOverrides).toStrictEqual({});
     expect(nonOpenAiContribution?.stablePrefix).toContain("<persona_latch>");
     expect(nonOpenAiContribution?.sectionOverrides?.interaction_style).toContain(
-      "Live chat tone: short, natural, human.",
+      "Live chat: short, natural, human.",
     );
   });
 
@@ -85,12 +73,12 @@ describe("GPT-5 prompt overlay runtime contract", () => {
     expect(contribution?.sectionOverrides).toStrictEqual({});
   });
 
-  it("does not apply GPT-5 overlays to non-GPT-5 models", () => {
-    expect(
-      resolveGpt5SystemPromptContribution({
-        providerId: OPENAI_CONTRACT_PROVIDER_ID,
-        modelId: NON_GPT5_CONTRACT_MODEL_ID,
-      }),
-    ).toBeUndefined();
-  });
+  it.each([NON_GPT5_CONTRACT_MODEL_ID, "gpt-oss-120b", "o3", "codex-mini-latest"])(
+    "does not apply GPT-5 overlays to %s",
+    (modelId) => {
+      expect(
+        resolveGpt5SystemPromptContribution({ providerId: OPENAI_CONTRACT_PROVIDER_ID, modelId }),
+      ).toBeUndefined();
+    },
+  );
 });

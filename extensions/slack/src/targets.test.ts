@@ -1,34 +1,19 @@
 // Slack tests cover targets plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
-  normalizeSlackMessagingTarget,
-  parseSlackTarget,
-  resolveSlackChannelId,
-  slackContextTargetsMatch,
+  canonicalizeSlackApiTargetId,
+  formatSlackTarget,
   slackTargetsMatch,
-} from "./targets.js";
+} from "./target-parsing.js";
+import { parseSlackTarget, resolveSlackChannelId, slackContextTargetsMatch } from "./targets.js";
 
 describe("parseSlackTarget", () => {
-  it("parses user mentions and prefixes", () => {
-    const cases = [
-      { input: "<@U123>", id: "U123", normalized: "user:u123" },
-      { input: "user:U456", id: "U456", normalized: "user:u456" },
-      { input: "slack:U789", id: "U789", normalized: "user:u789" },
-    ] as const;
-    for (const testCase of cases) {
-      expect(parseSlackTarget(testCase.input), testCase.input).toEqual({
-        kind: "user",
-        id: testCase.id,
-        raw: testCase.input,
-        normalized: testCase.normalized,
-      });
-    }
-  });
-
   it("parses channel targets", () => {
     const cases = [
       { input: "channel:C123", id: "C123", normalized: "channel:c123" },
       { input: "#C999", id: "C999", normalized: "channel:c999" },
+      { input: "updates", id: "updates", normalized: "channel:updates" },
+      { input: "workspace", id: "workspace", normalized: "channel:workspace" },
     ] as const;
     for (const testCase of cases) {
       expect(parseSlackTarget(testCase.input), testCase.input).toEqual({
@@ -40,16 +25,17 @@ describe("parseSlackTarget", () => {
     }
   });
 
-  it("rejects invalid @ and # targets", () => {
-    const cases = [
-      { input: "@bob-1", expectedMessage: /Slack DMs require a user id/ },
-      { input: "#general-1", expectedMessage: /Slack channels require a channel id/ },
-    ] as const;
-    for (const testCase of cases) {
-      expect(() => parseSlackTarget(testCase.input), testCase.input).toThrow(
-        testCase.expectedMessage,
-      );
-    }
+  it("formats bare and structurally valid workspace-qualified targets", () => {
+    expect(formatSlackTarget({ teamId: "T123", kind: "channel", id: "C456" })).toBe(
+      "team:T123:channel:C456",
+    );
+    expect(formatSlackTarget({ kind: "channel", id: "C456" })).toBe("C456");
+    expect(formatSlackTarget({ teamId: "T123", kind: "user", id: "B456" })).toBe(
+      "team:T123:user:B456",
+    );
+    expect(() => formatSlackTarget({ teamId: "E123", kind: "channel", id: "C456" })).toThrow(
+      "Invalid Slack workspace-qualified target",
+    );
   });
 });
 
@@ -59,25 +45,21 @@ describe("resolveSlackChannelId", () => {
     expect(resolveSlackChannelId("C123")).toBe("C123");
   });
 
-  it("rejects user targets", () => {
-    expect(() => resolveSlackChannelId("user:U123")).toThrow(/channel id is required/i);
+  it("preserves an explicit channel name", () => {
+    expect(resolveSlackChannelId("#companychat")).toBe("companychat");
   });
 });
 
-describe("normalizeSlackMessagingTarget", () => {
-  it("defaults raw ids to channels", () => {
-    expect(normalizeSlackMessagingTarget("C123")).toBe("channel:c123");
+describe("Slack API target ids", () => {
+  it("canonicalizes a proven user id", () => {
+    expect(canonicalizeSlackApiTargetId("user", "w09g2dj0275")).toBe("W09G2DJ0275");
   });
 });
 
 describe("slackTargetsMatch", () => {
-  it("matches equivalent channel and user targets", () => {
-    expect(slackTargetsMatch("channel:C123", "C123")).toBe(true);
-    expect(slackTargetsMatch("user:U123", "slack:U123")).toBe(true);
-  });
-
-  it("does not match different target kinds", () => {
-    expect(slackTargetsMatch("user:U123", "channel:U123")).toBe(false);
+  it("keeps identically named targets in different workspaces distinct", () => {
+    expect(slackTargetsMatch("team:T1:channel:C123", "team:T2:channel:C123")).toBe(false);
+    expect(slackTargetsMatch("team:T1:channel:C123", "channel:C123")).toBe(false);
   });
 });
 

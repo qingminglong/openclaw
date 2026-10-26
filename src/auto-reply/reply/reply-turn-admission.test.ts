@@ -1,320 +1,514 @@
-// Tests reply turn admission decisions for active, queued, and aborted runs.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { setImmediate } from "node:timers/promises";
+import { afterEach, assert, expect, it, vi } from "vitest";
+import { createDeferred, withinTest } from "../../../test/helpers/promise.js";
+import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
+import { SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE } from "../../config/sessions/lifecycle.js";
+import {
+  deleteSessionEntryLifecycle,
+  loadSessionEntry,
+  replaceSessionEntry,
+} from "../../config/sessions/session-accessor.js";
+import type { InternalSessionEntry as SessionEntry } from "../../config/sessions/types.js";
+import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
+import { resetDiagnosticRunActivityForTest } from "../../logging/diagnostic-run-activity.js";
 import {
   createReplyOperation,
-  runAfterReplyOperationClear,
-  testing,
-} from "./reply-run-registry.js";
-import { admitReplyTurn } from "./reply-turn-admission.js";
+  getSessionControllerOperation,
+} from "../../sessions/session-controller.js";
+import {
+  getTerminalSessionWorkAdmissionRelease,
+  interruptSessionControllerEffects,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
+import {
+  claimSessionControllerTask,
+  releaseSessionControllerClaim,
+  reserveSessionControllerSource,
+  retireSessionControllerInput,
+} from "../../sessions/session-controller.mailbox.js";
+import { testing } from "../../sessions/session-controller.test-support.js";
+import { runWithReplyOperationLifecycleAdmission } from "./reply-turn-admission.js";
+import { admitTestReplyTurn, createSessionStore } from "./reply-turn-admission.test-support.js";
 
-describe("reply turn admission", () => {
-  afterEach(() => {
-    testing.resetReplyRunRegistry();
+const releaseMocks = vi.hoisted(() => ({
+  beforeRelease: vi.fn(async () => {}),
+  schedule: vi.fn(),
+}));
+vi.mock(
+  import("../../agents/main-session-recovery/main-session-recovery-store.js"),
+  async (importOriginal) => {
+    const actual = await importOriginal();
+    return {
+      ...actual,
+      releaseMainSessionRecoveryOwner: async (
+        lease: Parameters<typeof actual.releaseMainSessionRecoveryOwner>[0],
+      ) => {
+        await releaseMocks.beforeRelease();
+        return await actual.releaseMainSessionRecoveryOwner(lease);
+      },
+    };
+  },
+);
+vi.mock(
+  import("../../agents/main-session-recovery/main-session-recovery-owner-release.js"),
+  async (importOriginal) => ({
+    ...(await importOriginal()),
+    scheduleMainSessionRecoveryPendingTarget: releaseMocks.schedule,
+  }),
+);
+
+const sessionKey = "agent:main:telegram:topic:admission";
+const sessionId = "original-session";
+const scope = { sessionKey, sessionId };
+const sourceKey = "agent:main:telegram:slash:source";
+const activeRunSkipped = { status: "skipped", reason: "active-run" };
+function admit(overrides: Partial<Parameters<typeof admitTestReplyTurn>[0]> = {}) {
+  return admitTestReplyTurn({ ...scope, ...overrides });
+}
+function admitStored(storePath: string, overrides: Parameters<typeof admit>[0] = {}) {
+  return admit({ storePath, expectedSessionId: sessionId, ...overrides });
+}
+function adopt(
+  storePath: string,
+  reservation: ReturnType<typeof operation>,
+  overrides: Parameters<typeof admit>[0] = {},
+) {
+  return admitStored(storePath, {
+    sessionId: reservation.sessionId,
+    waitForActive: false,
+    adoptOperation: reservation,
+    ...overrides,
   });
+}
+function observe<T>(promise: Promise<T>) {
+  const pending = {
+    settled: false,
+    promise: promise.then((result) => {
+      pending.settled = true;
+      return result;
+    }),
+  };
+  return pending;
+}
+function abortableAdmission(overrides: Parameters<typeof admit>[0]) {
+  const controller = new AbortController();
+  return Object.assign(observe(admit({ ...overrides, upstreamAbortSignal: controller.signal })), {
+    abort: () => controller.abort(),
+  });
+}
+function operation(overrides: Partial<Parameters<typeof createReplyOperation>[0]> = {}) {
+  return createReplyOperation({ ...scope, resetTriggered: false, ...overrides });
+}
+function owned(result: Awaited<ReturnType<typeof admit>>) {
+  assert(result.status === "owned", "Expected reply ownership");
+  return result.operation;
+}
+function store(state: Partial<SessionEntry> = {}) {
+  return createSessionStore({ [sessionKey]: { sessionId, updatedAt: 100, ...state } });
+}
+function entry(storePath: string, key = sessionKey) {
+  return loadSessionEntry({ storePath, sessionKey: key });
+}
+const interruptedEntry = {
+  status: "interrupted",
+  abortedLastRun: true,
+  mainRestartRecovery: { cycleId: "cycle-1", revision: 1, chargedAttempts: 0 },
+} satisfies Partial<SessionEntry>;
+const tombstoneEntry = {
+  mainRestartRecovery: {
+    cycleId: "cycle-1",
+    revision: 4,
+    chargedAttempts: 3,
+    tombstone: {
+      reason: "automatic recovery exhausted",
+      recoveredSessionId: "dashboard-successor",
+      recoveredSessionKey: "agent:main:dashboard:successor",
+    },
+  },
+} satisfies Partial<SessionEntry>;
+async function holdMutation(storePath: string, run: () => Promise<unknown> = async () => {}) {
+  const started = createDeferred();
+  const release = createDeferred();
+  const mutation = runSessionMutation({
+    scope: storePath,
+    identities: [sessionKey, sessionId],
+    run: async () => {
+      started.resolve();
+      await release.promise;
+      await run();
+    },
+  });
+  await started.promise;
+  return async () => {
+    release.resolve();
+    await mutation;
+  };
+}
+function holdRecoveryRelease() {
+  const started = createDeferred();
+  const release = createDeferred();
+  releaseMocks.beforeRelease.mockImplementationOnce(async () => {
+    started.resolve();
+    await release.promise;
+  });
+  return { started: started.promise, release: release.resolve };
+}
+async function expectRecoveryReleased(storePath: string, key = sessionKey) {
+  await vi.waitFor(() =>
+    expect(entry(storePath, key)?.mainRestartRecovery?.foregroundClaims).toBeUndefined(),
+  );
+}
+function interrupt(
+  storePath: string,
+  run: () => Promise<void>,
+  reason: Error = new Error("Synthetic user interruption"),
+) {
+  const target = { scope: storePath, identities: [sessionKey, sessionId] };
+  return runSessionMutation({
+    ...target,
+    prepare: async () => {
+      await interruptSessionControllerEffects({ ...target, reason });
+    },
+    run,
+  });
+}
+afterEach(async () => {
+  if (vi.isFakeTimers()) {
+    await vi.runOnlyPendingTimersAsync();
+    vi.useRealTimers();
+  }
+  testing.resetSessionControllerForTest();
+  resetDiagnosticRunActivityForTest();
+  releaseMocks.beforeRelease.mockClear();
+  releaseMocks.schedule.mockClear();
+});
 
-  it("waits for visible turns and reuses the active session id", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "active-session",
-      resetTriggered: false,
+it("rejects a reply when an archive commits before admission", async () => {
+  const storePath = store();
+  const release = await holdMutation(storePath, () =>
+    replaceSessionEntry({ sessionKey, storePath }, { sessionId, updatedAt: 100, archivedAt: 100 }),
+  );
+  const admission = admit({ storePath });
+  await release();
+  await expect(admission).rejects.toMatchObject({
+    name: "SessionWorkStartError",
+    reason: "archived",
+    retryable: false,
+    message: `Session "${sessionKey}" is archived. Restore it before starting new work.`,
+  });
+});
+it("rejects a reply when deletion commits before admission", async () => {
+  const storePath = store();
+  const release = await holdMutation(storePath, () =>
+    deleteSessionEntryLifecycle({
+      storePath,
+      archiveTranscript: false,
+      target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
+    }),
+  );
+  const admission = admitStored(storePath);
+  await release();
+  await expect(admission).rejects.toMatchObject({ code: "SESSION_WORK_START_CHANGED" });
+});
+it.each(["visible", "queued_followup"] as const)(
+  "retains source recovery until %s admission after adoption",
+  async (kind) => {
+    const storePath = createSessionStore({
+      [sourceKey]: { sessionId, updatedAt: 100, ...interruptedEntry },
+      [sessionKey]: { sessionId: "target-session", updatedAt: 100 },
     });
-    active.setPhase("running");
-
-    const admitted = admitReplyTurn({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "new-session",
-      kind: "visible",
-      resetTriggered: false,
+    const source = owned(
+      await admitStored(storePath, {
+        sessionKey: sourceKey,
+        originatingLeafEntryId: "leaf-before-run",
+      }),
+    );
+    const adopted = owned(await adopt(storePath, source, { expectedSessionId: "target-session" }));
+    adopted.updateSessionId("target-session");
+    expect(adopted).toBe(source);
+    expect(adopted.originatingLeafEntryId).toBe("leaf-before-run");
+    expect(adopted).toMatchObject({ key: sessionKey, sessionId: "target-session" });
+    const targets = [sourceKey, sessionKey].map((key) => ({ scope: storePath, identities: [key] }));
+    expect(targets.map(getTerminalSessionWorkAdmissionRelease)).toEqual([false, false]);
+    adopted.freezeAbort();
+    const terminalReleases = targets.map((target) => {
+      const released = getTerminalSessionWorkAdmissionRelease(target);
+      if (released === false) {
+        throw new Error("Committed reply admission is still classified as live");
+      }
+      return released;
     });
-
-    let settled = false;
-    void admitted.then(() => {
-      settled = true;
-    });
+    const release = holdRecoveryRelease();
+    adopted.complete();
+    await release.started;
+    const successor = observe(admitStored(storePath, { sessionKey: sourceKey, kind }));
     await Promise.resolve();
-    expect(settled).toBe(false);
-
-    active.complete();
-    const result = await admitted;
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe("active-session");
-      result.operation.complete();
-    }
+    expect(successor.settled).toBe(false);
+    release.release();
+    await Promise.all(terminalReleases);
+    const next = owned(await successor.promise);
+    expect(next.sessionId).toBe(sessionId);
+    next.complete();
+    await expectRecoveryReleased(storePath, sourceKey);
+  },
+);
+it("admits an explicit reset without reopening its restart tombstone", async () => {
+  const archivedAt = Date.now() - 1000;
+  const storePath = store({ ...tombstoneEntry, archivedAt, status: "failed" });
+  const admitted = owned(
+    await admitStored(storePath, { resetTriggered: true, allowRestartTombstoneReset: true }),
+  );
+  expect(entry(storePath)).toMatchObject({
+    sessionId,
+    archivedAt,
+    mainRestartRecovery: { tombstone: { recoveredSessionId: "dashboard-successor" } },
   });
-
-  it("does not apply cleanup settle timeout to visible turn admission", async () => {
-    vi.useFakeTimers();
+  admitted.complete();
+});
+it("does not treat resetTriggered alone as restart-tombstone authority", async () => {
+  await expect(admitStored(store(tombstoneEntry), { resetTriggered: true })).rejects.toMatchObject({
+    code: SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE,
+    message: expect.stringMatching(/ended during restart recovery/i),
+  });
+});
+it.each([true, false])(
+  "requires terminal evidence to retire recovery fences: %s",
+  async (terminal) => {
+    const storePath = store({
+      abortedLastRun: false,
+      restartRecoveryRuns: [{ runId: "stale-run", lifecycleGeneration: "stale-generation" }],
+      ...(terminal ? { restartRecoveryTerminalRunIds: ["stale-run"] } : {}),
+    });
+    const before = entry(storePath);
+    expect(before?.status).toBeUndefined();
+    if (!terminal) {
+      await expect(admitStored(storePath)).rejects.toMatchObject({
+        code: "SESSION_WORK_START_CHANGED",
+      });
+      expect(entry(storePath)).toEqual(before);
+      return;
+    }
+    const admitted = owned(await admitStored(storePath));
+    expect(admitted.sessionId).toBe(sessionId);
+    const current = entry(storePath);
+    expect(current?.restartRecoveryRuns).toBeUndefined();
+    expect(current?.mainRestartRecovery).toBeUndefined();
+    admitted.complete();
+  },
+);
+it("schedules released recovery only after retained admission exits", async () => {
+  const storePath = store(interruptedEntry);
+  const blocker = operation();
+  const reservation = operation({ sessionKey: sourceKey, sessionId: "source-session" });
+  const result = await adopt(storePath, reservation, {
+    retainLifecycleAdmissionOnActive: true,
+  });
+  expect(result).toMatchObject(activeRunSkipped);
+  expect(releaseMocks.schedule).not.toHaveBeenCalled();
+  expect(entry(storePath)).not.toHaveProperty("mainRestartRecovery.foregroundClaims");
+  if (result.status === "skipped") {
+    result.lifecycleAdmission?.release();
+  }
+  await vi.waitFor(() =>
+    expect(releaseMocks.schedule).toHaveBeenCalledWith({ ...scope, storePath }),
+  );
+  blocker.complete();
+  reservation.complete();
+});
+it("excludes the initiating reply admission from an in-band lifecycle mutation", async () => {
+  const storePath = store();
+  const admitted = owned(await admitStored(storePath));
+  await runWithReplyOperationLifecycleAdmission(admitted, () =>
+    interrupt(storePath, async () => {}),
+  );
+  expect(admitted.abortSignal.aborted).toBe(false);
+  admitted.complete();
+});
+it("skips an aborted reply waiting behind a lifecycle mutation", async () => {
+  const storePath = store();
+  const release = await holdMutation(storePath);
+  const admission = abortableAdmission({ storePath });
+  admission.abort();
+  await release();
+  await expect(admission.promise).resolves.toEqual({ status: "skipped", reason: "aborted" });
+});
+it.for([false, true])(
+  "adopts a reservation and preserves restart=%s",
+  async (restart, { signal }) => {
+    const storePath = store();
+    const reservation = operation({ sessionKey: sourceKey, sessionId: "source-session" });
+    expect(owned(await adopt(storePath, reservation))).toBe(reservation);
+    expect(reservation.key).toBe(sessionKey);
+    expect(getSessionControllerOperation(sourceKey)).toBeUndefined();
+    expect(getSessionControllerOperation(sessionKey)).toBe(reservation);
+    reservation.setPhase("running");
+    const aborted = createDeferred();
+    reservation.abortSignal.addEventListener("abort", () => aborted.resolve(), { once: true });
+    let mutationRan = false;
+    const mutation = interrupt(
+      storePath,
+      async () => {
+        mutationRan = true;
+      },
+      restart ? createAgentRunRestartAbortError() : undefined,
+    );
     try {
-      const active = createReplyOperation({
-        sessionKey: "agent:main:discord:channel:42",
-        sessionId: "active-session",
-        resetTriggered: false,
+      await withinTest(aborted.promise, signal);
+      expect(reservation.result).toEqual({
+        kind: "aborted",
+        code: restart ? "aborted_for_restart" : "aborted_by_user",
       });
-      active.setPhase("running");
+      expect(mutationRan).toBe(false);
+    } finally {
+      reservation.complete();
+      await mutation;
+    }
+    expect(mutationRan).toBe(true);
+  },
+);
+it("skips adoption without waiting when the target run slot is owned", async () => {
+  const blocker = operation();
+  blocker.setPhase("running");
+  const storePath = store({
+    restartRecoveryRuns: [
+      { runId: "active-run", lifecycleGeneration: getAgentEventLifecycleGeneration() },
+    ],
+  });
+  const before = entry(storePath);
+  const reservation = operation({ sessionKey: sourceKey, sessionId: "source-session" });
+  const result = await adopt(storePath, reservation);
+  expect(result).toMatchObject({ ...activeRunSkipped, activeOperation: blocker });
+  expect(reservation).toMatchObject({ key: sourceKey, result: null });
+  expect(getSessionControllerOperation(sourceKey)).toBe(reservation);
+  expect(getSessionControllerOperation(sessionKey)).toBe(blocker);
+  expect(entry(storePath)).toEqual(before);
+  blocker.complete();
+  reservation.complete();
+});
 
-      const admitted = admitReplyTurn({
-        sessionKey: "agent:main:discord:channel:42",
-        sessionId: "waiting-session",
-        kind: "visible",
-        resetTriggered: false,
-      });
+it.each([false, true])(
+  "rechecks a reset committed before admission, expected-session=%s",
+  async (expected) => {
+    const storePath = store();
+    const release = await holdMutation(storePath, () =>
+      replaceSessionEntry(
+        { sessionKey, storePath },
+        { sessionId: "reset-session", updatedAt: 200 },
+      ),
+    );
+    const admission = admit({ storePath, expectedSessionId: expected ? sessionId : undefined });
+    await release();
+    if (expected) {
+      await expect(admission).rejects.toMatchObject({ code: "SESSION_WORK_START_CHANGED" });
+    } else {
+      const result = owned(await admission);
+      expect(result.sessionId).toBe("reset-session");
+      result.complete();
+    }
+  },
+);
 
-      let settled = false;
-      void admitted.then(() => {
-        settled = true;
-      });
-
-      await vi.advanceTimersByTimeAsync(15_000);
+for (const outcome of ["retired", "cancelled"] as const) {
+  it(`waits without spinning on raw source preparation until ${outcome}`, async ({ signal }) => {
+    const input = reserveSessionControllerSource(sessionKey, { policy: { mode: "followup" } });
+    const abort = new AbortController();
+    let settled = false;
+    const pending = admit({ upstreamAbortSignal: abort.signal }).then((result) => {
+      settled = true;
+      return result;
+    });
+    try {
+      await withinTest(setImmediate(), signal);
       expect(settled).toBe(false);
-
-      active.complete();
-      const result = await admitted;
-      expect(result.status).toBe("owned");
+      if (outcome === "cancelled") {
+        abort.abort();
+      } else {
+        retireSessionControllerInput(input);
+      }
+      const result = await withinTest(pending, signal);
+      if (outcome === "cancelled") {
+        expect(result).toEqual({ status: "skipped", reason: "aborted" });
+        expect(input.phase).toBe("preparing");
+      } else {
+        owned(result).complete();
+      }
+    } finally {
+      abort.abort();
+      retireSessionControllerInput(input);
+      const result = await pending;
       if (result.status === "owned") {
         result.operation.complete();
       }
-    } finally {
-      await vi.runOnlyPendingTimersAsync();
-      vi.useRealTimers();
+      await input.settlement.promise;
     }
   });
+}
 
-  it("keeps the cleanup settle timeout for queued follow-up retry", async () => {
-    vi.useFakeTimers();
-    try {
-      const active = createReplyOperation({
-        sessionKey: "agent:main:discord:channel:42",
-        sessionId: "active-session",
-        resetTriggered: false,
+it.each([1, 2])("retains admission after %i terminal writer fence failures", async (count) => {
+  const held = operation();
+  const failures = [new Error("first fence failed"), new Error("second fence failed")].slice(
+    0,
+    count,
+  );
+  const fences = failures.map((failure) =>
+    vi.fn(async () => {
+      throw failure;
+    }),
+  );
+  for (const fence of fences) {
+    held.registerTerminalProducerFence(fence);
+  }
+  try {
+    const retirement = held.retireAdmissionAfterFencing();
+    if (count === 1) {
+      await expect(retirement).rejects.toBe(failures[0]);
+    } else {
+      await expect(retirement).rejects.toMatchObject({
+        message: "Session admission writer fencing failed",
+        errors: failures,
       });
-      active.setPhase("running");
-
-      const admitted = admitReplyTurn({
-        sessionKey: "agent:main:discord:channel:42",
-        sessionId: "queued-session",
-        kind: "queued_followup",
-        resetTriggered: false,
-      });
-
-      await vi.advanceTimersByTimeAsync(15_000);
-
-      await expect(admitted).resolves.toMatchObject({
-        status: "skipped",
-        reason: "active-run",
-        activeOperation: active,
-      });
-      active.complete();
-    } finally {
-      await vi.runOnlyPendingTimersAsync();
-      vi.useRealTimers();
     }
-  });
+    for (const fence of fences) {
+      expect(fence).toHaveBeenCalledOnce();
+    }
+    expect(held.admissionRetired).toBe(false);
+    expect(getSessionControllerOperation(sessionKey)).toBe(held);
+  } finally {
+    held.complete();
+  }
+});
 
-  it("keeps an already-waiting follow-up behind the delivery barrier", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    let releaseBarrier: () => void = () => {};
-    const barrier = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-    const admitted = admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "queued-session",
-      kind: "queued_followup",
-      resetTriggered: false,
-    });
-    let settled = false;
-    void admitted.then(() => {
-      settled = true;
-    });
-
-    await Promise.resolve();
-    active.completeWithAfterClearBarrier(barrier);
-    await Promise.resolve();
-
-    expect(settled).toBe(false);
-
-    releaseBarrier();
-    const result = await admitted;
-    expect(result.status).toBe("owned");
+it("resumes raw-source admission after writer fencing without waiting for producer cleanup", async ({
+  signal,
+}) => {
+  const input = reserveSessionControllerSource(sessionKey, { policy: { mode: "followup" } });
+  const abort = new AbortController();
+  const pending = admit({ upstreamAbortSignal: abort.signal });
+  let sourceOperation: ReturnType<typeof operation> | undefined;
+  try {
+    await withinTest(setImmediate(), signal);
+    const claim = await claimSessionControllerTask(input, () => {});
+    sourceOperation = operation({ mailboxClaim: claim });
+    sourceOperation.registerTerminalProducerFence(async () => true);
+    expect(await sourceOperation.retireAdmissionAfterFencing()).toBe(true);
+    expect(sourceOperation.admissionRetired).toBe(true);
+    expect(input.phase).toBe("claimed");
+    const successor = owned(await withinTest(pending, signal));
+    expect(getSessionControllerOperation(sessionKey)).toBe(successor);
+    expect(input.phase).toBe("claimed");
+    successor.complete();
+  } finally {
+    abort.abort();
+    sourceOperation?.complete();
+    if (input.claim) {
+      releaseSessionControllerClaim(input.claim);
+    } else {
+      retireSessionControllerInput(input);
+    }
+    const result = await pending;
     if (result.status === "owned") {
       result.operation.complete();
     }
-  });
-
-  it("allows a visible turn to claim the lane while delivery settles", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    let releaseBarrier: () => void = () => {};
-    const barrier = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-
-    active.completeWithAfterClearBarrier(barrier);
-    const result = await admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "visible-session",
-      kind: "visible",
-      resetTriggered: false,
-    });
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      result.operation.complete();
-    }
-    releaseBarrier();
-    await barrier;
-  });
-
-  it("skips heartbeat turns while delivery settles", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    let releaseBarrier: () => void = () => {};
-    const barrier = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-
-    active.completeWithAfterClearBarrier(barrier);
-    const result = await admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "heartbeat-session",
-      kind: "heartbeat",
-      resetTriggered: false,
-    });
-
-    expect(result).toEqual({ status: "skipped", reason: "active-run" });
-    releaseBarrier();
-    await barrier;
-  });
-
-  it("passes a visible turn's rotated session to after-clear work", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    let releaseBarrier: () => void = () => {};
-    const barrier = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-    let admissionSessionId: string | undefined;
-    runAfterReplyOperationClear(active, (sessionId) => {
-      admissionSessionId = sessionId;
-    });
-
-    active.completeWithAfterClearBarrier(barrier);
-    const visibleAdmission = await admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "visible-session",
-      kind: "visible",
-      resetTriggered: false,
-    });
-    expect(visibleAdmission.status).toBe("owned");
-    if (visibleAdmission.status === "owned") {
-      visibleAdmission.operation.updateSessionId("rotated-session");
-      visibleAdmission.operation.complete();
-    }
-
-    releaseBarrier();
-    await barrier;
-    await vi.waitFor(() => {
-      expect(admissionSessionId).toBe("rotated-session");
-    });
-    const queuedResult = await admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: admissionSessionId ?? "queued-session",
-      kind: "queued_followup",
-      resetTriggered: false,
-    });
-    expect(queuedResult.status).toBe("owned");
-    if (queuedResult.status === "owned") {
-      expect(queuedResult.operation.sessionId).toBe("rotated-session");
-      queuedResult.operation.complete();
-    }
-  });
-
-  it("uses the active run's final session id after waiting", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "pre-compact-session",
-      resetTriggered: false,
-    });
-    active.setPhase("preflight_compacting");
-
-    const admitted = admitReplyTurn({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "new-session",
-      kind: "visible",
-      resetTriggered: false,
-    });
-
-    await Promise.resolve();
-    active.updateSessionId("post-compact-session");
-    active.complete();
-    const result = await admitted;
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe("post-compact-session");
-      result.operation.complete();
-    }
-  });
-
-  it("skips heartbeat turns while a visible turn owns the lane", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "visible-session",
-      resetTriggered: false,
-    });
-
-    const result = await admitReplyTurn({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "heartbeat-session",
-      kind: "heartbeat",
-      resetTriggered: false,
-    });
-
-    expect(result).toMatchObject({
-      status: "skipped",
-      reason: "active-run",
-      activeOperation: active,
-    });
-    active.complete();
-  });
-
-  it("stops waiting when the caller aborts", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    const abortController = new AbortController();
-    const admitted = admitReplyTurn({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "waiting-session",
-      kind: "queued_followup",
-      resetTriggered: false,
-      upstreamAbortSignal: abortController.signal,
-    });
-
-    abortController.abort();
-
-    await expect(admitted).resolves.toMatchObject({
-      status: "skipped",
-      reason: "aborted",
-      activeOperation: active,
-    });
-    active.complete();
-  });
+    await input.settlement.promise;
+  }
 });

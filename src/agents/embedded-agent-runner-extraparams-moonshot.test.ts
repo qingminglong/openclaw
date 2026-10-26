@@ -1,12 +1,23 @@
 // Covers Moonshot-specific extra-params thinking payload behavior.
+
+import { expectDefined } from "@openclaw/normalization-core";
+import { buildProviderStreamFamilyHooks } from "openclaw/plugin-sdk/provider-stream-family";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  createMoonshotThinkingWrapper,
-  resolveMoonshotThinkingKeep,
-  resolveMoonshotThinkingType,
-} from "../llm/providers/stream-wrappers/moonshot.js";
 import { runExtraParamsPayloadCase } from "./embedded-agent-runner-extraparams.test-support.js";
-import { testing as extraParamsTesting } from "./embedded-agent-runner/extra-params.js";
+import { testing as extraParamsTesting } from "./embedded-agent-runner/extra-params.test-support.js";
+
+function createReadToolCallHistory() {
+  return [
+    {
+      role: "assistant",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: "{}" } }],
+    },
+  ];
+}
+
+function moonshotConfig(modelId: string, params: Record<string, unknown>) {
+  return { agents: { defaults: { models: { [`moonshot/${modelId}`]: { params } } } } };
+}
 
 beforeEach(() => {
   // Moonshot thinking support lives in its provider wrapper, wired through the
@@ -16,14 +27,7 @@ beforeEach(() => {
     resolveProviderExtraParamsForTransport: () => undefined,
     wrapProviderStreamFn: (params) => {
       if (params.provider === "moonshot") {
-        const thinkingType = resolveMoonshotThinkingType({
-          configuredThinking: params.context.extraParams?.thinking,
-          thinkingLevel: params.context.thinkingLevel,
-        });
-        const thinkingKeep = resolveMoonshotThinkingKeep({
-          configuredThinking: params.context.extraParams?.thinking,
-        });
-        return createMoonshotThinkingWrapper(params.context.streamFn, thinkingType, thinkingKeep);
+        return buildProviderStreamFamilyHooks("moonshot-thinking").wrapStreamFn?.(params.context);
       }
       return params.context.streamFn;
     },
@@ -35,16 +39,6 @@ afterEach(() => {
 });
 
 describe("applyExtraParamsToAgent Moonshot", () => {
-  it("maps thinkingLevel=off to Moonshot thinking.type=disabled", () => {
-    const payload = runExtraParamsPayloadCase({
-      provider: "moonshot",
-      modelId: "kimi-k2.5",
-      thinkingLevel: "off",
-    });
-
-    expect(payload.thinking).toEqual({ type: "disabled" });
-  });
-
   it("maps non-off thinking levels to Moonshot thinking.type=enabled and normalizes tool_choice", () => {
     const payload = runExtraParamsPayloadCase({
       provider: "moonshot",
@@ -76,19 +70,9 @@ describe("applyExtraParamsToAgent Moonshot", () => {
       provider: "moonshot",
       modelId: "kimi-k2.5",
       thinkingLevel: "high",
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "moonshot/kimi-k2.5": {
-                params: {
-                  thinking: { type: "disabled" },
-                },
-              },
-            },
-          },
-        },
-      },
+      cfg: moonshotConfig("kimi-k2.5", {
+        thinking: { type: "disabled" },
+      }),
     });
 
     expect(payload.thinking).toEqual({ type: "disabled" });
@@ -102,33 +86,12 @@ describe("applyExtraParamsToAgent Moonshot", () => {
       modelId: "kimi-k2.6",
       thinkingLevel: "low",
       payload: { model: "kimi-k2.6" },
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "moonshot/kimi-k2.6": {
-                params: {
-                  thinking: { type: "enabled", keep: "all" },
-                },
-              },
-            },
-          },
-        },
-      },
+      cfg: moonshotConfig("kimi-k2.6", {
+        thinking: { type: "enabled", keep: "all" },
+      }),
     });
 
     expect(payload.thinking).toEqual({ type: "enabled", keep: "all" });
-  });
-
-  it("omits thinking.keep on kimi-k2.6 when not configured", () => {
-    const payload = runExtraParamsPayloadCase({
-      provider: "moonshot",
-      modelId: "kimi-k2.6",
-      thinkingLevel: "low",
-      payload: { model: "kimi-k2.6" },
-    });
-
-    expect(payload.thinking).toEqual({ type: "enabled" });
   });
 
   it("strips thinking.keep for non-k2.6 models even when configured", () => {
@@ -137,19 +100,9 @@ describe("applyExtraParamsToAgent Moonshot", () => {
       modelId: "kimi-k2.5",
       thinkingLevel: "low",
       payload: { model: "kimi-k2.5" },
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "moonshot/kimi-k2.5": {
-                params: {
-                  thinking: { type: "enabled", keep: "all" },
-                },
-              },
-            },
-          },
-        },
-      },
+      cfg: moonshotConfig("kimi-k2.5", {
+        thinking: { type: "enabled", keep: "all" },
+      }),
     });
 
     expect(payload.thinking).toEqual({ type: "enabled" });
@@ -161,74 +114,89 @@ describe("applyExtraParamsToAgent Moonshot", () => {
       modelId: "kimi-k2.6",
       thinkingLevel: "low",
       payload: { model: "kimi-k2.6", tool_choice: { type: "tool", name: "read" } },
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "moonshot/kimi-k2.6": {
-                params: {
-                  thinking: { type: "enabled", keep: "all" },
-                },
-              },
-            },
-          },
-        },
-      },
+      cfg: moonshotConfig("kimi-k2.6", {
+        thinking: { type: "enabled", keep: "all" },
+      }),
     });
 
     expect(payload.thinking).toEqual({ type: "disabled" });
   });
-  it("omits thinking controls and broadens pinned tool choice for kimi-k2.7-code", () => {
+  it.each(["kimi-k2.7-code", "kimi-k2.7-code-highspeed"])(
+    "omits thinking controls and broadens pinned tool choice for %s",
+    (modelId) => {
+      const payload = runExtraParamsPayloadCase({
+        provider: "moonshot",
+        modelId,
+        thinkingLevel: "off",
+        payload: {
+          model: modelId,
+          messages: createReadToolCallHistory(),
+        },
+        cfg: moonshotConfig(modelId, {
+          thinking: { type: "disabled", keep: "all" },
+          extra_body: {
+            thinking: { type: "disabled", keep: "all" },
+            reasoning_effort: "low",
+            tool_choice: { type: "tool", name: "read" },
+            temperature: 0,
+            top_p: 0.5,
+            n: 2,
+            presence_penalty: 1,
+            frequency_penalty: 1,
+          },
+        }),
+      });
+
+      expect(payload).not.toHaveProperty("thinking");
+      expect(payload).not.toHaveProperty("reasoning_effort");
+      expect(payload.tool_choice).toBe("auto");
+      expect(payload).not.toHaveProperty("temperature");
+      expect(payload).not.toHaveProperty("top_p");
+      expect(payload).not.toHaveProperty("n");
+      expect(payload).not.toHaveProperty("presence_penalty");
+      expect(payload).not.toHaveProperty("frequency_penalty");
+      const messages = payload.messages as Array<Record<string, unknown>>;
+      expect(expectDefined(messages[0], "messages[0] test invariant").reasoning_content).toBe("");
+    },
+  );
+
+  it("forces Kimi K3 max reasoning while preserving pinned tool choice", () => {
+    const pinnedToolChoice = { type: "function", function: { name: "read" } };
     const payload = runExtraParamsPayloadCase({
       provider: "moonshot",
-      modelId: "kimi-k2.7-code",
+      modelId: "kimi-k3",
       thinkingLevel: "off",
       payload: {
-        model: "kimi-k2.7-code",
-        messages: [
-          {
-            role: "assistant",
-            tool_calls: [
-              { id: "call_1", type: "function", function: { name: "read", arguments: "{}" } },
-            ],
-          },
-        ],
+        model: "kimi-k3",
+        messages: createReadToolCallHistory(),
       },
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "moonshot/kimi-k2.7-code": {
-                params: {
-                  thinking: { type: "disabled", keep: "all" },
-                  extra_body: {
-                    thinking: { type: "disabled", keep: "all" },
-                    reasoning_effort: "low",
-                    tool_choice: { type: "tool", name: "read" },
-                    temperature: 0,
-                    top_p: 0.5,
-                    n: 2,
-                    presence_penalty: 1,
-                    frequency_penalty: 1,
-                  },
-                },
-              },
-            },
-          },
+      cfg: moonshotConfig("kimi-k3", {
+        thinking: { type: "disabled", keep: "all" },
+        extra_body: {
+          thinking: { type: "disabled", keep: "all" },
+          reasoningEffort: "low",
+          reasoning_effort: "low",
+          tool_choice: pinnedToolChoice,
+          temperature: 0,
+          top_p: 0.5,
+          n: 2,
+          presence_penalty: 1,
+          frequency_penalty: 1,
         },
-      },
+      }),
     });
 
     expect(payload).not.toHaveProperty("thinking");
-    expect(payload).not.toHaveProperty("reasoning_effort");
-    expect(payload.tool_choice).toBe("auto");
+    expect(payload).not.toHaveProperty("reasoningEffort");
+    expect(payload.reasoning_effort).toBe("max");
+    expect(payload.tool_choice).toEqual(pinnedToolChoice);
     expect(payload).not.toHaveProperty("temperature");
     expect(payload).not.toHaveProperty("top_p");
     expect(payload).not.toHaveProperty("n");
     expect(payload).not.toHaveProperty("presence_penalty");
     expect(payload).not.toHaveProperty("frequency_penalty");
     const messages = payload.messages as Array<Record<string, unknown>>;
-    expect(messages[0].reasoning_content).toBe("");
+    expect(expectDefined(messages[0], "messages[0] test invariant").reasoning_content).toBe("");
   });
 
   it("repairs only missing assistant tool-call reasoning_content when thinking is enabled", () => {
@@ -261,8 +229,10 @@ describe("applyExtraParamsToAgent Moonshot", () => {
 
     expect(payload.thinking).toEqual({ type: "enabled" });
     const messages = payload.messages as Array<Record<string, unknown>>;
-    expect(messages[1].reasoning_content).toBe("");
-    expect(messages[2].reasoning_content).toBe("native reasoning");
+    expect(expectDefined(messages[1], "messages[1] test invariant").reasoning_content).toBe("");
+    expect(expectDefined(messages[2], "messages[2] test invariant").reasoning_content).toBe(
+      "native reasoning",
+    );
     expect(messages[3]).not.toHaveProperty("reasoning_content");
   });
 
@@ -272,18 +242,14 @@ describe("applyExtraParamsToAgent Moonshot", () => {
       modelId: "kimi-k2.5",
       thinkingLevel: "off",
       payload: {
-        messages: [
-          {
-            role: "assistant",
-            tool_calls: [
-              { id: "call_1", type: "function", function: { name: "read", arguments: "{}" } },
-            ],
-          },
-        ],
+        messages: createReadToolCallHistory(),
       },
     });
 
+    expect(payload.thinking).toEqual({ type: "disabled" });
     const messages = payload.messages as Array<Record<string, unknown>>;
-    expect(messages[0].reasoning_content).toBeUndefined();
+    expect(
+      expectDefined(messages[0], "messages[0] test invariant").reasoning_content,
+    ).toBeUndefined();
   });
 });

@@ -1,64 +1,146 @@
-/**
- * Tests provider stream shared helpers and stream hook capture.
- */
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
-import type { Model } from "openclaw/plugin-sdk/llm";
-import { describe, expect, it } from "vitest";
+import type { AssistantMessage, Model } from "openclaw/plugin-sdk/llm";
+import { createZeroUsageFixture } from "openclaw/plugin-sdk/test-fixtures";
+import { expect, it, vi } from "vitest";
+import { makeProviderModelFixture } from "../agents/test-helpers/provider-model-fixture.js";
 import { createAssistantMessageEventStream } from "../llm/utils/event-stream.js";
 import {
-  createDeepSeekV4OpenAICompatibleThinkingWrapper,
-  createAnthropicThinkingPrefillPayloadWrapper,
-  createOpenAICompatibleCompletionsThinkingOffWrapper,
-  createPayloadPatchStreamWrapper,
-  createPlainTextToolCallCompatWrapper,
-  defaultToolStreamExtraParams,
-  isOpenAICompatibleThinkingEnabled,
-  normalizeOpenAICompatibleReasoningPayload,
-  setQwenChatTemplateThinking,
-  stripTrailingAnthropicAssistantPrefillWhenThinking,
+  createDeepSeekV4OpenAICompatibleThinkingWrapper as deepSeekWrapper,
+  createAnthropicThinkingPrefillPayloadWrapper as prefillWrapper,
+  createOpenAICompatibleCompletionsThinkingOffWrapper as thinkingOffWrapper,
+  createPayloadPatchStreamWrapper as patchWrapper,
+  createPlainTextToolCallCompatWrapper as toolCallWrapper,
+  defaultToolStreamExtraParams as toolStreamParams,
+  isOpenAICompatibleThinkingEnabled as thinkingEnabled,
+  normalizeOpenAICompatibleReasoningPayload as normalizeReasoning,
+  normalizeOpenAICompatibleReasoningReplay as normalizeReplay,
+  setQwenChatTemplateThinking as setQwenThinking,
+  stripTrailingAnthropicAssistantPrefillWhenThinking as stripPrefill,
+  transformProviderStreamMessages as transformMessages,
 } from "./provider-stream-shared.js";
 
 type StreamEvent = { type: string } & Record<string, unknown>;
 
-const lmstudioBinaryModel = {
-  api: "openai-completions",
-  provider: "lmstudio",
-  id: "google/gemma-4-26b-a4b-qat",
-  baseUrl: "http://127.0.0.1:1234/v1",
-  reasoning: true,
-  compat: {
-    supportsReasoningEffort: true,
-    supportedReasoningEfforts: ["none", "minimal", "low", "medium", "high", "xhigh"],
-    reasoningEffortMap: { off: "none", none: "none", adaptive: "xhigh", max: "xhigh" },
-  },
-} as unknown as Model<"openai-completions">;
+type AssistantContent = string | Array<Record<string, unknown>>;
 
-const lmstudioBareModel = {
-  api: "openai-completions",
-  provider: "lmstudio",
-  id: "qwen3-8b-instruct",
-  baseUrl: "http://127.0.0.1:1234/v1",
-  reasoning: true,
-} as unknown as Model<"openai-completions">;
-
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`expected ${label} to be a record`);
-  }
-  return value as Record<string, unknown>;
+function textBlock(text: string) {
+  return { type: "text", text };
 }
 
-function createEventStream(events: unknown[]): ReturnType<StreamFn> {
-  const output = createAssistantMessageEventStream();
-  const stream = output as unknown as { push(event: unknown): void; end(): void };
-  queueMicrotask(() => {
-    for (const event of events) {
-      stream.push(event);
-    }
-    stream.end();
-  });
-  return output as ReturnType<StreamFn>;
+type MessageFixture = Record<string, unknown> & { content?: AssistantContent; stopReason?: string };
+type EventFixture = Record<string, unknown> & {
+  type: string;
+  partial?: MessageFixture;
+  message?: MessageFixture;
+  error?: MessageFixture;
+};
+
+function completeAssistantMessage(value: MessageFixture, fallbackStopReason = "stop") {
+  return {
+    ...value,
+    role: "assistant",
+    content: typeof value.content === "string" ? [textBlock(value.content)] : (value.content ?? []),
+    api: "openai-completions",
+    provider: "test",
+    model: "test-model",
+    usage: createZeroUsageFixture(),
+    stopReason: value.stopReason ?? fallbackStopReason,
+    timestamp: 1,
+  };
 }
+
+function completeStreamEvent(event: EventFixture) {
+  const requiresPartial = !["text_delta", "done", "error"].includes(event.type);
+  return {
+    ...event,
+    ...(event.partial || requiresPartial
+      ? { partial: completeAssistantMessage(event.partial ?? { content: [] }) }
+      : {}),
+    ...(event.message
+      ? { message: completeAssistantMessage(event.message, String(event.reason)) }
+      : {}),
+    ...(event.error ? { error: completeAssistantMessage(event.error, "error") } : {}),
+  };
+}
+
+function thinkingBlock(thinking = "Need file contents.") {
+  return { type: "thinking", thinking };
+}
+function thinkingDelta(content: Array<Record<string, unknown>>, contentIndex: number) {
+  return {
+    type: "thinking_delta",
+    contentIndex,
+    delta: "Need file contents.",
+    partial: { content },
+  };
+}
+function payloadStream(payload: Record<string, unknown>): StreamFn {
+  return (model, _context, options) => {
+    options?.onPayload?.(payload as never, model as never);
+    return {} as ReturnType<StreamFn>;
+  };
+}
+function prefillPayload(type: string) {
+  return {
+    thinking: { type },
+    messages: [
+      { role: "user", content: "Return JSON." },
+      { role: "assistant", content: "{" },
+    ],
+  };
+}
+
+function expectEventTypes(events: StreamEvent[], types: string) {
+  expect(events.map((event) => event.type)).toEqual(types.split(" "));
+}
+
+function textDelta(delta: string) {
+  return { type: "text_delta", contentIndex: 0, delta };
+}
+
+function doneEvent(content: AssistantContent, reason = "stop") {
+  return {
+    type: "done",
+    reason,
+    message: completeAssistantMessage({ content, stopReason: reason }),
+  };
+}
+
+function errorEvent(error: MessageFixture, partial?: MessageFixture) {
+  return {
+    type: "error",
+    reason: "error",
+    ...(partial ? { partial: completeAssistantMessage(partial, "error") } : {}),
+    error: completeAssistantMessage(error, "error"),
+  };
+}
+
+const streamTestModel = makeProviderModelFixture<"openai-completions">({
+  id: "test-model",
+  name: "Test Model",
+  api: "openai-completions",
+  provider: "test",
+  baseUrl: "https://example.test/v1",
+  contextWindow: 8_192,
+  maxTokens: 1_024,
+}) satisfies Model<"openai-completions">;
+
+function localModel(id: string, compat?: Model<"openai-completions">["compat"]) {
+  return {
+    ...streamTestModel,
+    provider: "lmstudio",
+    id,
+    baseUrl: "http://127.0.0.1:1234/v1",
+    reasoning: true,
+    ...(compat ? { compat } : {}),
+  };
+}
+const lmstudioBareModel = localModel("qwen3-8b-instruct");
+const lmstudioBinaryModel = localModel("google/gemma-4-26b-a4b-qat", {
+  supportsReasoningEffort: true,
+  supportedReasoningEfforts: ["none", "minimal", "low", "medium", "high", "xhigh"],
+  reasoningEffortMap: { off: "none", none: "none", adaptive: "xhigh", max: "xhigh" },
+});
 
 function createPayloadCapture(initialReasoningEffort?: string) {
   const payloads: Array<Record<string, unknown>> = [];
@@ -74,23 +156,25 @@ function createPayloadCapture(initialReasoningEffort?: string) {
   return { baseStreamFn, payloads };
 }
 
-function createControlledPlainTextToolCallCompatStream() {
-  const source = createAssistantMessageEventStream();
-  const baseStream: StreamFn = () => source as ReturnType<StreamFn>;
-  const wrapped = createPlainTextToolCallCompatWrapper(baseStream);
-  const stream = wrapped(
-    { provider: "test", api: "openai-completions", id: "test-model" } as never,
-    {
-      messages: [],
-      tools: [{ name: "read", description: "Read", parameters: { type: "object" } }],
-    } as never,
+async function collectEvents(events: EventFixture[], toolNames = ["read"]): Promise<StreamEvent[]> {
+  const outputSource = createAssistantMessageEventStream();
+  queueMicrotask(() => {
+    for (const event of events) {
+      outputSource.push(completeStreamEvent(event) as never);
+    }
+    outputSource.end();
+  });
+  const wrapped = toolCallWrapper(() => outputSource);
+  const stream = await wrapped(
+    streamTestModel,
+    { tools: toolNames.map((name) => ({ name })) } as never,
     {},
   );
-  return { source, stream };
-}
-
-async function resolveStream(stream: ReturnType<StreamFn>) {
-  return stream instanceof Promise ? await stream : stream;
+  const output: StreamEvent[] = [];
+  for await (const event of stream as AsyncIterable<unknown>) {
+    output.push(event as StreamEvent);
+  }
+  return output;
 }
 
 async function nextEvent(iterator: AsyncIterator<unknown>, label: string): Promise<StreamEvent> {
@@ -107,2136 +191,373 @@ async function nextEvent(iterator: AsyncIterator<unknown>, label: string): Promi
   return result.value as StreamEvent;
 }
 
-describe("defaultToolStreamExtraParams", () => {
-  it("defaults tool_stream on when absent", () => {
-    expect(defaultToolStreamExtraParams()).toEqual({ tool_stream: true });
-    expect(defaultToolStreamExtraParams({ fastMode: true })).toEqual({
-      fastMode: true,
-      tool_stream: true,
-    });
+it("transforms checkpoints and final results while preserving sparse deltas", async () => {
+  const partial: AssistantMessage = {
+    role: "assistant",
+    api: "openai-completions",
+    provider: "test",
+    model: "test-model",
+    content: [],
+    usage: createZeroUsageFixture(),
+    stopReason: "stop",
+    timestamp: 1,
+  };
+  const final: AssistantMessage = { ...partial, usage: createZeroUsageFixture() };
+  const source = createAssistantMessageEventStream();
+  source.push({ type: "start", partial });
+  source.push({ type: "text_delta", contentIndex: 0, delta: "reply" });
+  source.push({ type: "done", reason: "stop", message: final });
+  source.end();
+  const stream = transformMessages(source, (message) => {
+    message.usage.cacheTelemetry = { state: "available" };
   });
-
-  it("preserves explicit tool_stream values", () => {
-    const enabled = { tool_stream: true, fastMode: true };
-    const disabled = { tool_stream: false, fastMode: true };
-
-    expect(defaultToolStreamExtraParams(enabled)).toBe(enabled);
-    expect(defaultToolStreamExtraParams(disabled)).toBe(disabled);
-  });
-});
-
-describe("isOpenAICompatibleThinkingEnabled", () => {
-  it("uses explicit request reasoning before session thinking level", () => {
-    expect(
-      isOpenAICompatibleThinkingEnabled({
-        thinkingLevel: "high",
-        options: { reasoning: "none" } as never,
-      }),
-    ).toBe(false);
-    expect(
-      isOpenAICompatibleThinkingEnabled({
-        thinkingLevel: "off",
-        options: { reasoningEffort: "medium" } as never,
-      }),
-    ).toBe(true);
-  });
-
-  it("treats off and none as disabled", () => {
-    expect(isOpenAICompatibleThinkingEnabled({ thinkingLevel: "off", options: {} })).toBe(false);
-    expect(
-      isOpenAICompatibleThinkingEnabled({
-        thinkingLevel: "high",
-        options: { reasoning: "none" } as never,
-      }),
-    ).toBe(false);
-  });
-
-  it("defaults to enabled for missing or non-string values", () => {
-    expect(isOpenAICompatibleThinkingEnabled({ thinkingLevel: undefined, options: {} })).toBe(true);
-    expect(
-      isOpenAICompatibleThinkingEnabled({
-        thinkingLevel: "off",
-        options: { reasoning: { effort: "off" } } as never,
-      }),
-    ).toBe(true);
-  });
-});
-
-describe("setQwenChatTemplateThinking", () => {
-  it("preserves existing chat-template kwargs and enables thinking", () => {
-    const payload = {
-      chat_template_kwargs: {
-        custom_flag: "keep",
-        preserve_thinking: false,
-      },
-    };
-
-    setQwenChatTemplateThinking(payload, true);
-
-    expect(payload.chat_template_kwargs).toEqual({
-      custom_flag: "keep",
-      preserve_thinking: false,
-      enable_thinking: true,
-    });
-  });
-
-  it("creates the required chat-template kwargs when absent", () => {
-    const payload: Record<string, unknown> = {};
-
-    setQwenChatTemplateThinking(payload, false);
-
-    expect(payload).toEqual({
-      chat_template_kwargs: {
-        enable_thinking: false,
-        preserve_thinking: true,
-      },
-    });
-  });
-});
-
-describe("normalizeOpenAICompatibleReasoningPayload", () => {
-  it("removes the legacy field and adds the selected reasoning effort", () => {
-    const payload: Record<string, unknown> = {
-      reasoning_effort: "high",
-    };
-
-    normalizeOpenAICompatibleReasoningPayload(payload, "adaptive");
-
-    expect(payload).toEqual({ reasoning: { effort: "medium" } });
-  });
-
-  it("preserves explicit reasoning controls", () => {
-    const withMaxTokens: Record<string, unknown> = {
-      reasoning_effort: "high",
-      reasoning: { max_tokens: 256 },
-    };
-    const withEffort: Record<string, unknown> = {
-      reasoning_effort: "high",
-      reasoning: { effort: "low", summary: "auto" },
-    };
-
-    normalizeOpenAICompatibleReasoningPayload(withMaxTokens, "high");
-    normalizeOpenAICompatibleReasoningPayload(withEffort, "high");
-
-    expect(withMaxTokens).toEqual({ reasoning: { max_tokens: 256 } });
-    expect(withEffort).toEqual({ reasoning: { effort: "low", summary: "auto" } });
-  });
-
-  it("removes only the legacy field when thinking is disabled", () => {
-    const payload: Record<string, unknown> = {
-      reasoning_effort: "high",
-    };
-
-    normalizeOpenAICompatibleReasoningPayload(payload, "off");
-
-    expect(payload).toEqual({});
-  });
-});
-
-describe("createDeepSeekV4OpenAICompatibleThinkingWrapper", () => {
-  it("backfills reasoning_content on every replayed assistant message when thinking is enabled", () => {
-    const payload = {
-      messages: [
-        { role: "user", content: "read file" },
-        { role: "assistant", tool_calls: [{ id: "call_1", name: "read" }] },
-        { role: "tool", content: "ok" },
-        { role: "assistant", content: "done" },
-        { role: "assistant", content: "kept", reasoning_content: "native reasoning" },
-      ],
-    };
-    const baseStreamFn: StreamFn = (_model, _context, options) => {
-      options?.onPayload?.(payload as never, _model as never);
-      return {} as ReturnType<StreamFn>;
-    };
-
-    const wrapped = createDeepSeekV4OpenAICompatibleThinkingWrapper({
-      baseStreamFn,
-      thinkingLevel: "high",
-      shouldPatchModel: () => true,
-    });
-    void wrapped?.({} as never, {} as never, {});
-
-    expect(payload.messages[0]).not.toHaveProperty("reasoning_content");
-    expect(payload.messages[1]).toHaveProperty("reasoning_content", "");
-    expect(payload.messages[2]).not.toHaveProperty("reasoning_content");
-    expect(payload.messages[3]).toHaveProperty("reasoning_content", "");
-    expect(payload.messages[4]).toHaveProperty("reasoning_content", "native reasoning");
-  });
-});
-
-describe("createPayloadPatchStreamWrapper", () => {
-  it("passes stream call options to payload patches", () => {
-    let captured: Record<string, unknown> = {};
-    const baseStreamFn: StreamFn = (_model, _context, options) => {
-      const payload: Record<string, unknown> = {};
-      options?.onPayload?.(payload, _model);
-      captured = payload;
-      return {} as ReturnType<StreamFn>;
-    };
-
-    const wrapped = createPayloadPatchStreamWrapper(baseStreamFn, ({ payload, options }) => {
-      payload.reasoning = (options as { reasoning?: unknown } | undefined)?.reasoning;
-    });
-    void wrapped(
-      { id: "model" } as never,
-      { messages: [] } as never,
-      {
-        reasoning: "medium",
-      } as never,
-    );
-
-    expect(captured).toEqual({ reasoning: "medium" });
-  });
-
-  it("calls the underlying stream directly when shouldPatch rejects the model", () => {
-    let onPayloadWasInstalled = false;
-    const baseStreamFn: StreamFn = (_model, _context, options) => {
-      onPayloadWasInstalled = typeof options?.onPayload === "function";
-      return {} as ReturnType<StreamFn>;
-    };
-
-    const wrapped = createPayloadPatchStreamWrapper(
-      baseStreamFn,
-      ({ payload }) => {
-        payload.unexpected = true;
-      },
-      { shouldPatch: () => false },
-    );
-    void wrapped({ id: "model" } as never, { messages: [] } as never, {});
-
-    expect(onPayloadWasInstalled).toBe(false);
-  });
-});
-
-describe("createOpenAICompatibleCompletionsThinkingOffWrapper", () => {
-  it("maps reasoning_effort to the model's disabled value when thinking is off", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture("high");
-    const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(baseStreamFn, "off");
-    void wrapped(lmstudioBinaryModel, { messages: [] }, {});
-
-    expect(payloads[0]?.reasoning_effort).toBe("none");
-  });
-
-  it("drops reasoning_effort when the model has no disabled effort", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture("high");
-    const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(baseStreamFn, "off");
-    void wrapped(lmstudioBareModel, { messages: [] }, {});
-
-    expect(payloads[0]).not.toHaveProperty("reasoning_effort");
-  });
-
-  it("does not add reasoning_effort when none was sent", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture();
-    const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(baseStreamFn, "off");
-    void wrapped(lmstudioBinaryModel, { messages: [] }, {});
-
-    expect(payloads[0]).not.toHaveProperty("reasoning_effort");
-  });
-
-  it("leaves enabled thinking levels unchanged", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture("high");
-    const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(baseStreamFn, "high");
-    void wrapped(lmstudioBinaryModel, { messages: [] }, {});
-
-    expect(payloads[0]?.reasoning_effort).toBe("high");
-  });
-});
-
-describe("createPlainTextToolCallCompatWrapper", () => {
-  it("promotes standalone text tool calls into tool-call stream events", async () => {
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_start", content: "" },
-        { type: "text_delta", delta: '[tool:read] {"path":"/tmp/file.txt"}' },
-        { type: "text_end" },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: '[tool:read] {"path":"/tmp/file.txt"}',
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
+  const eventTypes: string[] = [];
+  for await (const event of stream) {
+    eventTypes.push(event.type);
+    if (event.type === "text_delta") {
+      expect(event).toEqual({ type: "text_delta", contentIndex: 0, delta: "reply" });
     }
+  }
+  expect(eventTypes).toEqual(["start", "text_delta", "done"]);
+  expect(partial.usage.cacheTelemetry).toEqual({ state: "available" });
+  expect(final.usage.cacheTelemetry).toEqual({ state: "available" });
+  expect((await stream.result()).usage.cacheTelemetry).toEqual({ state: "available" });
+});
 
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "toolcall_start",
-      "toolcall_delta",
-      "done",
-    ]);
-    const done = events.at(-1) as { message?: { content?: unknown; stopReason?: unknown } };
-    expect(done.message?.stopReason).toBe("toolUse");
-    expect(done.message?.content).toEqual([
-      expect.objectContaining({
-        type: "toolCall",
-        name: "read",
-        arguments: { path: "/tmp/file.txt" },
-      }),
-    ]);
+it("defaults tool_stream on when absent", () => {
+  expect(toolStreamParams()).toEqual({ tool_stream: true });
+  expect(toolStreamParams({ fastMode: true })).toEqual({
+    fastMode: true,
+    tool_stream: true,
+  });
+});
+
+it("preserves explicit tool_stream values", () => {
+  const enabled = { tool_stream: true, fastMode: true };
+  const disabled = { tool_stream: false, fastMode: true };
+
+  expect(toolStreamParams(enabled)).toBe(enabled);
+  expect(toolStreamParams(disabled)).toBe(disabled);
+});
+
+it.each([
+  { thinkingLevel: undefined, options: {}, enabled: true },
+  { thinkingLevel: "off", options: { reasoning: { effort: "off" } }, enabled: true },
+] as const)(
+  "resolves thinking $thinkingLevel with request $options to $enabled",
+  ({ thinkingLevel, options, enabled }) => {
+    expect(thinkingEnabled({ thinkingLevel, options: options as never })).toBe(enabled);
+  },
+);
+
+it.each([true, false])("preserves kwargs when present, enabled=%s", (enabled) => {
+  const payload: Record<string, unknown> = enabled
+    ? { chat_template_kwargs: { custom_flag: "keep", preserve_thinking: false } }
+    : {};
+  setQwenThinking(payload, enabled);
+  expect(payload).toEqual({
+    chat_template_kwargs: enabled
+      ? { custom_flag: "keep", preserve_thinking: false, enable_thinking: true }
+      : { enable_thinking: false, preserve_thinking: true },
+  });
+});
+it.each([{ max_tokens: 256 }, { effort: "low", summary: "auto" }])(
+  "preserves explicit %j controls",
+  (reasoning) => {
+    const payload = { reasoning_effort: "high", reasoning };
+    normalizeReasoning(payload, "high");
+    expect(payload).toEqual({ reasoning });
+  },
+);
+
+it("honors provider-owned tool-call replay selection", () => {
+  const payload = {
+    messages: [
+      { role: "assistant", content: "plain" },
+      { role: "assistant", tool_calls: [{ id: "call_1" }] },
+    ],
+  };
+
+  normalizeReplay(payload, {
+    thinkingEnabled: true,
+    shouldBackfillAssistantMessage: (message) => Array.isArray(message.tool_calls),
   });
 
-  it("promotes complete under-cap text tool calls for non-stop terminal reasons", async () => {
-    const rawToolText = '[tool:read] {"path":"/tmp/file.txt"}';
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "length",
-          message: {
-            role: "assistant",
-            content: rawToolText,
-            stopReason: "length",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
+  expect(payload.messages).toEqual([
+    { role: "assistant", content: "plain" },
+    { role: "assistant", tool_calls: [{ id: "call_1" }], reasoning_content: "" },
+  ]);
+});
 
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
+it("normalizes nullable reasoning for providers requiring string replay", () => {
+  const payload = {
+    messages: [
+      { role: "assistant", reasoning_content: null },
+      { role: "assistant", reasoning_content: undefined },
+    ],
+  };
 
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "toolcall_start",
-      "toolcall_delta",
-      "done",
-    ]);
-    const done = events.at(-1) as { reason?: unknown; message?: { stopReason?: unknown } };
-    expect(done.reason).toBe("toolUse");
-    expect(done.message?.stopReason).toBe("toolUse");
+  normalizeReplay(payload, {
+    thinkingEnabled: true,
+    replaceNullReasoningContent: true,
   });
 
-  it("passes through bracketed text when no configured tool names match", async () => {
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", delta: "[note] keep streaming" },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: "[note] keep streaming",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
+  expect(payload.messages).toEqual([
+    { role: "assistant", reasoning_content: "" },
+    { role: "assistant", reasoning_content: "" },
+  ]);
+});
 
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
+it("strips disabled reasoning with assistant-only policy", () => {
+  const payload = {
+    messages: [
+      { role: "user", reasoning_content: "preserve user" },
+      { role: "assistant", reasoning_content: "remove assistant" },
+      { role: "tool", reasoning_content: "preserve tool" },
+    ],
+  };
+  normalizeReplay(payload, {
+    thinkingEnabled: false,
+    stripAssistantMessagesOnly: true,
   });
 
-  it("converts standalone plain-text tool calls for result consumers", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const resultPromise = (await resolveStream(stream)).result();
-    const rawToolText = '[tool:read] {"path":"src/index.ts"}';
+  expect(payload.messages).toEqual([
+    { role: "user", reasoning_content: "preserve user" },
+    { role: "assistant" },
+    { role: "tool", reasoning_content: "preserve tool" },
+  ]);
+});
 
-    source.push({ type: "start", partial: { content: [] } } as never);
-    source.push({
-      type: "text_delta",
-      contentIndex: 0,
-      delta: rawToolText,
-    } as never);
-    source.push({
-      type: "done",
-      reason: "stop",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: rawToolText }],
-        stopReason: "stop",
-      },
-    } as never);
-    source.end();
+it("backfills reasoning_content on every replayed assistant message when thinking is enabled", () => {
+  const payload = {
+    messages: [
+      { role: "user", content: "read file" },
+      { role: "assistant", tool_calls: [{ id: "call_1", name: "read" }] },
+      { role: "tool", content: "ok" },
+      { role: "assistant", content: "done" },
+      { role: "assistant", content: "kept", reasoning_content: "native reasoning" },
+    ],
+  };
+  const baseStreamFn = payloadStream(payload);
 
-    const message = requireRecord(await resultPromise, "result message");
-    expect(message.stopReason).toBe("toolUse");
-    expect(requireRecord((message.content as unknown[])[0], "tool call")).toMatchObject({
-      type: "toolCall",
-      name: "read",
-      arguments: { path: "src/index.ts" },
-    });
+  const wrapped = deepSeekWrapper({
+    baseStreamFn,
+    thinkingLevel: "high",
+    shouldPatchModel: () => true,
   });
+  void wrapped?.({} as never, {} as never, {});
 
-  it("promotes serialized tool calls split across adjacent text blocks", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const resultPromise = (await resolveStream(stream)).result();
-    const rawToolText = [
-      "[tool:read]",
-      "<parameter=path>",
-      "src/index.ts",
-      "</parameter>",
-      "</function>",
-    ].join("\n");
+  expect(payload.messages[0]).not.toHaveProperty("reasoning_content");
+  expect(payload.messages[1]).toHaveProperty("reasoning_content", "");
+  expect(payload.messages[2]).not.toHaveProperty("reasoning_content");
+  expect(payload.messages[3]).toHaveProperty("reasoning_content", "");
+  expect(payload.messages[4]).toHaveProperty("reasoning_content", "native reasoning");
+});
 
-    source.push({ type: "start", partial: { content: [] } } as never);
-    source.push({
-      type: "text_delta",
-      contentIndex: 0,
-      delta: rawToolText,
-    } as never);
-    source.push({
-      type: "done",
-      reason: "stop",
-      message: {
-        role: "assistant",
-        content: [
-          { type: "text", text: "[tool:read]\n<parameter=path>" },
-          { type: "text", text: "src/index.ts\n</parameter>\n</function>" },
-        ],
-        stopReason: "stop",
-      },
-    } as never);
-    source.end();
+it("calls the underlying stream directly when shouldPatch rejects the model", () => {
+  const baseStreamFn = vi.fn<StreamFn>(() => ({}) as ReturnType<StreamFn>);
 
-    const message = requireRecord(await resultPromise, "result message");
-    expect(message.stopReason).toBe("toolUse");
-    expect(requireRecord((message.content as unknown[])[0], "tool call")).toMatchObject({
-      type: "toolCall",
-      name: "read",
-      arguments: { path: "src/index.ts" },
-    });
+  const wrapped = patchWrapper(
+    baseStreamFn,
+    ({ payload }) => {
+      payload.unexpected = true;
+    },
+    { shouldPatch: () => false },
+  );
+  void wrapped({ id: "model" } as never, { messages: [] } as never, {});
+
+  expect(baseStreamFn).toHaveBeenCalledOnce();
+  expect(baseStreamFn.mock.calls[0]?.[2]?.onPayload).toBeUndefined();
+});
+
+it("uses per-call thinking before the undefined default", () => {
+  const { baseStreamFn, payloads } = createPayloadCapture("high");
+  const wrapped = thinkingOffWrapper(baseStreamFn);
+  for (const reasoning of ["off", "max", undefined] as const) {
+    void wrapped(lmstudioBinaryModel, { messages: [] }, { reasoning });
+  }
+
+  expect(payloads.map((payload) => payload.reasoning_effort)).toEqual(["none", "high", "high"]);
+});
+
+it.each([
+  ["no disabled effort", lmstudioBareModel, "high"],
+  ["no effort sent", lmstudioBinaryModel, undefined],
+] as const)("omits reasoning_effort with %s", (_name, model, initialEffort) => {
+  const { baseStreamFn, payloads } = createPayloadCapture(initialEffort);
+  const wrapped = thinkingOffWrapper(baseStreamFn, "off");
+  void wrapped(model, { messages: [] }, {});
+  expect(payloads[0]).not.toHaveProperty("reasoning_effort");
+});
+
+it("does not promote complete-looking text tool calls after a length stop", async () => {
+  const rawToolText = '[tool:read] {"path":"/tmp/file.txt"}';
+  const events = await collectEvents([doneEvent(rawToolText, "length")]);
+
+  expectEventTypes(events, "done");
+  expect(events.at(-1)).toMatchObject({
+    reason: "length",
+    message: { content: [textBlock(rawToolText)], stopReason: "length" },
   });
+});
 
-  it("preserves exact text block adjacency inside promoted arguments", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const resultPromise = (await resolveStream(stream)).result();
+it("flushes false-positive buffered prefixes around interleaved events in source order", async () => {
+  const firstText = "[tool:re";
+  const secondText = " not a call";
+  const events = await collectEvents([
+    textDelta(firstText),
+    thinkingDelta([textBlock(firstText), thinkingBlock()], 1),
+    textDelta(secondText),
+    doneEvent([textBlock(`${firstText}${secondText}`), thinkingBlock()]),
+  ]);
 
-    source.push({
-      type: "done",
-      reason: "stop",
-      message: {
-        role: "assistant",
-        content: [
-          { type: "text", text: "[tool:read]\n<parameter=path>\nsrc/ind" },
-          { type: "text", text: "ex.ts\n</parameter>\n</function>" },
-        ],
-        stopReason: "stop",
-      },
-    } as never);
-    source.end();
+  expectEventTypes(events, "text_delta thinking_delta text_delta done");
+  expect(events[0]).toHaveProperty("delta", firstText);
+  expect(events[1]).toHaveProperty("partial.content", [textBlock(firstText), thinkingBlock()]);
+  expect(events[2]).toHaveProperty("delta", secondText);
+});
 
-    const message = requireRecord(await resultPromise, "result message");
-    expect(requireRecord((message.content as unknown[])[0], "tool call")).toMatchObject({
-      type: "toolCall",
-      name: "read",
-      arguments: { path: "src/index.ts" },
-    });
-  });
+it("keeps possible tool-call text buffered across interleaved non-text events", async () => {
+  const rawToolText = "[tool:read]\n<parameter=path>\nsrc/index.ts\n</parameter>\n</function>";
+  const events = await collectEvents([
+    { type: "text_delta", contentIndex: 1, delta: rawToolText },
+    thinkingDelta([thinkingBlock(), textBlock(rawToolText)], 0),
+    doneEvent([thinkingBlock(), textBlock(rawToolText)]),
+  ]);
 
-  it("repairs bracketed tool-call block boundaries when providers split header text", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const resultPromise = (await resolveStream(stream)).result();
+  expectEventTypes(events, "start thinking_delta toolcall_start toolcall_delta toolcall_end done");
+  expect(events[1]).toHaveProperty("partial.content", [
+    thinkingBlock(),
+    expect.objectContaining({ type: "toolCall", name: "read" }),
+  ]);
+  expect(JSON.stringify(events)).not.toContain(rawToolText);
+});
 
-    source.push({
-      type: "done",
-      reason: "stop",
-      message: {
-        role: "assistant",
-        content: [
-          { type: "text", text: "[read]" },
-          { type: "text", text: '{"path":"src/index.ts"}\n[END_TOOL_REQUEST]' },
-        ],
-        stopReason: "stop",
-      },
-    } as never);
-    source.end();
+it("scrubs compacted error partials when an emoji crosses the safe prefix boundary", async () => {
+  const toolPrefix = "[tool:read]\n<parameter=path>\n";
+  const emojiIndex = 255_999;
+  const firstChunk = `${toolPrefix}${"x".repeat(emojiIndex - toolPrefix.length)}😀${"y".repeat(70_000)}`;
+  const secondChunk = "z".repeat(70_000);
+  const rawToolText = firstChunk + secondChunk;
+  const events = await collectEvents([
+    textDelta(firstChunk),
+    textDelta(secondChunk),
+    errorEvent(
+      { content: [textBlock(rawToolText)], errorMessage: "stream failed" },
+      { content: [textBlock(rawToolText)] },
+    ),
+  ]);
 
-    const message = requireRecord(await resultPromise, "result message");
-    expect(requireRecord((message.content as unknown[])[0], "tool call")).toMatchObject({
-      type: "toolCall",
-      name: "read",
-      arguments: { path: "src/index.ts" },
-    });
-  });
+  expectEventTypes(events, "error");
+  expect(events[0]).toHaveProperty("partial.content", [textBlock("")]);
+  expect(events[0]).toHaveProperty("error.content", []);
+  expect(JSON.stringify(events)).not.toContain("[tool:read]");
+});
 
-  it("keeps possible tool-call text buffered across interleaved non-text events", async () => {
-    const rawToolText = [
-      "[tool:read]",
-      "<parameter=path>",
-      "src/index.ts",
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 1, delta: rawToolText },
-        {
-          type: "thinking_delta",
-          contentIndex: 0,
-          delta: "Need file contents.",
-          partial: {
-            content: [
-              { type: "thinking", thinking: "Need file contents." },
-              { type: "text", text: rawToolText },
-            ],
-          },
-        },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "thinking", thinking: "Need file contents." },
-              { type: "text", text: rawToolText },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const stream = await resolveStream(
-      wrapped({} as never, { tools: [{ name: "read" }] } as never, {}),
-    );
-    const events: unknown[] = [];
+it("scrubs mixed under-cap calls from multi-block errors without partials", async () => {
+  const rawCall = "<function=read></function>";
+  const visibleText = "Visible answer before the stream error.";
+  const rawText = `${rawCall}\n${visibleText}`;
+  const events = await collectEvents([
+    textDelta(rawText),
+    errorEvent({
+      role: "assistant",
+      content: [textBlock(rawCall), textBlock(visibleText)],
+      message: "stream failed",
+    }),
+  ]);
 
-    for await (const event of stream as AsyncIterable<unknown>) {
-      events.push(event);
-    }
+  expectEventTypes(events, "text_delta error");
+  expect(events[0]).toHaveProperty("delta", visibleText);
+  expect(events[1]).toHaveProperty("error.content", [textBlock(visibleText)]);
+  expect(JSON.stringify(events)).not.toContain("<function=read>");
+});
 
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "thinking_delta",
-      "toolcall_start",
-      "toolcall_delta",
-      "done",
-    ]);
-    const thinkingEvent = requireRecord(events[0], "thinking event");
-    expect(requireRecord(thinkingEvent.partial, "thinking partial").content).toEqual([
-      { type: "thinking", thinking: "Need file contents." },
-    ]);
-    expect(JSON.stringify(events)).not.toContain(rawToolText);
-  });
+it("promotes split zero-argument XML function calls without leaking partials", async () => {
+  const source = createAssistantMessageEventStream();
+  const wrapped = toolCallWrapper(() => source);
+  const stream = await wrapped(
+    streamTestModel,
+    {
+      messages: [],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object" } }],
+    } as never,
+    {},
+  );
+  const iterator = stream[Symbol.asyncIterator]();
+  const rawToolText = ["<function=read>", "</function>"].join("\n");
 
-  it("preserves interleaved event content indexes when buffered text is scrubbed first", async () => {
-    const rawToolText = [
-      "[tool:read]",
-      "<parameter=path>",
-      "src/index.ts",
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: rawToolText },
-        {
-          type: "thinking_delta",
-          contentIndex: 1,
-          delta: "Need file contents.",
-          partial: {
-            content: [
-              { type: "text", text: rawToolText },
-              { type: "thinking", thinking: "Need file contents." },
-            ],
-          },
-        },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: rawToolText },
-              { type: "thinking", thinking: "Need file contents." },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const stream = await resolveStream(
-      wrapped({} as never, { tools: [{ name: "read" }] } as never, {}),
-    );
-    const events: unknown[] = [];
+  try {
+    source.push(completeStreamEvent({ type: "start", partial: { content: [] } }) as never);
+    expect((await nextEvent(iterator, "start")).type).toBe("start");
 
-    for await (const event of stream as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "thinking_delta",
-      "toolcall_start",
-      "toolcall_delta",
-      "done",
-    ]);
-    const thinkingEvent = requireRecord(events[0], "thinking event");
-    expect(thinkingEvent.contentIndex).toBe(1);
-    expect(requireRecord(thinkingEvent.partial, "thinking partial").content).toEqual([
-      { type: "text", text: "" },
-      { type: "thinking", thinking: "Need file contents." },
-    ]);
-    expect(JSON.stringify(events)).not.toContain(rawToolText);
-  });
-
-  it("flushes false-positive buffered prefixes around interleaved events in source order", async () => {
-    const firstText = "[tool:re";
-    const secondText = " not a call";
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: firstText },
-        {
-          type: "thinking_delta",
-          contentIndex: 1,
-          delta: "Need file contents.",
-          partial: {
-            content: [
-              { type: "text", text: firstText },
-              { type: "thinking", thinking: "Need file contents." },
-            ],
-          },
-        },
-        { type: "text_delta", contentIndex: 0, delta: secondText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: `${firstText}${secondText}` },
-              { type: "thinking", thinking: "Need file contents." },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const stream = await resolveStream(
-      wrapped({} as never, { tools: [{ name: "read" }] } as never, {}),
-    );
-    const events: unknown[] = [];
-
-    for await (const event of stream as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "thinking_delta",
-      "text_delta",
-      "done",
-    ]);
-    expect(requireRecord(events[0], "first text").delta).toBe(firstText);
-    const thinkingEvent = requireRecord(events[1], "thinking event");
-    expect(requireRecord(thinkingEvent.partial, "thinking partial").content).toEqual([
-      { type: "text", text: firstText },
-      { type: "thinking", thinking: "Need file contents." },
-    ]);
-    expect(requireRecord(events[2], "second text").delta).toBe(secondText);
-  });
-
-  it("keeps CR-separated bracketed tool calls buffered for conversion", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const iterator = (await resolveStream(stream))[Symbol.asyncIterator]();
-
-    try {
-      source.push({ type: "start", partial: { content: [] } } as never);
-      expect((await nextEvent(iterator, "start")).type).toBe("start");
-
+    let streamedText = "";
+    for (const delta of ["<", "function=read>\n</func", "tion>"]) {
+      streamedText += delta;
       source.push({
         type: "text_delta",
         contentIndex: 0,
-        delta: '[read]\r{"path":"src/index.ts"}\r[END_TOOL_REQUEST]',
+        delta,
+        partial: { role: "assistant", content: [{ type: "text", text: streamedText }] },
       } as never);
-      source.push({
-        type: "done",
-        reason: "stop",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: '[read]\r{"path":"src/index.ts"}\r[END_TOOL_REQUEST]' }],
-          stopReason: "stop",
-        },
-      } as never);
-
-      const event = await nextEvent(iterator, "converted CR tool call");
-      expect(event.type).toBe("toolcall_start");
-    } finally {
-      source.end();
-      await iterator.return?.();
     }
-  });
+    source.push(doneEvent([textBlock(rawToolText)]) as never);
 
-  it("keeps bracketed XML parameter tool calls buffered for conversion", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const iterator = (await resolveStream(stream))[Symbol.asyncIterator]();
-    const rawToolText = [
-      "[tool:read]",
-      "<parameter=path>",
-      "src/index.ts",
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-
-    try {
-      source.push({ type: "start", partial: { content: [] } } as never);
-      expect((await nextEvent(iterator, "start")).type).toBe("start");
-
-      source.push({
-        type: "text_delta",
-        contentIndex: 0,
-        delta: rawToolText,
-      } as never);
-      source.push({
-        type: "done",
-        reason: "stop",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: rawToolText }],
-          stopReason: "stop",
-        },
-      } as never);
-
-      const event = await nextEvent(iterator, "converted bracketed XML tool call");
-      expect(event.type).toBe("toolcall_start");
-    } finally {
-      source.end();
-      await iterator.return?.();
-    }
-  });
-
-  it("suppresses over-cap bracketed XML parameter text instead of streaming it", async () => {
-    const oversizedPath = "x".repeat(256_001);
-    const rawToolText = [
-      "[tool:read]",
-      "<parameter=path>",
-      oversizedPath,
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "start", partial: { content: [] } },
-        { type: "text_start", contentIndex: 0, content: "" },
-        { type: "text_delta", contentIndex: 0, delta: rawToolText },
-        {
-          type: "thinking_delta",
-          contentIndex: 1,
-          delta: "checking",
-          partial: {
-            content: [
-              { type: "text", text: rawToolText },
-              { type: "thinking", thinking: "checking" },
-            ],
-          },
-        },
-        { type: "text_end", contentIndex: 0, content: rawToolText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawToolText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "start",
-      "thinking_delta",
-      "done",
-    ]);
-    const thinkingEvent = requireRecord(events[1], "thinking event");
-    expect(requireRecord(thinkingEvent.partial, "thinking partial").content).toEqual([
-      { type: "text", text: "" },
-      { type: "thinking", thinking: "checking" },
-    ]);
-    const doneEvent = requireRecord(events[2], "done event");
-    expect(doneEvent.reason).toBe("stop");
-    expect(doneEvent.message).toMatchObject({
-      role: "assistant",
-      content: [],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("scrubs over-cap bracketed XML parameter text from terminal error partials", async () => {
-    const rawToolText = ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: rawToolText },
-        {
-          type: "error",
-          partial: {
-            content: [
-              { type: "text", text: rawToolText },
-              { type: "thinking", thinking: "checking" },
-            ],
-          },
-          error: {
-            content: [{ type: "text", text: rawToolText }],
-            errorMessage: "stream failed",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual(["error"]);
-    const errorEvent = requireRecord(events[0], "error event");
-    expect(requireRecord(errorEvent.partial, "error partial").content).toEqual([
-      { type: "text", text: "" },
-      { type: "thinking", thinking: "checking" },
-    ]);
-    expect(requireRecord(errorEvent.error, "error body").content).toEqual([]);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("scrubs over-cap bracketed XML parameter text from done-message-only streams", async () => {
-    const rawToolText = [
-      "[tool:read]",
-      "<parameter=path>",
-      "x".repeat(256_001),
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawToolText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual(["done"]);
-    const doneEvent = requireRecord(events[0], "done event");
-    expect(doneEvent.reason).toBe("stop");
-    expect(doneEvent.message).toMatchObject({
-      role: "assistant",
-      content: [],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("scrubs over-cap bracketed XML parameter text from length terminal messages", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const output = await resolveStream(stream);
-    const resultPromise = output.result();
-    const eventsPromise = (async () => {
-      const events: unknown[] = [];
-      for await (const event of output as AsyncIterable<unknown>) {
-        events.push(event);
-      }
-      return events;
-    })();
-    const rawToolText = [
-      "[tool:read]",
-      "<parameter=path>",
-      "x".repeat(256_001),
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-
-    source.push({
-      type: "done",
-      reason: "length",
+    const events = [
+      await nextEvent(iterator, "zero-argument tool-call start"),
+      await nextEvent(iterator, "zero-argument tool-call arguments"),
+      await nextEvent(iterator, "zero-argument tool-call end"),
+      await nextEvent(iterator, "zero-argument done event"),
+    ];
+    expectEventTypes(events, "toolcall_start toolcall_delta toolcall_end done");
+    expect(events[1]).toMatchObject({ delta: "{}" });
+    expect(events[3]).toMatchObject({
+      reason: "toolUse",
       message: {
-        role: "assistant",
-        content: [{ type: "text", text: rawToolText }],
-        stopReason: "length",
+        content: [{ type: "toolCall", name: "read", arguments: {} }],
+        stopReason: "toolUse",
       },
-    } as never);
-    source.end();
-
-    const events = await eventsPromise;
-    const result = requireRecord(await resultPromise, "result message");
-
-    expect(requireRecord(events[0], "done event")).toMatchObject({
-      reason: "length",
-      message: { role: "assistant", content: [], stopReason: "length" },
     });
-    expect(result).toMatchObject({ role: "assistant", content: [], stopReason: "length" });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(result)).not.toContain("[tool:read]");
-  });
-
-  it("scrubs split over-cap bracketed XML parameter text from done messages", async () => {
-    const rawToolTextParts = [
-      "[tool:read]\n<parameter=path>",
-      ["x".repeat(256_001), "</parameter>", "</function>"].join("\n"),
-    ];
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: rawToolTextParts.map((text) => ({ type: "text", text })),
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    const doneEvent = requireRecord(events[0], "done event");
-    expect(doneEvent.reason).toBe("stop");
-    expect(doneEvent.message).toMatchObject({
-      role: "assistant",
-      content: [],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("</parameter>");
-  });
-
-  it("scrubs split over-cap bracketed XML tails before later visible text", async () => {
-    const rawToolTextParts = [
-      "[tool:read]\n<parameter=path>",
-      "x".repeat(256_001),
-      ["</parameter>", "</function>"].join("\n"),
-    ];
-    const visibleText = "Visible text after the tool-looking blocks.";
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              ...rawToolTextParts.map((text) => ({ type: "text", text })),
-              { type: "text", text: visibleText },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [{ type: "text", text: visibleText }],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("</parameter>");
-  });
-
-  it("scrubs split over-cap bracketed XML around non-text blocks", async () => {
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: "[tool:read]\n<parameter=path>" },
-              { type: "thinking", thinking: "Checking path." },
-              {
-                type: "text",
-                text: ["x".repeat(256_001), "</parameter>", "</function>"].join("\n"),
-              },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [{ type: "thinking", thinking: "Checking path." }],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("</parameter>");
-  });
-
-  it("scrubs closing tails after a single over-cap bracketed XML block", async () => {
-    const rawToolTextParts = [
-      ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join("\n"),
-      ["</parameter>", "</function>"].join("\n"),
-    ];
-    const visibleText = "Visible text after the tool-looking blocks.";
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              ...rawToolTextParts.map((text) => ({ type: "text", text })),
-              { type: "text", text: visibleText },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [{ type: "text", text: visibleText }],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("</parameter>");
-  });
-
-  it("scrubs closing tails after a single over-cap bracketed XML block without visible text", async () => {
-    const rawToolTextParts = [
-      ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join("\n"),
-      ["</parameter>", "</function>"].join("\n"),
-    ];
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: rawToolTextParts.map((text) => ({ type: "text", text })),
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("</parameter>");
-  });
-
-  it("scrubs over-cap buffers even when later text blocks contain complete tool calls", async () => {
-    const incompleteOverCapTool = ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join(
-      "\n",
-    );
-    const completeTool = '[tool:read] {"path":"src/index.ts"}';
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: incompleteOverCapTool },
-              { type: "text", text: completeTool },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("src/index.ts");
-  });
-
-  it("scrubs multiple incomplete over-cap tool blocks from done messages", async () => {
-    const firstOverCapTool = ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join("\n");
-    const secondOverCapTool = ["[tool:read]", "<parameter=path>", "y".repeat(256_001)].join("\n");
-    const visibleText = "Visible text after the tool-looking blocks.";
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: firstOverCapTool },
-              { type: "text", text: secondOverCapTool },
-              { type: "text", text: visibleText },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [{ type: "text", text: visibleText }],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("x".repeat(256_001));
-    expect(JSON.stringify(events)).not.toContain("y".repeat(256_001));
-  });
-
-  it("scrubs done-message over-cap blocks after visible text", async () => {
-    const intro = "Visible intro.";
-    const incompleteOverCapTool = ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join(
-      "\n",
-    );
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: intro },
-              { type: "text", text: incompleteOverCapTool },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [{ type: "text", text: intro }],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("scrubs split done-message over-cap blocks after visible text", async () => {
-    const intro = "Visible intro.";
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: intro },
-              { type: "text", text: "[tool:read]\n<parameter=path>" },
-              { type: "text", text: "x".repeat(256_001) },
-              { type: "text", text: ["</parameter>", "</function>"].join("\n") },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [{ type: "text", text: intro }],
-      stopReason: "stop",
-    });
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("</parameter>");
-  });
-
-  it("preserves small complete tool calls after over-cap visible text", async () => {
-    const visibleText = `Visible intro ${"x".repeat(256_001)}`;
-    const toolText = '[tool:read] {"path":"src/index.ts"}';
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: visibleText },
-              { type: "text", text: toolText },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual(["done"]);
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [
-        { type: "text", text: visibleText },
-        { type: "text", text: toolText },
-      ],
-      stopReason: "stop",
-    });
-  });
-
-  it("does not leak over-cap buffers when stripped later tool blocks are followed by text", async () => {
-    const incompleteOverCapTool = ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join(
-      "\n",
-    );
-    const completeTool = '[tool:read] {"path":"src/index.ts"}';
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: incompleteOverCapTool },
-              { type: "text", text: completeTool },
-              { type: "text", text: "Visible text after the tool-looking blocks." },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-    expect(JSON.stringify(events)).not.toContain("src/index.ts");
-    expect(requireRecord(events[0], "done event").message).toMatchObject({
-      role: "assistant",
-      content: [{ type: "text", text: "Visible text after the tool-looking blocks." }],
-      stopReason: "stop",
-    });
-  });
-
-  it("preserves unallowed tool-looking text while scrubbing an over-cap allowed tool block", async () => {
-    const allowedOverCapTool = [
-      "[tool:read]",
-      "<parameter=path>",
-      "x".repeat(256_001),
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-    const unallowedToolText = '[tool:write] {"path":"keep-visible"}';
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: allowedOverCapTool },
-              { type: "text", text: unallowedToolText },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(JSON.stringify(events)).toContain("[tool:write]");
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("flushes over-cap text for closed tool names that only prefix-match configured tools", async () => {
-    const rawToolText = [
-      "[tool:read]",
-      "<parameter=path>",
-      "x".repeat(256_001),
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: rawToolText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawToolText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read_file" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toContain("[tool:read]");
-  });
-
-  it("flushes long mixed text after a complete serialized tool-call prefix", async () => {
-    const rawText = ['[tool:read] {"path":"src/index.ts"}', "A".repeat(256_001)].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: rawText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toContain("AAAA");
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("preserves visible suffix text after an over-cap JSON tool payload", async () => {
-    const visibleSuffix = "Visible answer after oversized JSON.";
-    const rawText = [`[tool:read] {"path":"${"x".repeat(256_001)}"}`, visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: rawText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    const textEvent = requireRecord(events[0], "text event");
-    expect(String(textEvent.delta)).toBe(visibleSuffix);
-    expect(requireRecord(textEvent.partial, "text partial").content).toEqual([
-      { type: "text", text: visibleSuffix },
-    ]);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("reclassifies split over-cap mixed text and streams the visible suffix", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join("\n");
-    const visibleSuffix = "Visible answer after the tool-looking prefix.";
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: toolPrefix },
-        {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: ["</parameter>", "</function>", visibleSuffix].join("\n"),
-        },
-        { type: "text_end", contentIndex: 0, content: rawText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("preserves XML visible suffix after Unicode payload text", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", `${"x".repeat(256_001)}İ`].join("\n");
-    const visibleSuffix = "Visible suffix after Unicode payload.";
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: toolPrefix },
-        {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: ["</parameter>", "</function>", visibleSuffix].join("\n"),
-        },
-        { type: "text_end", contentIndex: 0, content: rawText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(JSON.stringify(events)).not.toContain("</parameter>");
+    expect(JSON.stringify(events)).not.toContain("<function");
     expect(JSON.stringify(events)).not.toContain("</function>");
-  });
-
-  it("scrubs reclassified mixed text from terminal error partials", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join("\n");
-    const visibleSuffix = "Visible answer before the stream error.";
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: toolPrefix },
-        {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: ["</parameter>", "</function>", visibleSuffix].join("\n"),
-        },
-        {
-          type: "error",
-          partial: { content: [{ type: "text", text: rawText }] },
-          error: {
-            content: [{ type: "text", text: rawText }],
-            message: "stream failed",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "error",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(
-      requireRecord(requireRecord(events[1], "error event").partial, "error partial").content,
-    ).toEqual([{ type: "text", text: visibleSuffix }]);
-    expect(
-      requireRecord(requireRecord(events[1], "error event").error, "error record").content,
-    ).toEqual([{ type: "text", text: visibleSuffix }]);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("preserves visible suffix text when the tool terminator arrives after the scan cap", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", "x".repeat(400_000)].join("\n");
-    const visibleSuffix = "Visible answer after a very large tool-looking prefix.";
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: toolPrefix },
-        {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: ["</parameter>", "</function>", visibleSuffix].join("\n"),
-        },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("preserves visible suffix text when the over-cap terminator is split across chunks", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", "x".repeat(400_000)].join("\n");
-    const visibleSuffix = "Visible answer after a split terminator.";
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: toolPrefix },
-        { type: "text_delta", contentIndex: 0, delta: "</par" },
-        {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: ["ameter>", "</function>", visibleSuffix].join("\n"),
-        },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("preserves long visible suffix text after an over-cap terminator", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", "x".repeat(400_000)].join("\n");
-    const visibleSuffix = `Visible answer ${"y".repeat(70_000)}`;
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: toolPrefix },
-        {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: ["</parameter>", "</function>", visibleSuffix].join("\n"),
-        },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("does not duplicate visible suffix text when mixed over-cap events omit contentIndex", async () => {
-    const visibleSuffix = "Visible answer from an index-less stream.";
-    const rawText = [`[tool:read] {"path":"${"x".repeat(256_001)}"}`, visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", delta: rawText },
-        { type: "text_end", content: rawText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("keeps partial snapshots current for multi-delta visible suffix text", async () => {
-    const firstVisible = "Visible answer ";
-    const secondVisible = "continues.";
-    const rawPrefix = `[tool:read] {"path":"${"x".repeat(256_001)}"}`;
-    const firstChunk = [rawPrefix, firstVisible].join("\n");
-    const rawText = `${firstChunk}${secondVisible}`;
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: firstChunk },
-        {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: secondVisible,
-          partial: { content: [{ type: "text", text: rawText }] },
-        },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: rawText }],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    const secondEvent = requireRecord(events[1], "second text event");
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "text_delta",
-      "done",
-    ]);
-    expect(secondEvent.delta).toBe(secondVisible);
-    expect(requireRecord(secondEvent.partial, "second partial").content).toEqual([
-      { type: "text", text: `${firstVisible}${secondVisible}` },
-    ]);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("preserves unrelated done-message text blocks when replacing a reclassified suffix", async () => {
-    const introText = "Intro text before the reclassified block.";
-    const visibleSuffix = "Visible suffix from the reclassified block.";
-    const rawToolText = [`[tool:read] {"path":"${"x".repeat(256_001)}"}`, visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", contentIndex: 0, delta: introText },
-        { type: "text_delta", contentIndex: 1, delta: rawToolText },
-        { type: "text_end", contentIndex: 1, content: rawToolText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: introText },
-              { type: "text", text: rawToolText },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    const doneMessage = requireRecord(
-      requireRecord(events.at(-1), "done event").message,
-      "done message",
-    );
-    expect(doneMessage.content).toEqual([
-      { type: "text", text: introText },
-      { type: "text", text: visibleSuffix },
-    ]);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("preserves later done-message text blocks when replacing an indexless reclassified suffix", async () => {
-    const visibleSuffix = "Visible suffix from the reclassified block.";
-    const laterText = "Additional visible answer text.";
-    const rawToolText = [`[tool:read] {"path":"${"x".repeat(256_001)}"}`, visibleSuffix].join("\n");
-    const baseStreamFn: StreamFn = () =>
-      createEventStream([
-        { type: "text_delta", delta: rawToolText },
-        {
-          type: "done",
-          reason: "stop",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "text", text: rawToolText },
-              { type: "text", text: laterText },
-            ],
-            stopReason: "stop",
-          },
-        },
-      ]);
-    const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
-    const events: unknown[] = [];
-
-    for await (const event of wrapped(
-      {} as never,
-      { tools: [{ name: "read" }] } as never,
-      {},
-    ) as AsyncIterable<unknown>) {
-      events.push(event);
-    }
-
-    const doneMessage = requireRecord(
-      requireRecord(events.at(-1), "done event").message,
-      "done message",
-    );
-    expect(doneMessage.content).toEqual([
-      { type: "text", text: visibleSuffix },
-      { type: "text", text: laterText },
-    ]);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("keeps legacy bracketed XML parameter tool calls buffered for conversion", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const iterator = (await resolveStream(stream))[Symbol.asyncIterator]();
-    const rawToolText = [
-      "[read]",
-      "<parameter=path>",
-      "src/index.ts",
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-
-    try {
-      source.push({ type: "start", partial: { content: [] } } as never);
-      expect((await nextEvent(iterator, "start")).type).toBe("start");
-
-      source.push({
-        type: "text_delta",
-        contentIndex: 0,
-        delta: rawToolText,
-      } as never);
-      source.push({
-        type: "done",
-        reason: "stop",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: rawToolText }],
-          stopReason: "stop",
-        },
-      } as never);
-
-      const event = await nextEvent(iterator, "converted legacy bracketed XML tool call");
-      expect(event.type).toBe("toolcall_start");
-    } finally {
-      source.end();
-      await iterator.return?.();
-    }
-  });
-
-  it("keeps CRLF legacy bracketed XML parameter tool calls buffered for conversion", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const iterator = (await resolveStream(stream))[Symbol.asyncIterator]();
-    const rawToolText = [
-      "[read]",
-      "<parameter=path>",
-      "src/index.ts",
-      "</parameter>",
-      "</function>",
-    ].join("\r\n");
-
-    try {
-      source.push({ type: "start", partial: { content: [] } } as never);
-      expect((await nextEvent(iterator, "start")).type).toBe("start");
-
-      source.push({
-        type: "text_delta",
-        contentIndex: 0,
-        delta: rawToolText,
-      } as never);
-      source.push({
-        type: "done",
-        reason: "stop",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: rawToolText }],
-          stopReason: "stop",
-        },
-      } as never);
-
-      const event = await nextEvent(iterator, "converted CRLF legacy XML tool call");
-      expect(event.type).toBe("toolcall_start");
-    } finally {
-      source.end();
-      await iterator.return?.();
-    }
-  });
-
-  it("keeps split XML function tool-call markers buffered for conversion", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const iterator = (await resolveStream(stream))[Symbol.asyncIterator]();
-    const rawToolText = [
-      "<function=read>",
-      "<parameter=path>",
-      "src/index.ts",
-      "</parameter>",
-      "</function>",
-    ].join("\n");
-
-    try {
-      source.push({ type: "start", partial: { content: [] } } as never);
-      expect((await nextEvent(iterator, "start")).type).toBe("start");
-
-      source.push({ type: "text_delta", contentIndex: 0, delta: "<" } as never);
-      source.push({
-        type: "text_delta",
-        contentIndex: 0,
-        delta: rawToolText.slice(1),
-      } as never);
-      source.push({
-        type: "done",
-        reason: "stop",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: rawToolText }],
-          stopReason: "stop",
-        },
-      } as never);
-
-      const event = await nextEvent(iterator, "converted split XML tool call");
-      expect(event.type).toBe("toolcall_start");
-    } finally {
-      source.end();
-      await iterator.return?.();
-    }
-  });
-
-  it("does not buffer normal final prose until done", async () => {
-    const { source, stream } = createControlledPlainTextToolCallCompatStream();
-    const iterator = (await resolveStream(stream))[Symbol.asyncIterator]();
-
-    try {
-      source.push({ type: "start", partial: { content: [] } } as never);
-      expect((await nextEvent(iterator, "start")).type).toBe("start");
-
-      source.push({
-        type: "text_delta",
-        contentIndex: 0,
-        delta: "final answer starts here",
-      } as never);
-
-      const event = await nextEvent(iterator, "normal final prose");
-      expect(event).toMatchObject({ type: "text_delta", delta: "final answer starts here" });
-    } finally {
-      source.push({ type: "done", reason: "stop", message: {} } as never);
-      source.end();
-      await iterator.return?.();
-    }
-  });
+  } finally {
+    source.end();
+    await iterator.return?.();
+  }
 });
 
-describe("stripTrailingAnthropicAssistantPrefillWhenThinking", () => {
-  it("removes trailing assistant text turns when Anthropic thinking is enabled", () => {
-    const payload = {
-      thinking: { type: "enabled", budget_tokens: 1024 },
-      messages: [
-        { role: "user", content: "Return JSON." },
-        { role: "assistant", content: "{" },
-        { role: "assistant", content: '"status"' },
-      ],
-    };
+it.each([
+  { content: [{ type: "tool_use", id: "toolu_1", name: "Read" }] },
+  { content: [{ type: "toolCall", id: "call_1", name: "Read" }] },
+  { tool_calls: [{ id: "call_1", name: "Read" }] },
+])("preserves assistant tool-use turns in %j", (message) => {
+  const payload = {
+    thinking: { type: "adaptive" },
+    messages: [{ role: "assistant", ...message }],
+  };
+  expect(stripPrefill(payload)).toBe(0);
+});
+it("keeps assistant prefill when Anthropic thinking is disabled", () => {
+  const payload = prefillPayload("disabled");
 
-    expect(stripTrailingAnthropicAssistantPrefillWhenThinking(payload)).toBe(2);
-    expect(payload.messages).toEqual([{ role: "user", content: "Return JSON." }]);
-  });
-
-  it("preserves assistant tool-use turns across Anthropic and OpenAI-shaped payloads", () => {
-    const anthropicPayload = {
-      thinking: { type: "adaptive" },
-      messages: [
-        { role: "user", content: "Read a file." },
-        { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read" }] },
-      ],
-    };
-    const openAiPayload = {
-      thinking: { type: "adaptive" },
-      messages: [
-        { role: "user", content: "Read a file." },
-        { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "Read" }] },
-      ],
-    };
-    const toolCallsPayload = {
-      thinking: { type: "adaptive" },
-      messages: [{ role: "assistant", tool_calls: [{ id: "call_1", name: "Read" }] }],
-    };
-
-    expect(stripTrailingAnthropicAssistantPrefillWhenThinking(anthropicPayload)).toBe(0);
-    expect(stripTrailingAnthropicAssistantPrefillWhenThinking(openAiPayload)).toBe(0);
-    expect(stripTrailingAnthropicAssistantPrefillWhenThinking(toolCallsPayload)).toBe(0);
-  });
-
-  it("keeps assistant prefill when Anthropic thinking is disabled", () => {
-    const payload = {
-      thinking: { type: "disabled" },
-      messages: [
-        { role: "user", content: "Return JSON." },
-        { role: "assistant", content: "{" },
-      ],
-    };
-
-    expect(stripTrailingAnthropicAssistantPrefillWhenThinking(payload)).toBe(0);
-    expect(payload.messages).toHaveLength(2);
-  });
+  expect(stripPrefill(payload)).toBe(0);
+  expect(payload.messages).toHaveLength(2);
 });
 
-describe("createAnthropicThinkingPrefillPayloadWrapper", () => {
-  it("reports stripped assistant prefill count", () => {
-    const payload = {
-      thinking: { type: "enabled" },
-      messages: [
-        { role: "user", content: "Return JSON." },
-        { role: "assistant", content: "{" },
-      ],
-    };
-    let strippedCount = 0;
-    const baseStreamFn: StreamFn = (_model, _context, options) => {
-      options?.onPayload?.(payload as never, _model as never);
-      return {} as ReturnType<StreamFn>;
-    };
+it("reports stripped assistant prefill count", () => {
+  const payload = prefillPayload("enabled");
+  let strippedCount = 0;
+  const baseStreamFn = payloadStream(payload);
 
-    const wrapped = createAnthropicThinkingPrefillPayloadWrapper(
-      baseStreamFn,
-      (stripped) => {
-        strippedCount = stripped;
-      },
-      { shouldPatch: ({ model }) => model.api === "anthropic-messages" },
-    );
-    void wrapped({ api: "anthropic-messages" } as never, {} as never, {});
+  const wrapped = prefillWrapper(
+    baseStreamFn,
+    (stripped) => {
+      strippedCount = stripped;
+    },
+    { shouldPatch: ({ model }) => model.api === "anthropic-messages" },
+  );
+  void wrapped({ api: "anthropic-messages" } as never, {} as never, {});
 
-    expect(payload.messages).toEqual([{ role: "user", content: "Return JSON." }]);
-    expect(strippedCount).toBe(1);
-  });
+  expect(payload.messages).toEqual([{ role: "user", content: "Return JSON." }]);
+  expect(strippedCount).toBe(1);
 });

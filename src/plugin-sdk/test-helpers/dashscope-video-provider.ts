@@ -2,40 +2,19 @@
 import { expect, vi } from "vitest";
 import type { VideoGenerationResult } from "../video-generation.js";
 
-type ClearableMock = {
-  mockClear(): unknown;
+type ImplementableMock = {
+  mockImplementation(implementation: () => Promise<unknown>): unknown;
 };
 
-type ResettableMock = {
-  mockReset(): unknown;
-};
-
-type ResolvableMock = {
-  mockResolvedValue(value: unknown): unknown;
-};
-
-type ChainableResolvedValueMock = ResettableMock & {
+type ChainableResolvedValueMock = {
   mockResolvedValueOnce(value: unknown): ChainableResolvedValueMock;
 };
 
-export type DashscopeVideoProviderMocks = {
-  resolveApiKeyForProviderMock: ClearableMock;
-  postJsonRequestMock: ResettableMock & ResolvableMock;
-  fetchWithTimeoutMock: ChainableResolvedValueMock;
-  assertOkOrThrowHttpErrorMock: ClearableMock;
-  resolveProviderHttpRequestConfigMock: ClearableMock;
-};
-
-export function resetDashscopeVideoProviderMocks(mocks: DashscopeVideoProviderMocks): void {
-  mocks.resolveApiKeyForProviderMock.mockClear();
-  mocks.postJsonRequestMock.mockReset();
-  mocks.fetchWithTimeoutMock.mockReset();
-  mocks.assertOkOrThrowHttpErrorMock.mockClear();
-  mocks.resolveProviderHttpRequestConfigMock.mockClear();
-}
-
 export function mockSuccessfulDashscopeVideoTask(
-  mocks: Pick<DashscopeVideoProviderMocks, "postJsonRequestMock" | "fetchWithTimeoutMock">,
+  mocks: {
+    postJsonRequestMock: ImplementableMock;
+    fetchWithTimeoutMock: ChainableResolvedValueMock;
+  },
   params: {
     requestId?: string;
     taskId?: string;
@@ -49,31 +28,29 @@ export function mockSuccessfulDashscopeVideoTask(
     taskStatus = "SUCCEEDED",
     videoUrl = "https://example.com/out.mp4",
   } = params;
-  mocks.postJsonRequestMock.mockResolvedValue({
-    response: {
-      json: async () => ({
-        request_id: requestId,
-        output: {
-          task_id: taskId,
-        },
-      }),
-    },
+  mocks.postJsonRequestMock.mockImplementation(async () => ({
+    response: Response.json({
+      request_id: requestId,
+      output: {
+        task_id: taskId,
+      },
+    }),
     release: vi.fn(async () => {}),
-  });
+  }));
   mocks.fetchWithTimeoutMock
-    .mockResolvedValueOnce({
-      json: async () => ({
+    .mockResolvedValueOnce(
+      Response.json({
         output: {
           task_status: taskStatus,
           results: [{ video_url: videoUrl }],
         },
       }),
-      headers: new Headers(),
-    })
-    .mockResolvedValueOnce({
-      arrayBuffer: async () => Buffer.from("mp4-bytes"),
-      headers: new Headers({ "content-type": "video/mp4" }),
-    });
+    )
+    .mockResolvedValueOnce(
+      new Response(Buffer.from("mp4-bytes"), {
+        headers: { "content-type": "video/mp4" },
+      }),
+    );
 }
 
 export function expectDashscopeVideoTaskPoll(
@@ -81,19 +58,14 @@ export function expectDashscopeVideoTaskPoll(
   params: {
     baseUrl?: string;
     taskId?: string;
-    timeoutMs?: number;
   } = {},
 ): void {
-  const {
-    baseUrl = "https://dashscope-intl.aliyuncs.com",
-    taskId = "task-1",
-    timeoutMs = 120_000,
-  } = params;
+  const { baseUrl = "https://dashscope-intl.aliyuncs.com", taskId = "task-1" } = params;
   expect(fetchWithTimeoutMock).toHaveBeenNthCalledWith(
     1,
     `${baseUrl}/api/v1/tasks/${taskId}`,
     expect.objectContaining({ method: "GET" }),
-    timeoutMs,
+    expect.any(Number),
     fetch,
   );
 }

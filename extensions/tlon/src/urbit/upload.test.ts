@@ -1,156 +1,109 @@
-// Tlon tests cover upload plugin behavior.
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { MAX_IMAGE_BYTES, readRemoteMediaBuffer } from "openclaw/plugin-sdk/media-runtime";
+import { expect, it, vi, beforeEach } from "vitest";
 import { uploadFile } from "../tlon-api.js";
 import { uploadImageFromUrl } from "./upload.js";
 
-vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
-  fetchWithSsrFGuard: vi.fn(),
+vi.mock("openclaw/plugin-sdk/media-runtime", () => ({
+  MAX_IMAGE_BYTES: 6 * 1024 * 1024,
+  readRemoteMediaBuffer: vi.fn(),
 }));
 
 vi.mock("../tlon-api.js", () => ({
   uploadFile: vi.fn(),
 }));
 
-const mockFetch = vi.mocked(fetchWithSsrFGuard);
+const mockReadRemoteMediaBuffer = vi.mocked(readRemoteMediaBuffer);
 const mockUploadFile = vi.mocked(uploadFile);
+const clientConfig = {
+  shipUrl: "https://zod.tlon.network",
+  shipName: "zod",
+  getCode: async () => "fixture-code",
+};
 
-type FetchMock = typeof mockFetch;
-
-function mockSuccessfulFetch(params: {
-  mockFetch: FetchMock;
-  blob: Blob;
-  finalUrl: string;
-  contentType: string;
-}) {
-  params.mockFetch.mockResolvedValue({
-    response: {
-      ok: true,
-      headers: new Headers({ "content-type": params.contentType }),
-      blob: () => Promise.resolve(params.blob),
-    } as unknown as Response,
-    finalUrl: params.finalUrl,
-    release: vi.fn().mockResolvedValue(undefined),
-  });
+const uploadedUrl = "https://memex.tlon.network/uploaded.png";
+const imageUrl = "https://example.com/image.png";
+const buffer = Buffer.from("fake-image");
+const upload = (url = imageUrl, cap?: number) => uploadImageFromUrl(url, clientConfig, cap);
+function setupSuccessfulUpload(contentType = "image/png", fileName?: string) {
+  mockReadRemoteMediaBuffer.mockResolvedValue({ buffer, contentType, fileName });
+  mockUploadFile.mockResolvedValue({ url: uploadedUrl });
 }
 
-async function setupSuccessfulUpload(params?: {
-  sourceUrl?: string;
-  contentType?: string;
-  uploadedUrl?: string;
-}) {
-  const sourceUrl = params?.sourceUrl ?? "https://example.com/image.png";
-  const contentType = params?.contentType ?? "image/png";
-  const mockBlob = new Blob(["fake-image"], { type: contentType });
-  mockSuccessfulFetch({
-    mockFetch,
-    blob: mockBlob,
-    finalUrl: sourceUrl,
-    contentType,
-  });
-  if (params?.uploadedUrl) {
-    mockUploadFile.mockResolvedValue({ url: params.uploadedUrl });
-  }
-  return { mockBlob };
-}
-
-function requireUploadParams(): { blob?: Blob; contentType?: string; fileName?: string } {
-  const [call] = mockUploadFile.mock.calls;
+function requireUploadParams() {
+  const call = mockUploadFile.mock.calls[0];
   if (!call) {
     throw new Error("expected Tlon uploadFile call");
   }
-  const [uploadParams] = call;
-  if (!uploadParams || typeof uploadParams !== "object" || Array.isArray(uploadParams)) {
-    throw new Error("expected Tlon uploadFile params");
-  }
-  return uploadParams as { blob?: Blob; contentType?: string; fileName?: string };
+  return call[0];
 }
 
-describe("uploadImageFromUrl", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+beforeEach(() => vi.clearAllMocks());
+
+it.each([1024, MAX_IMAGE_BYTES * 2])("caps downloads at %s bytes", async (cap) => {
+  setupSuccessfulUpload("image/jpeg");
+  const url = "https://example.com/path/to/my-image.jpg";
+
+  await expect(upload(url, cap)).resolves.toBe(uploadedUrl);
+  expect(mockReadRemoteMediaBuffer).toHaveBeenCalledWith({
+    url,
+    maxBytes: Math.min(cap ?? MAX_IMAGE_BYTES, MAX_IMAGE_BYTES),
+    responseHeaderTimeoutMs: 120_000,
+    readIdleTimeoutMs: 30_000,
+    ssrfPolicy: undefined,
+    beforeRequest: undefined,
+    requestInit: { method: "GET" },
+  });
+  expect(mockUploadFile).toHaveBeenCalledTimes(1);
+  const uploadParams = requireUploadParams();
+  expect(uploadParams).toMatchObject({ contentType: "image/jpeg", fileName: "my-image.jpg" });
+  const blob = uploadParams.blob;
+  expect(blob).toBeInstanceOf(Blob);
+  expect(Buffer.from(await blob.arrayBuffer())).toEqual(buffer);
+});
+
+it("prefers the downloaded filename over a query-style URL basename", async () => {
+  setupSuccessfulUpload("image/png", "photo#1.png");
+  await upload("https://example.com/download?id=123");
+  expect(requireUploadParams().fileName).toBe("photo#1.png");
+});
+
+it("preserves a wrapped authority rejection instead of falling back to the original URL", async () => {
+  const revoked = new Error("delivery revoked");
+  const assertDirectAdapterHandoff = vi.fn().mockImplementationOnce(() => {
+    throw revoked;
+  });
+  mockReadRemoteMediaBuffer.mockImplementationOnce(async ({ beforeRequest }) => {
+    try {
+      beforeRequest?.();
+    } catch (cause) {
+      throw new Error("media fetch failed", { cause });
+    }
+    throw new Error("expected authority rejection");
   });
 
-  it("fetches image and calls uploadFile, returns uploaded URL", async () => {
-    const { mockBlob } = await setupSuccessfulUpload({
-      uploadedUrl: "https://memex.tlon.network/uploaded.png",
-    });
+  const config = { ...clientConfig, assertDirectAdapterHandoff };
+  await expect(uploadImageFromUrl(imageUrl, config)).rejects.toBe(revoked);
+  expect(mockUploadFile).not.toHaveBeenCalled();
+  expect(assertDirectAdapterHandoff).toHaveBeenCalledTimes(1);
+});
 
-    const result = await uploadImageFromUrl("https://example.com/image.png");
+it("does not embed an unchecked URL when a configured cap rejects its bytes", async () => {
+  const error = new Error("payload exceeds maxBytes 1024");
+  mockReadRemoteMediaBuffer.mockRejectedValue(error);
+  await expect(upload(imageUrl, 1024)).rejects.toBe(error);
+  expect(mockUploadFile).not.toHaveBeenCalled();
+});
 
-    expect(result).toBe("https://memex.tlon.network/uploaded.png");
-    expect(mockUploadFile).toHaveBeenCalledTimes(1);
-    const uploadParams = requireUploadParams();
-    expect(uploadParams.blob).toBe(mockBlob);
-    expect(uploadParams.contentType).toBe("image/png");
-  });
+it("rejects non-http(s) URLs", async () => {
+  await expect(upload("file:///etc/passwd")).resolves.toBe("file:///etc/passwd");
+  await expect(upload("ftp://example.com/image.png")).resolves.toBe("ftp://example.com/image.png");
+  expect(mockReadRemoteMediaBuffer).not.toHaveBeenCalled();
+});
 
-  it("returns original URL if fetch fails", async () => {
-    mockFetch.mockResolvedValue({
-      response: {
-        ok: false,
-        status: 404,
-      } as unknown as Response,
-      finalUrl: "https://example.com/image.png",
-      release: vi.fn().mockResolvedValue(undefined),
-    });
+it("uses default filename when URL has no path", async () => {
+  setupSuccessfulUpload();
 
-    const result = await uploadImageFromUrl("https://example.com/image.png");
+  await upload("https://example.com/");
 
-    expect(result).toBe("https://example.com/image.png");
-  });
-
-  it("returns original URL if upload fails", async () => {
-    await setupSuccessfulUpload();
-    mockUploadFile.mockRejectedValue(new Error("Upload failed"));
-
-    const result = await uploadImageFromUrl("https://example.com/image.png");
-
-    expect(result).toBe("https://example.com/image.png");
-  });
-
-  it("rejects non-http(s) URLs", async () => {
-    const result = await uploadImageFromUrl("file:///etc/passwd");
-    expect(result).toBe("file:///etc/passwd");
-
-    const result2 = await uploadImageFromUrl("ftp://example.com/image.png");
-    expect(result2).toBe("ftp://example.com/image.png");
-  });
-
-  it("handles invalid URLs gracefully", async () => {
-    const result = await uploadImageFromUrl("not-a-valid-url");
-    expect(result).toBe("not-a-valid-url");
-  });
-
-  it("extracts filename from URL path", async () => {
-    const mockBlob = new Blob(["fake-image"], { type: "image/jpeg" });
-    mockSuccessfulFetch({
-      mockFetch,
-      blob: mockBlob,
-      finalUrl: "https://example.com/path/to/my-image.jpg",
-      contentType: "image/jpeg",
-    });
-
-    mockUploadFile.mockResolvedValue({ url: "https://memex.tlon.network/uploaded.jpg" });
-
-    await uploadImageFromUrl("https://example.com/path/to/my-image.jpg");
-
-    expect(requireUploadParams().fileName).toBe("my-image.jpg");
-  });
-
-  it("uses default filename when URL has no path", async () => {
-    const mockBlob = new Blob(["fake-image"], { type: "image/png" });
-    mockSuccessfulFetch({
-      mockFetch,
-      blob: mockBlob,
-      finalUrl: "https://example.com/",
-      contentType: "image/png",
-    });
-
-    mockUploadFile.mockResolvedValue({ url: "https://memex.tlon.network/uploaded.png" });
-
-    await uploadImageFromUrl("https://example.com/");
-
-    expect(requireUploadParams().fileName).toMatch(/^upload-\d+\.png$/);
-  });
+  expect(requireUploadParams().fileName).toMatch(/^upload-\d+\.png$/);
 });

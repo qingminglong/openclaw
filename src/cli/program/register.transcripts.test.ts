@@ -1,137 +1,216 @@
-// Register transcripts tests cover transcript command registration and file handling.
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { createDoctorConfigSnapshot } from "../../commands/doctor-config-snapshot.test-helpers.js";
+import { noteStaleUpdateRuns } from "../../commands/doctor-update-run.js";
+import * as startupConfigPreflight from "../../commands/startup-config-preflight.js";
+import { clearRuntimeConfigSnapshot } from "../../config/config.js";
+import { isVerbose, setVerbose } from "../../globals.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
+import {
+  createUpdateRun,
+  finishUpdateRun,
+  recordUpdateRunStep,
+} from "../../infra/update-run-ledger.js";
+import type { DB as OpenClawStateKyselyDatabase } from "../../state/openclaw-state-db.generated.js";
+import {
+  closeOpenClawStateDatabaseAsync,
+  closeOpenClawStateDatabaseForTest,
+  openOpenClawStateDatabase,
+} from "../../state/openclaw-state-db.js";
+import { observeMainThreadSql } from "../../test-utils/main-thread-sql-spies.test-support.js";
+import type { TranscriptSessionDescriptor } from "../../transcripts/provider-types.js";
+import { TranscriptsStore } from "../../transcripts/store.js";
+import { summarizeTranscripts } from "../../transcripts/summary.js";
+import { withConsoleLogsRoutedToStderrForJson } from "../json-output-mode.js";
+import { testApi as configGuardTestApi } from "./config-guard.js";
+import { registerPreActionHooks } from "./preaction.js";
+import { captureStdout } from "./program.test-helpers.js";
 import { registerTranscriptsCli } from "./register.transcripts.js";
 
-const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+const originalArgv = process.argv;
+const originalTitle = process.title;
+const originalVerbose = isVerbose();
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+let store: TranscriptsStore;
 
-async function makeStateDir(): Promise<string> {
-  return await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-transcripts-cli-"));
-}
-
-async function writeSession(
-  stateDir: string,
+function sessionFixture(
   sessionId: string,
-  date = "2026-05-22",
-): Promise<string> {
-  const sessionDir = path.join(stateDir, "transcripts", date, sessionId);
-  await fs.mkdir(sessionDir, { recursive: true });
-  await fs.writeFile(
-    path.join(sessionDir, "metadata.json"),
-    `${JSON.stringify(
-      {
-        sessionId,
-        title: "Design review",
-        source: { providerId: "manual-transcript" },
-        startedAt: `${date}T10:00:00.000Z`,
-        stoppedAt: `${date}T10:05:00.000Z`,
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  await fs.writeFile(
-    path.join(sessionDir, "summary.md"),
-    "# Design review\n\n## Action Items\n- Sam: Ship CLI\n",
-  );
-  return sessionDir;
+  fields: Partial<TranscriptSessionDescriptor> = {},
+): TranscriptSessionDescriptor {
+  return {
+    sessionId,
+    source: { providerId: "manual-transcript" },
+    startedAt: "2026-05-22T10:00:00.000Z",
+    ...fields,
+  };
 }
 
-async function runTranscriptsCli(args: string[]): Promise<string> {
-  let output = "";
-  const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(((
-    chunk: string | Uint8Array,
-  ) => {
-    output += String(chunk);
-    return true;
-  }) as typeof process.stdout.write);
-  try {
-    const program = new Command();
-    program.name("openclaw");
+async function writeSession(sessionId: string): Promise<string> {
+  const session = sessionFixture(sessionId);
+  const utterance = { text: "Action item: Ship CLI", speaker: { label: "Sam" } };
+  await store.writeSession(session);
+  await store.appendUtteranceForSession(session, utterance);
+  await store.writeSummary(summarizeTranscripts({ session, utterances: [utterance] }), session);
+  return store.sessionDir(session);
+}
+
+async function runCli(args: string[], startup = false): Promise<string> {
+  return captureStdout(async () => {
+    const program = new Command().name("openclaw");
     registerTranscriptsCli(program);
+    if (startup) {
+      registerPreActionHooks(program, "test");
+    }
     await program.parseAsync(["transcripts", ...args], { from: "user" });
-    return output;
-  } finally {
-    writeSpy.mockRestore();
-  }
+  });
+}
+
+async function runJson(...args: string[]) {
+  return JSON.parse(await runCli([...args, "--json"]));
 }
 
 describe("transcripts CLI", () => {
-  let stateDir = "";
-
-  beforeEach(async () => {
-    stateDir = await makeStateDir();
-    process.env.OPENCLAW_STATE_DIR = stateDir;
+  beforeEach(() => {
+    const stateDir = tempDirs.make("openclaw-transcripts-cli-");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    store = new TranscriptsStore(path.join(stateDir, "transcripts"));
   });
 
-  afterEach(() => {
-    if (originalStateDir === undefined) {
-      delete process.env.OPENCLAW_STATE_DIR;
-    } else {
-      process.env.OPENCLAW_STATE_DIR = originalStateDir;
+  afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
+    closeOpenClawStateDatabaseForTest();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    configGuardTestApi.resetConfigGuardStateForTests();
+    clearRuntimeConfigSnapshot();
+    process.argv = originalArgv;
+    process.title = originalTitle;
+    setVerbose(originalVerbose);
+  });
+
+  it("keeps transcript output clean after a successful update with warnings", async () => {
+    await writeSession("design-review");
+    const outputs = [];
+    for (const flags of [[], ["--json"]]) {
+      const args = ["list", ...flags];
+      outputs.push({ args, expected: await runCli(args) });
+    }
+    const run = createUpdateRun({ trigger: "cli" });
+    const warning = "Recorded update warning";
+    const warningStep = {
+      step: "warning:openclaw doctor",
+      status: "completed",
+      detail: warning,
+    } as const;
+    recordUpdateRunStep(run.runId, warningStep);
+    finishUpdateRun(run.runId, { status: "succeeded" });
+    const snapshot = createDoctorConfigSnapshot();
+    // Keep real note emission and guard suppression; state migration is outside this output test.
+    vi.spyOn(startupConfigPreflight, "runStartupConfigPreflight").mockImplementation(async () => {
+      await noteStaleUpdateRuns();
+      return { snapshot, baseConfig: snapshot.sourceConfig };
+    });
+    vi.stubEnv("OPENCLAW_SUPPRESS_NOTES", undefined);
+    vi.stubEnv("NODE_NO_WARNINGS", process.env.NODE_NO_WARNINGS);
+    expect(await captureStdout(() => noteStaleUpdateRuns())).toContain(warning);
+    for (const { args, expected } of outputs) {
+      configGuardTestApi.resetConfigGuardStateForTests();
+      process.argv = ["node", "openclaw", "transcripts", ...args];
+      const output = await withConsoleLogsRoutedToStderrForJson(
+        process.argv,
+        () => runCli(args, true),
+        { restoreChanges: true },
+      );
+      expect(output).toBe(expected);
+    }
+    expect(await captureStdout(() => noteStaleUpdateRuns())).toContain(warning);
+  });
+
+  it("keeps JSON inspection available before a summary exists", async () => {
+    await store.writeSession(sessionFixture("active-session"));
+    expect(await runJson("show", "active-session")).toMatchObject({
+      session: { sessionId: "active-session" },
+      summary: null,
+    });
+    expect(await runJson("path", "active-session")).toMatchObject({ exists: false });
+    for (const command of ["show", "path"]) {
+      await expect(runCli([command, "active-session"])).rejects.toThrow("summary.md not found");
     }
   });
 
-  it("registers a kebab-case command", () => {
-    const program = new Command();
-    registerTranscriptsCli(program);
-
-    expect(program.commands.map((command) => command.name())).toContain("transcripts");
-  });
-
-  it("lists stored transcript sessions", async () => {
-    const sessionDir = await writeSession(stateDir, "design-review");
-
-    const output = await runTranscriptsCli(["list"]);
-
-    expect(output).toContain("2026-05-22/design-review");
-    expect(output).toContain("Design review");
-    expect(output).toContain(path.join(sessionDir, "summary.md"));
-  });
-
-  it("prints summary markdown for a session", async () => {
-    await writeSession(stateDir, "design-review");
-
-    const output = await runTranscriptsCli(["show", "design-review"]);
-
-    expect(output).toContain("# Design review");
-    expect(output).toContain("Ship CLI");
-  });
-
-  it("ignores unrelated corrupt metadata while reading a valid session", async () => {
-    await writeSession(stateDir, "design-review");
-    const corruptDir = path.join(stateDir, "transcripts", "corrupt");
-    await fs.mkdir(corruptDir, { recursive: true });
-    await fs.writeFile(path.join(corruptDir, "metadata.json"), "{nope");
-
-    const listOutput = await runTranscriptsCli(["list"]);
-    const showOutput = await runTranscriptsCli(["show", "design-review"]);
-
-    expect(listOutput).toContain("design-review");
-    expect(listOutput).not.toContain("corrupt");
-    expect(showOutput).toContain("# Design review");
-  });
-
-  it("requires date-qualified selectors for repeated human session ids", async () => {
-    const olderSessionDir = await writeSession(stateDir, "standup", "2026-05-21");
-    await writeSession(stateDir, "standup", "2026-05-22");
-
-    await expect(runTranscriptsCli(["path", "standup"])).rejects.toThrow(
-      "multiple transcripts sessions match standup",
+  it("sanitizes stored summary control bytes at the show boundary", async () => {
+    await writeSession("legacy-summary");
+    const database = openOpenClawStateDatabase();
+    const db = getNodeSqliteKysely<OpenClawStateKyselyDatabase>(database.db);
+    executeSqliteQuerySync(
+      database.db,
+      db
+        .updateTable("meeting_transcript_summaries")
+        .set({ markdown: "# Old\n\n- x\ty\n- \u001b[2J\u001b[31mAPPROVED\u001b[0m" })
+        .where("session_id", "=", "legacy-summary"),
     );
-    const output = await runTranscriptsCli(["path", "2026-05-21/standup"]);
 
-    expect(output.trim()).toBe(path.join(olderSessionDir, "summary.md"));
+    const output = await runCli(["show", "legacy-summary"]);
+
+    expect(output).toContain("# Old\n\n- x\\ty\n- APPROVED");
+    expect(output).not.toContain("\u001b");
   });
 
-  it("prints the summary path by default", async () => {
-    const sessionDir = await writeSession(stateDir, "design-review");
+  it("sanitizes list selectors and text while escaping C1 bytes in JSON", async () => {
+    const title = "\u001b[31mCSI \u009b31m injected \u007f\u0085 title\u001b[0m";
+    const sessionId = "ansi-\u001b[31mprovider\u001b[0m";
+    await store.writeSession(sessionFixture(sessionId, { title }));
 
-    const output = await runTranscriptsCli(["path", "design-review"]);
+    const text = await runCli(["list"]);
+    expect(text.split("\t")[0]).toBe("2026-05-22/ansi--31mprovider-0m");
+    expect(text).not.toContain("\u001b");
+    const output = await runCli(["list", "--json"]);
 
-    expect(output.trim()).toBe(path.join(sessionDir, "summary.md"));
+    expect(/[\u007f-\u009f]/.test(output)).toBe(false);
+    expect(output).toContain("\\u009b");
+    const parsed = JSON.parse(output) as Array<{ sessionId: string; title: string }>;
+    expect(parsed).toEqual([expect.objectContaining({ sessionId, title })]);
+  });
+
+  it("materializes metadata, transcript, and directory exports from SQLite", async () => {
+    const sessionDir = await writeSession("design-review");
+    await fs.rm(sessionDir, { recursive: true, force: true });
+
+    const ownershipReads: string[] = [];
+    const database = openOpenClawStateDatabase().db;
+    observeMainThreadSql({
+      onStatement: (sql) => {
+        if (
+          !database.isTransaction &&
+          /^select\b/iu.test(sql) &&
+          sql.includes("export_pending_json")
+        ) {
+          ownershipReads.push(sql);
+        }
+      },
+    });
+
+    for (const [flag, file, content] of [
+      ["--metadata", "metadata.json", '"sessionId": "design-review"'],
+      ["--transcript", "transcript.jsonl", '"text":"Action item: Ship CLI"'],
+      ["--dir", "", undefined],
+    ] as const) {
+      const filePath = path.join(sessionDir, file);
+      expect((await runCli(["path", "design-review", flag])).trim()).toBe(filePath);
+      if (content) {
+        await expect(fs.readFile(filePath, "utf8")).resolves.toContain(content);
+      }
+    }
+    const summary = await runCli(["show", "design-review"]);
+    expect(summary).toContain("Ship CLI");
+    expect((await runJson("show", "design-review")).summary).toBe(summary);
+    expect(await runJson("path", "design-review")).toMatchObject({
+      path: path.join(sessionDir, "summary.md"),
+      exists: true,
+    });
+    expect(ownershipReads, "standalone export ownership SQL on the caller thread").toEqual([]);
   });
 });

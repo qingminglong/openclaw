@@ -1,185 +1,157 @@
-// Doctor update tests cover pre-doctor update prompts, state files, and declined update flows.
 import fs from "node:fs/promises";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import path from "node:path";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { createCliTtyMock } from "../cli/test-runtime-capture.js";
+import { withUpdateInProgressEnv } from "../cli/update-cli/update-command-service-env.js";
+import type { UpdateRunResult } from "../infra/update-runner-types.js";
+import { createCommandResult } from "../test-utils/npm-spec-install-test-helpers.js";
 import { maybeOfferUpdateBeforeDoctor } from "./doctor-update.js";
 
-const originalStdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
-const originalStdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-
 const mocks = vi.hoisted(() => ({
-  createUpdateProgress: vi.fn(),
+  updateCommand: vi.fn<typeof import("../cli/update-cli/update-command.js").updateCommand>(),
+  git: vi.fn<typeof import("../process/exec.js").runCommandWithTimeout>(),
+  confirm: vi.fn<(params: { message: string; initialValue: boolean }) => Promise<boolean>>(),
+  outro: vi.fn<(message: string) => void>(),
   note: vi.fn(),
-  runCommandWithTimeout: vi.fn(),
-  runGatewayUpdate: vi.fn(),
 }));
-
-vi.mock("../cli/update-cli/progress.js", () => ({
-  createUpdateProgress: mocks.createUpdateProgress,
+vi.mock("../cli/update-cli/update-command.js", () => ({ updateCommand: mocks.updateCommand }));
+vi.mock("../process/exec.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../process/exec.js")>()),
+  runCommandWithTimeout: mocks.git,
 }));
+vi.mock("../../packages/terminal-core/src/note.js", () => ({ note: mocks.note }));
 
-vi.mock("../process/exec.js", () => ({
-  runCommandWithTimeout: mocks.runCommandWithTimeout,
-}));
-
-vi.mock("../infra/update-runner.js", () => ({
-  runGatewayUpdate: mocks.runGatewayUpdate,
-}));
-
-vi.mock("../../packages/terminal-core/src/note.js", () => ({
-  note: mocks.note,
-}));
-
-async function runOffer(params?: {
-  root?: string;
-  confirm?: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
-}): Promise<Awaited<ReturnType<typeof maybeOfferUpdateBeforeDoctor>>> {
-  const confirm = params?.confirm ?? vi.fn().mockResolvedValue(false);
-  return await maybeOfferUpdateBeforeDoctor({
-    runtime: {} as never,
+const tty = createCliTtyMock([process.stdin]);
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const result = (status: UpdateRunResult["status"]): UpdateRunResult => ({
+  status,
+  mode: "git",
+  root: "/repo/source",
+  steps: [],
+  durationMs: 0,
+});
+function offer(overrides: Partial<Parameters<typeof maybeOfferUpdateBeforeDoctor>[0]> = {}) {
+  return maybeOfferUpdateBeforeDoctor({
     options: {},
-    root: params?.root ?? "/repo/link",
-    confirm,
-    outro: vi.fn(),
+    root: "/repo/source",
+    confirm: mocks.confirm,
+    outro: mocks.outro,
+    ...overrides,
   });
 }
 
-beforeEach(async () => {
-  mocks.createUpdateProgress.mockReset();
-  mocks.createUpdateProgress.mockReturnValue({ progress: {}, stop: vi.fn() });
-  mocks.note.mockReset();
-  mocks.runCommandWithTimeout.mockReset();
-  mocks.runGatewayUpdate.mockReset();
-  Object.defineProperty(process.stdin, "isTTY", {
-    configurable: true,
-    value: true,
-  });
-  Object.defineProperty(process.stdout, "isTTY", {
-    configurable: true,
-    value: true,
+function gitResult(code = 0, stdout = "/repo/source\n", stderr = "") {
+  return createCommandResult({ code, stdout, stderr });
+}
+
+async function expectSkipped(overrides: Parameters<typeof offer>[0] = {}) {
+  await expect(offer(overrides)).resolves.toBe(false);
+  expect(mocks.confirm).not.toHaveBeenCalled();
+  expect(mocks.updateCommand).not.toHaveBeenCalled();
+}
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", undefined);
+  vi.stubEnv("OPENCLAW_SUPERVISOR_MODE", undefined);
+  vi.stubEnv("OPENCLAW_SERVICE_REPAIR_POLICY", undefined);
+  tty.set(true);
+  vi.spyOn(fs, "realpath").mockImplementation(async (candidate) => String(candidate));
+  mocks.git.mockResolvedValue(gitResult());
+  mocks.confirm.mockResolvedValue(true);
+  mocks.updateCommand.mockImplementation(async ({ onResult }) => {
+    onResult?.(result("ok"));
   });
 });
-
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
-  if (originalStdinIsTtyDescriptor) {
-    Object.defineProperty(process.stdin, "isTTY", originalStdinIsTtyDescriptor);
-  } else {
-    delete (process.stdin as Partial<typeof process.stdin>).isTTY;
-  }
-  if (originalStdoutIsTtyDescriptor) {
-    Object.defineProperty(process.stdout, "isTTY", originalStdoutIsTtyDescriptor);
-  } else {
-    delete (process.stdout as Partial<typeof process.stdout>).isTTY;
-  }
+  tty.restore();
 });
 
-describe("maybeOfferUpdateBeforeDoctor", () => {
-  it("treats a linked package root as a git checkout when realpaths match", async () => {
-    const confirm = vi.fn().mockResolvedValue(false);
-    vi.spyOn(fs, "realpath").mockImplementation(async (candidate) => {
-      const value = String(candidate);
-      if (value === "/repo/link" || value === "/repo/real") {
-        return "/repo/real";
-      }
-      return value;
+it("reports a host-owned install before Git discovery", async () => {
+  const root = tempDirs.make("openclaw-doctor-host-");
+  await fs.writeFile(
+    path.join(root, "openclaw-install-owner.json"),
+    '{"schemaVersion":1,"owner":"macos-app","displayName":"OpenClaw.app","updateHint":"Update OpenClaw.app to update this Gateway."}',
+  );
+  await expectSkipped({ root, options: { nonInteractive: true } });
+  expect(mocks.git).not.toHaveBeenCalled();
+  expect(mocks.note).toHaveBeenCalledExactlyOnceWith(
+    "Managed by OpenClaw.app. Update OpenClaw.app to update this Gateway.",
+    "Update",
+  );
+});
+
+it.each(["external", "nonInteractive", "non-TTY", "declined"] as const)(
+  "leaves updating to the owner when %s",
+  async (gate) => {
+    vi.stubEnv("OPENCLAW_SERVICE_REPAIR_POLICY", gate === "external" ? "external" : undefined);
+    tty.set(gate !== "non-TTY");
+    mocks.confirm.mockResolvedValue(gate !== "declined");
+    await expect(
+      offer({ options: gate === "nonInteractive" ? { nonInteractive: true } : {} }),
+    ).resolves.toBe(false);
+    expect(mocks.updateCommand).not.toHaveBeenCalled();
+    expect(mocks.outro).not.toHaveBeenCalled();
+    if (gate === "declined") {
+      expect(mocks.confirm).toHaveBeenCalledOnce();
+    } else {
+      expect(mocks.confirm).not.toHaveBeenCalled();
+    }
+    if (gate === "external") {
+      expect(mocks.note).toHaveBeenCalledWith(
+        expect.stringContaining("external supervisor's stop/update/finalize/restart workflow"),
+        "Update",
+      );
+    } else if (gate !== "declined") {
+      expect(mocks.git).not.toHaveBeenCalled();
+    }
+  },
+);
+
+it.each([undefined, "still-starting"] as const)(
+  "delegates to the updater without recursion (readiness=%s)",
+  async (reason) => {
+    mocks.updateCommand.mockImplementation(async ({ onResult }) => {
+      expect(mocks.outro).not.toHaveBeenCalled();
+      await withUpdateInProgressEnv(process.cwd(), async () => {
+        await expect(offer()).resolves.toBe(false);
+      });
+      onResult?.(reason ? { ...result("skipped"), reason } : result("ok"));
     });
-    mocks.runCommandWithTimeout.mockResolvedValue({
-      stdout: "/repo/real\n",
-      stderr: "",
-      code: 0,
-      killed: false,
-      signal: null,
-      termination: "exit",
-      noOutputTimedOut: false,
+    await expect(offer()).resolves.toBe(true);
+    expect(mocks.confirm).toHaveBeenCalledOnce();
+    expect(mocks.updateCommand).toHaveBeenCalledExactlyOnceWith({
+      sourceUpdate: { root: "/repo/source" },
+      timeout: "1200",
+      onResult: expect.any(Function),
     });
+    expect(process.env.OPENCLAW_UPDATE_IN_PROGRESS).toBeUndefined();
+    if (reason) {
+      expect(mocks.outro).toHaveBeenCalledWith(
+        expect.stringContaining("Gateway readiness remains unverified. Keep recovery backups"),
+      );
+    }
+  },
+);
 
-    await expect(runOffer({ root: "/repo/link", confirm })).resolves.toEqual({ updated: false });
-
-    expect(confirm).toHaveBeenCalledWith({
-      message: "Update OpenClaw from git before running doctor?",
-      initialValue: true,
-    });
-    expect(mocks.note).not.toHaveBeenCalledWith(
-      expect.stringContaining("This install is not a git checkout."),
-      "Update",
-    );
-  });
-
-  it("passes step progress to the updater and stops the spinner when the update throws", async () => {
-    const stop = vi.fn();
-    const progress = {};
-    mocks.createUpdateProgress.mockReturnValue({ progress, stop });
-    vi.spyOn(fs, "realpath").mockImplementation(async (candidate) => String(candidate));
-    mocks.runCommandWithTimeout.mockResolvedValue({
-      stdout: "/repo/link\n",
-      stderr: "",
-      code: 0,
-      killed: false,
-      signal: null,
-      termination: "exit",
-      noOutputTimedOut: false,
-    });
-    mocks.runGatewayUpdate.mockRejectedValue(new Error("update exploded"));
-
-    const confirm = vi.fn().mockResolvedValue(true);
-    await expect(runOffer({ root: "/repo/link", confirm })).rejects.toThrow("update exploded");
-
-    expect(mocks.runGatewayUpdate).toHaveBeenCalledWith(expect.objectContaining({ progress }));
-    expect(mocks.createUpdateProgress).toHaveBeenCalledWith(true);
-    expect(stop).toHaveBeenCalledTimes(1);
-  });
-
-  it("disables update progress when stdout is not a TTY", async () => {
-    Object.defineProperty(process.stdout, "isTTY", {
-      configurable: true,
-      value: false,
-    });
-    vi.spyOn(fs, "realpath").mockImplementation(async (candidate) => String(candidate));
-    mocks.runCommandWithTimeout.mockResolvedValue({
-      stdout: "/repo/link\n",
-      stderr: "",
-      code: 0,
-      killed: false,
-      signal: null,
-      termination: "exit",
-      noOutputTimedOut: false,
-    });
-    mocks.runGatewayUpdate.mockResolvedValue({
-      status: "skipped",
-      mode: "git",
-      root: "/repo/link",
-      steps: [],
-      durationMs: 0,
-    });
-
-    const confirm = vi.fn().mockResolvedValue(true);
-    await expect(runOffer({ root: "/repo/link", confirm })).resolves.toEqual({
-      updated: true,
-      handled: false,
-    });
-
-    expect(mocks.createUpdateProgress).toHaveBeenCalledWith(false);
-  });
-
-  it("keeps package-manager guidance when git reports a different checkout", async () => {
-    const confirm = vi.fn();
-    vi.spyOn(fs, "realpath").mockImplementation(async (candidate) => String(candidate));
-    mocks.runCommandWithTimeout.mockResolvedValue({
-      stdout: "/repo/other\n",
-      stderr: "",
-      code: 0,
-      killed: false,
-      signal: null,
-      termination: "exit",
-      noOutputTimedOut: false,
-    });
-
-    await expect(runOffer({ root: "/repo/link", confirm })).resolves.toEqual({ updated: false });
-
-    expect(confirm).not.toHaveBeenCalled();
-    expect(mocks.note).toHaveBeenCalledWith(
-      expect.stringContaining("This install is not a git checkout."),
-      "Update",
-    );
-  });
+it.each([
+  ["another checkout", gitResult(0, "/repo/other\n"), true],
+  ["not a repository", gitResult(128, "/repo/other\n", "fatal: not a git repository"), true],
+  ["missing git", new Error("spawn git ENOENT"), false],
+  ["inspection failed", gitResult(128, "", "permission denied"), false],
+] as const)("keeps package guidance accurate for %s", async (_kind, response, guidance) => {
+  if (response instanceof Error) {
+    mocks.git.mockRejectedValue(response);
+  } else {
+    mocks.git.mockResolvedValue(response);
+  }
+  await expectSkipped();
+  if (guidance) {
+    expect(mocks.note).toHaveBeenCalledWith(expect.stringContaining("openclaw update"), "Update");
+  } else {
+    expect(mocks.note).not.toHaveBeenCalled();
+  }
 });

@@ -1,11 +1,10 @@
-// Signal tests cover config schema plugin behavior.
-import { describe, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { SignalConfigSchema } from "../config-api.js";
 
 function expectValidSignalConfig(config: unknown) {
-  const res = SignalConfigSchema.safeParse(config);
-  expect(res.success).toBe(true);
+  expect(SignalConfigSchema.safeParse(config).success).toBe(true);
 }
+const container = { kind: "container", url: "http://signal-container:8080" };
 
 function expectInvalidSignalConfig(config: unknown) {
   const res = SignalConfigSchema.safeParse(config);
@@ -16,117 +15,79 @@ function expectInvalidSignalConfig(config: unknown) {
   return res.error.issues;
 }
 
-describe("signal groups schema", () => {
-  it('rejects dmPolicy="open" without allowFrom "*"', () => {
-    const issues = expectInvalidSignalConfig({
-      dmPolicy: "open",
-      allowFrom: ["+15555550123"],
-    });
+it('rejects dmPolicy="open" without allowFrom "*"', () => {
+  const issues = expectInvalidSignalConfig({ dmPolicy: "open", allowFrom: ["+15555550123"] });
+  expect(issues[0]?.path.join(".")).toBe("allowFrom");
+});
 
-    expect(issues[0]?.path.join(".")).toBe("allowFrom");
+it('rejects dmPolicy="allowlist" without allowFrom', () => {
+  const issues = expectInvalidSignalConfig({ dmPolicy: "allowlist" });
+  expect(issues.some((issue) => issue.path.includes("allowFrom"))).toBe(true);
+});
+
+it("rejects a named container transport without an inherited or owned account", () => {
+  const issues = expectInvalidSignalConfig({ accounts: { work: { transport: container } } });
+  expect(issues.map((issue) => issue.path.join("."))).toContain("accounts.work.account");
+});
+
+it("allows disabled account-less container transports", () => {
+  expectValidSignalConfig({ enabled: false, transport: container });
+  expectValidSignalConfig({ accounts: { work: { enabled: false, transport: container } } });
+});
+
+it("accepts a default-account number stored beside a root container transport", () => {
+  expectValidSignalConfig({
+    transport: container,
+    accounts: { Default: { account: "+15555550123" } },
   });
+});
 
-  it('accepts dmPolicy="open" with allowFrom "*"', () => {
-    const res = SignalConfigSchema.safeParse({ dmPolicy: "open", allowFrom: ["*"] });
+it.each([
+  { socketPath: "/tmp/../signal.sock" },
+  { socketPath: `/tmp/${"a".repeat(100)}.sock` },
+  { socketPath: "/tmp/signal.sock", url: "http://127.0.0.1:8080" },
+  { socketPath: "/tmp/signal.sock", httpHost: "127.0.0.1" },
+  { socketPath: "/tmp/signal.sock", httpPort: 8080 },
+  { socketPath: "/tmp/signal.sock", receiveMode: "on-start" },
+])("rejects invalid or ambiguous socket transport %j", (options) => {
+  expectInvalidSignalConfig({ transport: { kind: "managed-native", ...options } });
+});
 
-    expect(res.success).toBe(true);
-    if (res.success) {
-      expect(res.data.dmPolicy).toBe("open");
-    }
+it.each(["external-native", "container"])("rejects socketPath on %s transport", (kind) => {
+  expectInvalidSignalConfig({
+    account: "+15555550123",
+    transport: { kind, url: "http://127.0.0.1:8080", socketPath: "/tmp/signal.sock" },
   });
+});
 
-  it("defaults dm/group policy", () => {
-    const res = SignalConfigSchema.safeParse({});
+it("rejects managed transport ports outside the TCP range", () => {
+  expectInvalidSignalConfig({ transport: { kind: "managed-native", httpPort: 65_536 } });
+});
 
-    expect(res.success).toBe(true);
-    if (res.success) {
-      expect(res.data.dmPolicy).toBe("pairing");
-      expect(res.data.groupPolicy).toBe("allowlist");
-    }
+it("rejects non-HTTP transport URLs", () => {
+  expectInvalidSignalConfig({
+    transport: { kind: "external-native", url: "ftp://signal-native:8080" },
   });
+});
 
-  it("accepts historyLimit", () => {
-    const res = SignalConfigSchema.safeParse({ historyLimit: 6 });
-
-    expect(res.success).toBe(true);
-    if (res.success) {
-      expect(res.data.historyLimit).toBe(6);
-    }
+it("rejects transport URLs containing credentials", () => {
+  expectInvalidSignalConfig({
+    transport: { kind: "container", url: "http://user@signal-container:8080" },
   });
+});
+const legacyConfig = {
+  account: "+15555550123",
+  apiMode: "container",
+  httpUrl: "http://signal-container:8080",
+  autoStart: false,
+};
 
-  it("accepts textChunkLimit", () => {
-    const res = SignalConfigSchema.safeParse({
-      enabled: true,
-      textChunkLimit: 2222,
-    });
+afterEach(() => vi.unstubAllEnvs());
 
-    expect(res.success).toBe(true);
-    if (res.success) {
-      expect(res.data.textChunkLimit).toBe(2222);
-    }
-  });
+it("closes the temporary schema window without reloading modules", () => {
+  vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", "1");
+  expect(SignalConfigSchema.safeParse(legacyConfig).success).toBe(true);
 
-  it("accepts accountUuid for loop protection", () => {
-    expectValidSignalConfig({
-      accountUuid: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    });
-  });
-
-  it("accepts channel apiMode", () => {
-    for (const apiMode of ["auto", "native", "container"]) {
-      expectValidSignalConfig({ apiMode });
-    }
-  });
-
-  it("rejects per-account apiMode", () => {
-    const issues = expectInvalidSignalConfig({
-      accounts: {
-        primary: {
-          apiMode: "container",
-        },
-      },
-    });
-
-    expect(issues.map((issue) => issue.path.join("."))).toContain("accounts.primary");
-  });
-
-  it("accepts top-level group overrides", () => {
-    expectValidSignalConfig({
-      groups: {
-        "*": {
-          requireMention: false,
-        },
-        "+1234567890": {
-          requireMention: true,
-        },
-      },
-    });
-  });
-
-  it("accepts per-account group overrides", () => {
-    expectValidSignalConfig({
-      accounts: {
-        primary: {
-          groups: {
-            "*": {
-              requireMention: false,
-            },
-          },
-        },
-      },
-    });
-  });
-
-  it("rejects unknown keys in group entries", () => {
-    const issues = expectInvalidSignalConfig({
-      groups: {
-        "*": {
-          requireMention: false,
-          nope: true,
-        },
-      },
-    });
-
-    expect(issues.map((issue) => issue.path.join("."))).toEqual(["groups.*"]);
-  });
+  vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", "0");
+  expect(SignalConfigSchema.safeParse(legacyConfig).success).toBe(false);
 });

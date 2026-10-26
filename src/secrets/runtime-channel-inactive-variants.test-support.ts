@@ -1,15 +1,17 @@
 /** Test support for inactive channel variants in secrets runtime scenarios. */
 import { vi } from "vitest";
-import { loadBundledChannelSecretContractApi } from "./channel-contract-api.js";
+import { loadChannelSecretContractApi } from "./channel-contract-api.js";
 
 /** Test-only bootstrap registry mock for inactive channel secret surface variants. */
-const googleChatSecrets = loadBundledChannelSecretContractApi("googlechat");
-const ircSecrets = loadBundledChannelSecretContractApi("irc");
-const slackSecrets = loadBundledChannelSecretContractApi("slack");
+const googleChatSecrets = loadChannelSecretContractApi({ channelId: "googlechat", config: {} });
+const ircSecrets = loadChannelSecretContractApi({ channelId: "irc", config: {} });
+const mattermostSecrets = loadChannelSecretContractApi({ channelId: "mattermost", config: {} });
+const slackSecrets = loadChannelSecretContractApi({ channelId: "slack", config: {} });
 
 if (
   !googleChatSecrets?.collectRuntimeConfigAssignments ||
   !ircSecrets?.collectRuntimeConfigAssignments ||
+  !mattermostSecrets?.collectRuntimeConfigAssignments ||
   !slackSecrets?.collectRuntimeConfigAssignments
 ) {
   throw new Error("Missing channel secret contract api");
@@ -17,11 +19,15 @@ if (
 
 const googleChatAssignments = googleChatSecrets.collectRuntimeConfigAssignments;
 const ircAssignments = ircSecrets.collectRuntimeConfigAssignments;
+const mattermostAssignments = mattermostSecrets.collectRuntimeConfigAssignments;
 const slackAssignments = slackSecrets.collectRuntimeConfigAssignments;
 
 function resolveAssignments(id: string) {
   if (id === "irc") {
     return ircAssignments;
+  }
+  if (id === "mattermost") {
+    return mattermostAssignments;
   }
   if (id === "slack") {
     return slackAssignments;

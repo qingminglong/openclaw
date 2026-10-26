@@ -1,10 +1,7 @@
-// Irc helper module supports normalize behavior.
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { buildChannelOutboundSessionRoute } from "openclaw/plugin-sdk/channel-core";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { hasIrcControlChars } from "./control-chars.js";
-import type { IrcInboundMessage } from "./types.js";
 
 const IRC_TARGET_PATTERN = /^[^\s:]+$/u;
 
@@ -37,6 +34,32 @@ export function normalizeIrcMessagingTarget(raw: string): string | undefined {
   return target;
 }
 
+export function resolveIrcOutboundSessionRoute(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  accountId?: string | null;
+  target: string;
+}) {
+  const target = normalizeIrcMessagingTarget(params.target);
+  if (!target) {
+    return null;
+  }
+  const chatType = isChannelTarget(target) ? "group" : "direct";
+  // Server-specific casemapping and nick changes mean the outbound spelling is
+  // not a stable inbound peer identity, even when delivery succeeds.
+  return buildChannelOutboundSessionRoute({
+    cfg: params.cfg,
+    agentId: params.agentId,
+    channel: "irc",
+    accountId: params.accountId,
+    recipientSessionExact: chatType === "direct" ? "direct-alias" : false,
+    peer: { kind: chatType, id: target },
+    chatType,
+    from: `irc:${target}`,
+    to: target,
+  });
+}
+
 export function looksLikeIrcTargetId(raw: string): boolean {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -60,27 +83,4 @@ export function normalizeIrcAllowEntry(raw: string): string {
     value = value.slice("user:".length);
   }
   return value.trim();
-}
-
-export function buildIrcAllowlistCandidates(
-  message: IrcInboundMessage,
-  params?: { allowNameMatching?: boolean },
-): string[] {
-  const nick = normalizeLowercaseStringOrEmpty(message.senderNick);
-  const user = normalizeOptionalLowercaseString(message.senderUser);
-  const host = normalizeOptionalLowercaseString(message.senderHost);
-  const candidates = new Set<string>();
-  if (nick && params?.allowNameMatching === true) {
-    candidates.add(nick);
-  }
-  if (nick && user) {
-    candidates.add(`${nick}!${user}`);
-  }
-  if (nick && host) {
-    candidates.add(`${nick}@${host}`);
-  }
-  if (nick && user && host) {
-    candidates.add(`${nick}!${user}@${host}`);
-  }
-  return [...candidates];
 }

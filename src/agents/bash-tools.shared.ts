@@ -1,57 +1,38 @@
-/**
- * Shared helpers for bash exec/process tools.
- * Owns sandbox workdir mapping, Docker exec argument construction, output
- * slicing, environment coercion, and compact session labels.
- */
-import { existsSync, statSync } from "node:fs";
-import fs from "node:fs/promises";
-import { homedir } from "node:os";
-import path from "node:path";
 import { parseStrictInteger } from "@openclaw/normalization-core/number-coercion";
+import { parseEnvValue as stripQuotes } from "../secrets/shared.js";
 import { sliceUtf16Safe } from "../utils.js";
-import { assertSandboxPath } from "./sandbox-paths.js";
-import type { SandboxBackendExecSpec } from "./sandbox/backend-handle.types.js";
+import type { SandboxBackendHandle } from "./sandbox/backend-handle.types.js";
+import type { ReadOnlyWorkspaceSkillMount } from "./sandbox/workspace-mounts.js";
 
 const CHUNK_LIMIT = 8 * 1024;
 
-/** Sandbox metadata needed to map host workspaces into container exec calls. */
 export type BashSandboxConfig = {
   containerName: string;
   workspaceDir: string;
   containerWorkdir: string;
+  workdirValidation?: SandboxBackendHandle["workdirValidation"];
+  validateWorkdir?: SandboxBackendHandle["validateWorkdir"];
+  discardPreparedWorkdir?: SandboxBackendHandle["discardPreparedWorkdir"];
+  workdirRoots?: readonly string[];
+  /** Approved read-only skill mounts that may be selected as an exec workdir. */
+  readOnlyWorkspaceSkillMounts?: readonly ReadOnlyWorkspaceSkillMount[];
   env?: Record<string, string>;
-  buildExecSpec?: (params: {
-    command: string;
-    workdir?: string;
-    env: Record<string, string>;
-    usePty: boolean;
-  }) => Promise<SandboxBackendExecSpec>;
-  finalizeExec?: (params: {
-    status: "completed" | "failed";
-    exitCode: number | null;
-    timedOut: boolean;
-    token?: unknown;
-  }) => Promise<void>;
+  prepareProcessCleanup?: SandboxBackendHandle["prepareProcessCleanup"];
+  buildExecSpec?: SandboxBackendHandle["buildExecSpec"];
+  finalizeExec?: SandboxBackendHandle["finalizeExec"];
 };
 
-/** Builds the environment passed into sandboxed exec calls. */
 export function buildSandboxEnv(params: {
   defaultPath: string;
   paramsEnv?: Record<string, string>;
   sandboxEnv?: Record<string, string>;
   containerWorkdir: string;
-}) {
-  const env: Record<string, string> = {
-    PATH: params.defaultPath,
-    HOME: params.containerWorkdir,
-  };
-  for (const [key, value] of Object.entries(params.sandboxEnv ?? {})) {
-    env[key] = value;
-  }
-  for (const [key, value] of Object.entries(params.paramsEnv ?? {})) {
-    env[key] = value;
-  }
-  return env;
+}): Record<string, string> {
+  return Object.assign(
+    { PATH: params.defaultPath, HOME: params.containerWorkdir },
+    params.sandboxEnv,
+    params.paramsEnv,
+  );
 }
 
 /** Coerces process/env-like records to string-only environment variables. */
@@ -66,142 +47,6 @@ export function coerceEnv(env?: NodeJS.ProcessEnv | Record<string, string>) {
     }
   }
   return record;
-}
-
-/** Builds `docker exec` arguments while preserving container PATH behavior. */
-export function buildDockerExecArgs(params: {
-  containerName: string;
-  command: string;
-  workdir?: string;
-  env: Record<string, string>;
-  tty: boolean;
-}) {
-  const args = ["exec", "-i"];
-  if (params.tty) {
-    args.push("-t");
-  }
-  if (params.workdir) {
-    args.push("-w", params.workdir);
-  }
-  for (const [key, value] of Object.entries(params.env)) {
-    // Skip PATH — passing a host PATH (e.g. Windows paths) via -e poisons
-    // Docker's executable lookup, causing "sh: not found" on Windows hosts.
-    // PATH is handled separately via OPENCLAW_PREPEND_PATH below.
-    if (key === "PATH") {
-      continue;
-    }
-    args.push("-e", `${key}=${value}`);
-  }
-  const hasCustomPath = typeof params.env.PATH === "string" && params.env.PATH.length > 0;
-  if (hasCustomPath) {
-    // Avoid interpolating PATH into the shell command; pass it via env instead.
-    args.push("-e", `OPENCLAW_PREPEND_PATH=${params.env.PATH}`);
-  }
-  // Login shell (-l) sources /etc/profile which resets PATH to a minimal set,
-  // overriding both Docker ENV and -e PATH=... environment variables.
-  // Prepend custom PATH after profile sourcing to ensure custom tools are accessible
-  // while preserving system paths that /etc/profile may have added.
-  const pathExport = hasCustomPath
-    ? 'export PATH="${OPENCLAW_PREPEND_PATH}:$PATH"; unset OPENCLAW_PREPEND_PATH; '
-    : "";
-  // Use absolute path for sh to avoid dependency on PATH resolution during exec.
-  args.push(params.containerName, "/bin/sh", "-lc", `${pathExport}${params.command}`);
-  return args;
-}
-
-/** Resolves a requested workdir to both host and container paths for a sandbox. */
-export async function resolveSandboxWorkdir(params: {
-  workdir: string;
-  sandbox: BashSandboxConfig;
-  warnings: string[];
-}) {
-  const fallback = params.sandbox.workspaceDir;
-  const mappedHostWorkdir = mapContainerWorkdirToHost({
-    workdir: params.workdir,
-    sandbox: params.sandbox,
-  });
-  const candidateWorkdir = mappedHostWorkdir ?? params.workdir;
-  try {
-    const resolved = await assertSandboxPath({
-      filePath: candidateWorkdir,
-      cwd: process.cwd(),
-      root: params.sandbox.workspaceDir,
-    });
-    const stats = await fs.stat(resolved.resolved);
-    if (!stats.isDirectory()) {
-      throw new Error("workdir is not a directory");
-    }
-    const relative = resolved.relative
-      ? resolved.relative.split(path.sep).join(path.posix.sep)
-      : "";
-    const containerWorkdir = relative
-      ? path.posix.join(params.sandbox.containerWorkdir, relative)
-      : params.sandbox.containerWorkdir;
-    return { hostWorkdir: resolved.resolved, containerWorkdir };
-  } catch {
-    params.warnings.push(
-      `Warning: workdir "${params.workdir}" is unavailable; using "${fallback}".`,
-    );
-    return {
-      hostWorkdir: fallback,
-      containerWorkdir: params.sandbox.containerWorkdir,
-    };
-  }
-}
-
-function mapContainerWorkdirToHost(params: {
-  workdir: string;
-  sandbox: BashSandboxConfig;
-}): string | undefined {
-  const workdir = normalizeContainerPath(params.workdir);
-  const containerRoot = normalizeContainerPath(params.sandbox.containerWorkdir);
-  if (containerRoot === ".") {
-    return undefined;
-  }
-  if (workdir === containerRoot) {
-    return path.resolve(params.sandbox.workspaceDir);
-  }
-  if (!workdir.startsWith(`${containerRoot}/`)) {
-    return undefined;
-  }
-  const rel = workdir
-    .slice(containerRoot.length + 1)
-    .split("/")
-    .filter(Boolean);
-  return path.resolve(params.sandbox.workspaceDir, ...rel);
-}
-
-function normalizeContainerPath(input: string): string {
-  const normalized = input.trim().replace(/\\/g, "/");
-  if (!normalized) {
-    return ".";
-  }
-  return path.posix.normalize(normalized);
-}
-
-/** Resolves a host workdir, falling back to a safe cwd/home path with a warning. */
-export function resolveWorkdir(workdir: string, warnings: string[]) {
-  const current = safeCwd();
-  const fallback = current ?? homedir();
-  try {
-    const stats = statSync(workdir);
-    if (stats.isDirectory()) {
-      return workdir;
-    }
-  } catch {
-    // ignore, fallback below
-  }
-  warnings.push(`Warning: workdir "${workdir}" is unavailable; using "${fallback}".`);
-  return fallback;
-}
-
-function safeCwd() {
-  try {
-    const cwd = process.cwd();
-    return existsSync(cwd) ? cwd : null;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -225,11 +70,14 @@ export function readEnvInt(key: string, legacyKey?: string) {
   return parseStrictInteger(raw);
 }
 
-/** Splits large output into fixed-size UTF-16 chunks for transport. */
-export function chunkString(input: string, limit = CHUNK_LIMIT) {
+/** Splits output into bounded chunks without splitting UTF-16 surrogate pairs. */
+export function chunkString(input: string) {
   const chunks: string[] = [];
-  for (let i = 0; i < input.length; i += limit) {
-    chunks.push(input.slice(i, i + limit));
+  let i = 0;
+  while (i < input.length) {
+    const chunk = sliceUtf16Safe(input, i, i + CHUNK_LIMIT);
+    chunks.push(chunk);
+    i += chunk.length;
   }
   return chunks;
 }
@@ -243,7 +91,6 @@ export function truncateMiddle(str: string, max: number) {
   return `${sliceUtf16Safe(str, 0, half)}...${sliceUtf16Safe(str, -half)}`;
 }
 
-/** Returns a line-based log slice plus original line/character counts. */
 export function sliceLogLines(
   text: string,
   offset?: number,
@@ -275,10 +122,10 @@ export function sliceLogLines(
 /** Derives a compact human label from a shell command. */
 export function deriveSessionName(command: string): string | undefined {
   const tokens = tokenizeCommand(command);
-  if (tokens.length === 0) {
+  const verb = tokens[0];
+  if (!verb) {
     return undefined;
   }
-  const verb = tokens[0];
   let target = tokens.slice(1).find((t) => !t.startsWith("-"));
   if (!target) {
     target = tokens[1];
@@ -293,23 +140,4 @@ export function deriveSessionName(command: string): string | undefined {
 function tokenizeCommand(command: string): string[] {
   const matches = command.match(/(?:[^\s"']+|"(?:\\.|[^"\\])*"|'[^']*')+/g) ?? [];
   return matches.map((token) => stripQuotes(token)).filter(Boolean);
-}
-
-function stripQuotes(value: string): string {
-  const trimmed = value.trim();
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
-}
-
-/** Right-pads a string for aligned plain-text process output. */
-export function pad(str: string, width: number) {
-  if (str.length >= width) {
-    return str;
-  }
-  return str + " ".repeat(width - str.length);
 }

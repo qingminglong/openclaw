@@ -1,68 +1,90 @@
-/**
- * Tests the registered gateway server method list and exported method names.
- */
-import { describe, expect, it } from "vitest";
-import { GATEWAY_EVENTS, listGatewayMethods } from "./server-methods-list.js";
+import { expect, it } from "vitest";
+import {
+  createCoreGatewayMethodDescriptors,
+  STARTUP_UNAVAILABLE_GATEWAY_METHODS,
+} from "./methods/core-method-policy.js";
+import { listGatewayMethods } from "./server-methods-list.js";
+import { LEGACY_ADVERTISED_GATEWAY_METHODS } from "./server-methods-list.test-fixtures.js";
+import { coreGatewayHandlers } from "./server-methods.js";
 
-describe("GATEWAY_EVENTS", () => {
-  it("advertises Talk event streams in hello features", () => {
-    expect(GATEWAY_EVENTS).toContain("talk.event");
-    expect(GATEWAY_EVENTS).not.toContain("talk.realtime.relay");
-    expect(GATEWAY_EVENTS).not.toContain("talk.transcription.relay");
-  });
+const descriptors = createCoreGatewayMethodDescriptors(coreGatewayHandlers);
+const descriptor = (name: string) => descriptors.find((entry) => entry.name === name);
+
+it.each([
+  ["agents.avatar.generate", "operator.admin", { since: "2026.10", controlPlaneWrite: true }],
+  [
+    "models.authSetApiKey plugins.reload plugins.refresh cron.add cron.update cron.remove cron.run",
+    "operator.admin",
+    { controlPlaneWrite: true },
+  ],
+  ["sessions.title.prepare projects.add", "operator.write", { controlPlaneWrite: true }],
+  ["projects.searchRemote", "operator.read", {}],
+  ["node.runnerInventory.update", "node", { advertise: false }],
+  ["mcp.events.list", "operator.read", { since: "2026.10" }],
+  ["gateway.restart.preflight", "operator.read", { since: "<=2026.7" }],
+  [
+    "environments.create environments.destroy environments.prepare",
+    "operator.admin",
+    { startup: "unavailable-until-sidecars", controlPlaneWrite: true },
+  ],
+  ["environments.session.status", "operator.read", { since: "2026.9" }],
+  [
+    "environments.session.create environments.session.destroy",
+    "operator.admin",
+    { since: "2026.9", controlPlaneWrite: true },
+  ],
+  ["environments.session.exec", "operator.admin", { since: "2026.9" }],
+] as const)("applies discovery and authority policy to %s", (names, scope, policy) => {
+  const methods = listGatewayMethods();
+  for (const name of names.split(" ")) {
+    expect(coreGatewayHandlers[name]).toBeTypeOf("function");
+    expect(descriptor(name)).toMatchObject({ scope, ...policy });
+    if ("startup" in policy) {
+      expect(STARTUP_UNAVAILABLE_GATEWAY_METHODS).toContain(name);
+    }
+    if (name !== "node.runnerInventory.update") {
+      expect(methods).toContain(name);
+    }
+  }
 });
 
-describe("listGatewayMethods", () => {
-  it("advertises plugin surface refresh for capability rotation", () => {
-    expect(listGatewayMethods()).toContain("node.pluginSurface.refresh");
-  });
+it("keeps read-only methods outside the control-plane write budget", () => {
+  for (const name of [
+    "gateway.restart.preflight",
+    "cron.get",
+    "cron.list",
+    "cron.status",
+    "cron.runs",
+    "cron.history",
+    "environments.session.status",
+    "environments.session.exec",
+  ]) {
+    expect(descriptor(name)?.controlPlaneWrite).toBeUndefined();
+  }
+});
 
-  it("advertises ClawHub skill trust methods", () => {
-    const methods = listGatewayMethods();
-    expect(methods).toContain("skills.securityVerdicts");
-    expect(methods).toContain("skills.skillCard");
-  });
+it("preserves the legacy advertised prefix and appends the MCP catalog", () => {
+  const methods = listGatewayMethods();
+  expect(methods.slice(0, LEGACY_ADVERTISED_GATEWAY_METHODS.length)).toEqual(
+    LEGACY_ADVERTISED_GATEWAY_METHODS,
+  );
+  expect(methods.indexOf("mcp.events.list")).toBeGreaterThanOrEqual(
+    LEGACY_ADVERTISED_GATEWAY_METHODS.length,
+  );
+});
 
-  it("does not advertise hidden core handlers", () => {
-    const methods = listGatewayMethods();
-    expect(methods).not.toContain("config.openFile");
-    expect(methods).not.toContain("chat.inject");
-    expect(methods).not.toContain("nativeHook.invoke");
-    expect(methods).not.toContain("sessions.usage");
-  });
-
-  it("preserves the legacy advertised method order", () => {
-    const methods = listGatewayMethods();
-    expect(methods.slice(0, 5)).toEqual([
-      "health",
-      "diagnostics.stability",
-      "doctor.memory.status",
-      "doctor.memory.dreamDiary",
-      "doctor.memory.backfillDreamDiary",
-    ]);
-    expect(methods.slice(32, 37)).toEqual([
-      "exec.approvals.get",
-      "exec.approvals.set",
-      "exec.approvals.node.get",
-      "exec.approvals.node.set",
-      "exec.approval.get",
-    ]);
-  });
-
-  it("advertises the versioned Talk session RPCs", () => {
-    const methods = listGatewayMethods();
-    expect(methods).toContain("talk.client.create");
-    expect(methods).toContain("talk.client.toolCall");
-    expect(methods).toContain("talk.client.steer");
-    expect(methods).toContain("talk.session.create");
-    expect(methods).toContain("talk.session.join");
-    expect(methods).toContain("talk.session.appendAudio");
-    expect(methods).toContain("talk.session.startTurn");
-    expect(methods).toContain("talk.session.endTurn");
-    expect(methods).toContain("talk.session.cancelTurn");
-    expect(methods).toContain("talk.session.cancelOutput");
-    expect(methods).toContain("talk.session.submitToolResult");
-    expect(methods).toContain("talk.session.steer");
-    expect(methods).toContain("talk.session.close");
-  });
+it.each([
+  "users.background.get",
+  "users.background.upload",
+  "users.background.remove",
+  "controlUi.sessionPullRequests.checks",
+  "update.runs.get",
+  "update.runs.list",
+  "talk.voice.get",
+  "talk.voice.set",
+  "talk.voice.complete",
+  "sessions.setInvolvement",
+])("advertises and wires %s", (name) => {
+  expect(listGatewayMethods()).toContain(name);
+  expect(coreGatewayHandlers[name]).toBeTypeOf("function");
 });

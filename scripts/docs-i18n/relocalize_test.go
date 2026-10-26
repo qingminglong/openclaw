@@ -7,46 +7,29 @@ import (
 	"testing"
 )
 
-func TestPostprocessLocalizedDocsFixesStaleLinksAfterLaterPagesExist(t *testing.T) {
-	t.Parallel()
-
+func TestPostprocessLocalizedDocsRejectsProtocolMarkerLeak(t *testing.T) {
 	docsRoot := t.TempDir()
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
 	writeFile(t, filepath.Join(docsRoot, "gateway", "index.md"), "# Gateway\n")
-	writeFile(t, filepath.Join(docsRoot, "gateway", "troubleshooting.md"), "# Troubleshooting\n")
-	writeFile(t, filepath.Join(docsRoot, "zh-CN", "gateway", "index.md"), stringsJoin(
+	pagePath := filepath.Join(docsRoot, "zh-CN", "gateway", "index.md")
+	writeFile(t, pagePath, stringsJoin(
 		"---",
-		"title: 网关",
 		"x-i18n:",
 		"  source_hash: test",
+		"  postprocess_version: pending",
 		"---",
 		"",
-		"See [Troubleshooting](/gateway/troubleshooting).",
-	))
-	writeFile(t, filepath.Join(docsRoot, "zh-CN", "gateway", "troubleshooting.md"), stringsJoin(
-		"---",
-		"title: 故障排除",
-		"x-i18n:",
-		"  source_hash: test",
-		"---",
+		"# 网关",
 		"",
-		"# 故障排除",
+		"__OC_I18N_900014__",
 	))
 
-	if err := postprocessLocalizedDocs(docsRoot, "zh-CN", []string{
-		filepath.Join(docsRoot, "zh-CN", "gateway", "index.md"),
-		filepath.Join(docsRoot, "zh-CN", "gateway", "troubleshooting.md"),
-	}); err != nil {
-		t.Fatalf("postprocessLocalizedDocs failed: %v", err)
+	err := postprocessLocalizedDocs(docsRoot, "zh-CN", []string{pagePath})
+	if err == nil {
+		t.Fatal("expected postprocess protocol marker leak rejection")
 	}
-
-	got := mustReadFile(t, filepath.Join(docsRoot, "zh-CN", "gateway", "index.md"))
-	if !strings.Contains(got, "---\ntitle: 网关\nx-i18n:\n  source_hash: test\n  postprocess_version: "+localizedLinkPostprocessVersion+"\n---\n\n") {
-		t.Fatalf("front matter corrupted after rewrite:\n%s", got)
-	}
-	want := "See [Troubleshooting](/zh-CN/gateway/troubleshooting)."
-	if !containsLine(got, want) {
-		t.Fatalf("expected rewritten localized link %q in output:\n%s", want, got)
+	if !strings.Contains(err.Error(), "protocol token leaked after localized link postprocess") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -97,6 +80,9 @@ func TestPostprocessLocalizedDocsRewritesPublishedPageLinksForEachLocale(t *test
 			}
 
 			got := mustReadFile(t, pagePath)
+			if !strings.Contains(got, "---\ntitle: "+tt.title+"\nx-i18n:\n  source_hash: test\n  postprocess_version: "+localizedLinkPostprocessVersion+"\n---\n\n") {
+				t.Fatalf("front matter corrupted after rewrite:\n%s", got)
+			}
 			expectedLinks := []string{
 				"See [Troubleshooting](" + tt.wantPrefix + "/gateway/troubleshooting).",
 				"See [Example provider](" + tt.wantPrefix + "/providers/example-provider).",
@@ -120,6 +106,7 @@ func TestPostprocessLocalizedDocsDoesNotTreatThreeLetterSourceDirsAsLocales(t *t
 	writeFile(t, filepath.Join(docsRoot, "cli", "index.md"), "# CLI\n")
 	writeFile(t, filepath.Join(docsRoot, "cli", "AGENTS.md"), "# CLI docs guide\n")
 	writeFile(t, filepath.Join(docsRoot, "web", "index.md"), "# Web\n")
+	writeFile(t, filepath.Join(docsRoot, "gateway", "index.md"), "# Gateway\n")
 	writeFile(t, filepath.Join(docsRoot, "zh-CN", "AGENTS.md"), "# zh-CN\n")
 	writeFile(t, filepath.Join(docsRoot, "zh-CN", ".i18n", "README.md"), "# zh-CN i18n\n")
 	writeFile(t, filepath.Join(docsRoot, "zh-CN", "cli", "index.md"), "# CLI 本地化\n")
@@ -158,6 +145,7 @@ func TestPostprocessLocalizedDocsOnlyTouchesScopedFiles(t *testing.T) {
 
 	docsRoot := t.TempDir()
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
+	writeFile(t, filepath.Join(docsRoot, "gateway", "index.md"), "# Gateway\n")
 	writeFile(t, filepath.Join(docsRoot, "gateway", "troubleshooting.md"), "# Troubleshooting\n")
 	writeFile(t, filepath.Join(docsRoot, "zh-CN", "gateway", "troubleshooting.md"), "# 故障排除\n")
 
@@ -200,6 +188,8 @@ func TestPostprocessLocalizedDocsContinuesAfterUnchangedFile(t *testing.T) {
 
 	docsRoot := t.TempDir()
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
+	writeFile(t, filepath.Join(docsRoot, "gateway", "already-localized.md"), "# Already localized\n")
+	writeFile(t, filepath.Join(docsRoot, "gateway", "index.md"), "# Gateway\n")
 	writeFile(t, filepath.Join(docsRoot, "gateway", "troubleshooting.md"), "# Troubleshooting\n")
 	writeFile(t, filepath.Join(docsRoot, "zh-CN", "gateway", "troubleshooting.md"), "# 故障排除\n")
 
@@ -237,6 +227,7 @@ func TestPostprocessLocalizedDocsFinalizesPostprocessVersionWithoutBodyRewrite(t
 	docsRoot := t.TempDir()
 	path := filepath.Join(docsRoot, "zh-CN", "gateway", "index.md")
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
+	writeFile(t, filepath.Join(docsRoot, "gateway", "index.md"), "# Gateway\n")
 	writeFile(t, path, stringsJoin(
 		"---",
 		"title: 网关",

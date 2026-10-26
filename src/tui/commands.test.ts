@@ -1,88 +1,118 @@
-// Verifies TUI command definitions and parser metadata.
 import { describe, expect, it } from "vitest";
-import { getSlashCommands, helpText, parseCommand } from "./commands.js";
+import {
+  getSlashCommands,
+  helpText,
+  parseCommand,
+  shouldSubmitExactArgumentCompletion,
+} from "./commands.js";
+
+type Options = Parameters<typeof getSlashCommands>[0];
+const levels = (...values: string[]) => values.map((value) => ({ id: value, label: value }));
+const choices = (...values: string[]) => values.map((value) => ({ value, label: value }));
+const findCommand = (name: string, options?: Options) =>
+  getSlashCommands(options).find((entry) => entry.name === name);
+const minimax = { provider: "minimax", model: "MiniMax-M3", thinkingLevels: [] };
 
 describe("parseCommand", () => {
-  it("normalizes aliases and keeps command args", () => {
-    expect(parseCommand("/elev full")).toEqual({ name: "elevated", args: "full" });
+  it.each([
+    ["/ELEV full", "elevated", "full"],
+    ["/t high", "think", "high"],
+    ["/side check this", "btw", "check this"],
+    ["/followup first\nsecond", "followup", "first\nsecond"],
+    ["/compact: focus on decisions", "compact", "focus on decisions"],
+    ["/gwstatus", "gateway-status", ""],
+    ["   ", "", ""],
+  ])("parses %s", (input, name, args) => {
+    expect(parseCommand(input)).toEqual({ name, args });
   });
-
-  it("normalizes gateway-status aliases", () => {
-    expect(parseCommand("/gwstatus")).toEqual({ name: "gateway-status", args: "" });
+  it.each([false, true])("discovers explicit followup with local=%s", (local) => {
+    expect(helpText({ local })).toContain("/followup <message>");
+    expect(getSlashCommands({ local }).some((command) => command.name === "followup")).toBe(true);
   });
-
-  it("returns empty name for empty input", () => {
-    expect(parseCommand("   ")).toEqual({ name: "", args: "" });
+  it("accepts but does not advertise the retired alias", () => {
+    expect(parseCommand("/crestodian repair gateway")).toEqual({
+      name: "openclaw",
+      args: "repair gateway",
+    });
+    expect(getSlashCommands().map(({ name }) => name)).not.toContain("crestodian");
+    expect(helpText()).not.toContain("/crestodian");
   });
 });
 
 describe("getSlashCommands", () => {
-  it("provides level completions for built-in toggles", () => {
+  it.each([false, true])("exposes host-local Chrome setup in local=%s mode", (local) => {
+    const setup = findCommand("browser-setup", { local });
+    expect(setup?.description).toContain("TUI process host (not the Gateway)");
+    expect(setup?.getArgumentCompletions?.("")).toEqual(choices("inspect", "install", "verify"));
+    expect(helpText({ local })).toContain("/browser-setup [inspect|install|verify]");
+  });
+  it.each([
+    ["verbose", "o", ["on", "off"], undefined],
+    ["activation", "a", ["always"], undefined],
+    ["think", "default", ["default"], undefined],
+    ["fast", "default", ["default"], undefined],
+    [
+      "think",
+      "m",
+      ["medium", "max"],
+      { provider: "ollama", model: "qwen3:0.6b", thinkingLevels: levels("off", "medium", "max") },
+    ],
+    ["think", "", ["off", "adaptive", "default"], minimax],
+  ] satisfies [string, string, string[], Options][])(
+    "completes /%s %s",
+    (name, prefix, expected, options) => {
+      expect(findCommand(name, options)?.getArgumentCompletions?.(prefix)).toEqual(
+        choices(...expected),
+      );
+    },
+  );
+  it.each([
+    ["think", "t", "max"],
+    ["verbose", "v", "full"],
+    ["elevated", "elev", "ask"],
+  ])("keeps /%s completion on /%s", (name, alias, level) => {
+    for (const local of [false, true]) {
+      const commands = getSlashCommands({ local, thinkingLevels: levels("max") });
+      for (const command of [name, alias]) {
+        expect(
+          commands.find((entry) => entry.name === command)?.getArgumentCompletions?.(level),
+        ).toEqual(choices(level));
+      }
+      expect(shouldSubmitExactArgumentCompletion(`/${alias} ${level}`, commands)).toBe(true);
+    }
+  });
+  it.each([
+    ["usage", "cost"],
+    ["verbose", "full"],
+    ["reasoning", "stream"],
+  ])("submits an exact /%s %s completion", (name, level) => {
     const commands = getSlashCommands();
-    const verbose = commands.find((command) => command.name === "verbose");
-    const activation = commands.find((command) => command.name === "activation");
-    expect(verbose?.getArgumentCompletions?.("o")).toEqual([
-      { value: "on", label: "on" },
-      { value: "off", label: "off" },
-    ]);
-    expect(activation?.getArgumentCompletions?.("a")).toEqual([
-      { value: "always", label: "always" },
-    ]);
+    expect(findCommand(name)?.getArgumentCompletions?.(level)).toEqual(choices(level));
+    expect(shouldSubmitExactArgumentCompletion(`/${name} ${level}`, commands)).toBe(true);
   });
-
-  it("keeps session status on the shared command path and exposes gateway status separately", () => {
-    const commands = getSlashCommands();
-    const status = commands.find((command) => command.name === "status");
-    const gatewayStatus = commands.find((command) => command.name === "gateway-status");
-    const crestodian = commands.find((command) => command.name === "crestodian");
-    expect(status?.description).toBe("Show current status.");
-    expect(gatewayStatus?.description).toBe("Show gateway status summary");
-    expect(crestodian?.description).toBe("Return to Crestodian");
+  it.each([
+    ["gpt-5.6-sol", "codex"],
+    ["gpt-5.6-terra", "codex"],
+    ["gpt-5.6-luna", "codex"],
+    ["gpt-5.6-luna", "openclaw"],
+  ])("offers ultra for openai/%s on %s", (model, agentRuntime) => {
+    const completions = findCommand("think", {
+      provider: "openai",
+      model,
+      agentRuntime,
+      thinkingLevels: [],
+    })?.getArgumentCompletions?.("");
+    if (!Array.isArray(completions)) {
+      throw new Error("expected synchronous thinking-level completions");
+    }
+    expect(completions.some((choice) => choice.value === "ultra")).toBe(true);
   });
-
-  it("distinguishes new-session and reset command descriptions", () => {
-    const commands = getSlashCommands();
-    const newSession = commands.find((command) => command.name === "new");
-    const reset = commands.find((command) => command.name === "reset");
-    expect(newSession?.description).toBe("Spawn a new isolated session");
-    expect(reset?.description).toBe("Reset the current session");
-  });
-
-  it("uses session-provided thinking levels for completions", () => {
-    const commands = getSlashCommands({
-      provider: "ollama",
-      model: "qwen3:0.6b",
-      thinkingLevels: [
-        { id: "off", label: "off" },
-        { id: "medium", label: "medium" },
-        { id: "max", label: "max" },
-      ],
-    });
-    const think = commands.find((command) => command.name === "think");
-    expect(think?.getArgumentCompletions?.("m")).toEqual([
-      { value: "medium", label: "medium" },
-      { value: "max", label: "max" },
-    ]);
-  });
-
-  it("falls back to provider-resolved levels when thinkingLevels is empty (#76482)", async () => {
-    const commands = getSlashCommands({
-      provider: "anthropic",
-      model: "claude-sonnet-4-6",
-      thinkingLevels: [], // empty from lightweight session row
-    });
-    const think = commands.find((command) => command.name === "think");
-    // Should fall back to listThinkingLevelLabels, not return empty completions
-    const completions = await think?.getArgumentCompletions?.("");
-    expect(completions?.length).toBeGreaterThan(0);
-  });
-
   it("merges dynamic gateway commands", () => {
     const commands = getSlashCommands({
       dynamicCommands: [
         {
           name: "dreaming",
-          textAliases: ["/dreaming"],
+          textAliases: ["/dreaming", "/dream"],
           description: "Enable or disable memory dreaming.",
           source: "plugin",
           scope: "both",
@@ -90,21 +120,34 @@ describe("getSlashCommands", () => {
         },
       ],
     });
-
-    expect(commands.find((command) => command.name === "dreaming")?.description).toBe(
+    expect(commands.find(({ name }) => name === "dreaming")?.description).toBe(
       "Enable or disable memory dreaming.",
     );
+    expect(
+      commands.find(({ name }) => name === "dream")?.getArgumentCompletions?.(""),
+    ).toBeUndefined();
+  });
+  it("only advertises shared commands local mode can route", () => {
+    const names = getSlashCommands({ local: true }).map(({ name }) => name);
+    expect(names).toEqual(
+      expect.not.arrayContaining(["commands", "status", "compact", "context", "tools"]),
+    );
+    expect(names).toEqual(
+      expect.arrayContaining(["goal", "btw", "side", "queue", "stop", "t", "auth"]),
+    );
+    expect(getSlashCommands().map(({ name }) => name)).not.toContain("auth");
+    const help = helpText({ local: true });
+    for (const text of ["/commands", "/status"]) {
+      expect(help).not.toContain(text);
+    }
   });
 });
 
 describe("helpText", () => {
-  it("includes slash command help for aliases", () => {
-    const output = helpText();
-    expect(output).toContain("/elevated <on|off|ask|full>");
-    expect(output).toContain("/elev <on|off|ask|full>");
-    expect(output).toContain("/fast <status|auto|on|off>");
-    expect(output).toContain("/gateway-status");
-    expect(output).toContain("/gwstatus");
-    expect(output).toContain("/crestodian [request]");
+  it.each([
+    [{ ...minimax, thinkingLevels: levels("off", "max") }, "/think <off|max|default>"],
+    [minimax, "/think <off|adaptive|default>"],
+  ] satisfies [Options, string][])("documents thinking levels for %j", (options, expected) => {
+    expect(helpText(options)).toContain(expected);
   });
 });

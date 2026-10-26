@@ -1,5 +1,74 @@
+import type { MessageHookMediaFact } from "../hooks/message-hook-media.js";
 import type { DiagnosticTraceContext } from "../infra/diagnostic-trace-context.js";
 import type { PluginConversationBinding } from "./conversation-binding.types.js";
+import type { AsyncPluginHook } from "./hook-handler.types.js";
+
+/** Provider-owned event before any durable channel ingress payload is written. */
+export type PluginHookBeforeChannelIngressEvent = { event: unknown };
+
+export type PluginHookBeforeChannelIngressResult = { event?: unknown };
+
+export type PluginHookBeforeChannelIngressContext = {
+  channelId: string;
+  accountId?: string;
+  /** Admission and participating plugin lifetimes; propagate through awaited policy I/O. */
+  signal: AbortSignal;
+};
+
+/** Ordered media fact exposed by inbound message hooks. */
+export type PluginHookMediaFact = MessageHookMediaFact;
+
+/** Channel-neutral geographic fix carried by an inbound provider update. */
+export type PluginHookLocation = {
+  latitude: number;
+  longitude: number;
+  accuracy?: number;
+  name?: string;
+  address?: string;
+  source?: "pin" | "place" | "live";
+  isLive?: boolean;
+  livePeriodSeconds?: number;
+  caption?: string;
+};
+
+/** Stable provider update identity for transport-level correlation and deduplication. */
+export type PluginHookProviderUpdate = {
+  id: string;
+  kind: string;
+  messageId?: string;
+  messageTimestamp?: number;
+  editedTimestamp?: number;
+};
+
+/** Provider metadata plus deprecated media aliases retained during the SDK migration window. */
+export type PluginHookInboundMessageMetadata = Record<string, unknown> & {
+  /** @deprecated Use the first `event.media` fact with a defined `path`. */
+  mediaPath?: string;
+  /** @deprecated Use the first `event.media` fact's `url ?? path`. */
+  mediaUrl?: string;
+  /** @deprecated Use the first `event.media` fact's `contentType ?? kind`. */
+  mediaType?: string;
+  /** @deprecated Collect defined `path` values from `event.media` in order. */
+  mediaPaths?: string[];
+  /** @deprecated Collect each defined `url ?? path` from `event.media` in order. */
+  mediaUrls?: string[];
+  /** @deprecated Collect each defined `contentType ?? kind` from `event.media` in order. */
+  mediaTypes?: string[];
+  /** @deprecated Use the first `event.originalMedia` fact with a defined `path`. */
+  originalMediaPath?: string;
+  /** @deprecated Use the first `event.originalMedia` fact's `url ?? path`. */
+  originalMediaUrl?: string;
+  /** @deprecated Use the first `event.originalMedia` fact's `contentType ?? kind`. */
+  originalMediaType?: string;
+  /** @deprecated Collect defined `path` values from `event.originalMedia` in order. */
+  originalMediaPaths?: string[];
+  /** @deprecated Collect each defined `url ?? path` from `event.originalMedia` in order. */
+  originalMediaUrls?: string[];
+  /** @deprecated Collect each defined `contentType ?? kind` from `event.originalMedia` in order. */
+  originalMediaTypes?: string[];
+  /** @deprecated Use `event.mediaStagingPending`. */
+  mediaStagingPending?: boolean;
+};
 
 export type PluginHookMessageContext = {
   channelId: string;
@@ -57,46 +126,31 @@ export type PluginHookMessageContext = {
 };
 
 export type PluginHookInboundClaimContext = PluginHookMessageContext & {
+  /** Resolved owner for session scopes whose canonical key does not encode an agent id. */
+  agentId?: string;
   parentConversationId?: string;
   senderId?: string;
   messageId?: string;
   pluginBinding?: PluginConversationBinding;
 };
 
-export type PluginHookInboundClaimEvent = {
-  content: string;
+export type PluginHookInboundClaimEvent = PluginHookInboundMessageFacts & {
   body?: string;
   bodyForAgent?: string;
   transcript?: string;
-  timestamp?: number;
   channel: string;
   accountId?: string;
   conversationId?: string;
   parentConversationId?: string;
-  senderId?: string;
   senderName?: string;
   senderUsername?: string;
-  replyToId?: string;
-  replyToIdFull?: string;
-  replyToBody?: string;
-  replyToSender?: string;
-  replyToIsQuote?: boolean;
-  threadId?: string | number;
-  messageId?: string;
-  sessionKey?: string;
-  runId?: string;
-  trace?: DiagnosticTraceContext;
-  traceId?: string;
-  spanId?: string;
-  parentSpanId?: string;
   isGroup: boolean;
   commandAuthorized?: boolean;
+  senderIsOwner?: boolean;
   wasMentioned?: boolean;
-  metadata?: Record<string, unknown>;
 };
 
-export type PluginHookMessageReceivedEvent = {
-  from: string;
+type PluginHookInboundMessageFacts = {
   content: string;
   timestamp?: number;
   threadId?: string | number;
@@ -113,7 +167,19 @@ export type PluginHookMessageReceivedEvent = {
   traceId?: string;
   spanId?: string;
   parentSpanId?: string;
-  metadata?: Record<string, unknown>;
+  location?: PluginHookLocation;
+  providerUpdate?: PluginHookProviderUpdate;
+  /** Staged, locally usable attachments in stable source order. */
+  media?: PluginHookMediaFact[];
+  /** Original attachment facts when local staging has not completed yet. */
+  originalMedia?: PluginHookMediaFact[];
+  /** True when `originalMedia` is present but `media` is intentionally withheld pending staging. */
+  mediaStagingPending?: boolean;
+  metadata?: PluginHookInboundMessageMetadata;
+};
+
+export type PluginHookMessageReceivedEvent = PluginHookInboundMessageFacts & {
+  from: string;
 };
 
 export type PluginHookMessageSendingEvent = {
@@ -124,7 +190,7 @@ export type PluginHookMessageSendingEvent = {
   metadata?: Record<string, unknown>;
 };
 
-export type PluginHookMessageSendingResult = {
+type PluginHookMessageSendingResult = {
   content?: string;
   cancel?: boolean;
   cancelReason?: string;
@@ -143,4 +209,20 @@ export type PluginHookMessageSentEvent = {
   spanId?: string;
   parentSpanId?: string;
   error?: string;
+};
+
+/** Message operation contracts share their provider-event and delivery types. */
+export type PluginMessageHookHandlerMap = {
+  before_channel_ingress: AsyncPluginHook<
+    PluginHookBeforeChannelIngressEvent,
+    PluginHookBeforeChannelIngressContext,
+    PluginHookBeforeChannelIngressResult
+  >;
+  message_received: AsyncPluginHook<PluginHookMessageReceivedEvent, PluginHookMessageContext>;
+  message_sending: AsyncPluginHook<
+    PluginHookMessageSendingEvent,
+    PluginHookMessageContext,
+    PluginHookMessageSendingResult
+  >;
+  message_sent: AsyncPluginHook<PluginHookMessageSentEvent, PluginHookMessageContext>;
 };

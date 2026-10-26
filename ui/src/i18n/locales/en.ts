@@ -1,42 +1,439 @@
-// Control UI English locale strings are the i18n source bundle.
+// Control UI startup English. Lazy fragments retain empty namespace anchors here
+// so host-side composition preserves grouped translation-memory source order.
 import type { TranslationMap } from "../lib/types.ts";
+import * as agentEn from "./en-agents.ts";
 
-export const en: TranslationMap = {
+type EnglishCatalog = TranslationMap & {
+  languages: TranslationMap;
+  onboarding: TranslationMap & { memoryImport: TranslationMap };
+  execApproval: TranslationMap & { labels: TranslationMap; scope: TranslationMap };
+  sessionProgressCard: TranslationMap & {
+    refresh: TranslationMap;
+    activity: TranslationMap;
+    outcome: TranslationMap;
+    status: TranslationMap;
+  };
+  assistantPanel: TranslationMap;
+  outputs: TranslationMap;
+  nativeLinkMenu: TranslationMap;
+  capacityMeter: TranslationMap;
+  skillGroups: TranslationMap;
+  skillStatus: TranslationMap;
+  labsPage: TranslationMap & { swarm: TranslationMap };
+  agentChip: TranslationMap;
+  agentsHome: TranslationMap;
+  logbook: TranslationMap;
+  gatewayLogs: TranslationMap;
+  standingGrants: TranslationMap;
+  approvalHistory: TranslationMap;
+  approvalPage: TranslationMap;
+  secretsStore: TranslationMap &
+    Record<
+      "allowedHosts" | "allowedHostsPlaceholder" | "protectedSecret" | "agentReadable" | "hint",
+      string
+    >;
+  pluginsPage: TranslationMap & Record<"installed" | "official" | "install", string>;
+  mcpApp: TranslationMap;
+  linkReader: TranslationMap;
+  agentTools: TranslationMap;
+  githubPublication: TranslationMap & Record<"newAction" | "capacity", string>;
+  githubConnections: TranslationMap &
+    Record<"title" | "mine" | "system" | "forMe" | "forSystem", string>;
+  board: TranslationMap & { announcement: TranslationMap; widget: TranslationMap };
+  browser: TranslationMap & { errors: TranslationMap; annotatePrompt: TranslationMap };
+  pluginUi: TranslationMap & { surface: TranslationMap };
+  shortcutsOverlay: TranslationMap & { title: string };
+  chat: TranslationMap &
+    Record<
+      | "sessionAutomation"
+      | "activityPills"
+      | "usageLimit"
+      | "providerPolicy"
+      | "diskSpace"
+      | "workerRuntimeInstall"
+      | "subagentsPanel"
+      | "reactions"
+      | "sessionHeader"
+      | "board"
+      | "taskSuggestions"
+      | "view"
+      | "workspaceConflict"
+      | "skillLearned"
+      | "asyncQuestions"
+      | "youtube"
+      | "rail"
+      | "thread"
+      | "sessionDiscussion",
+      TranslationMap
+    > & {
+      clawhub: TranslationMap;
+      sidebar: TranslationMap;
+      composer: TranslationMap;
+      queue: TranslationMap;
+      mentions: TranslationMap;
+      permissions: TranslationMap;
+      voice: TranslationMap;
+      sendErrors: TranslationMap;
+      sessionDetails: TranslationMap &
+        Record<
+          | "automationAttention"
+          | "automationEmpty"
+          | "automationEnabled"
+          | "automationError"
+          | "automationLoading"
+          | "automationMore"
+          | "automationPaused"
+          | "automationUnavailable"
+          | "automations"
+          | "progressOptions",
+          string
+        >;
+      sessionDiff: TranslationMap & Record<"title" | "show", string>;
+      sessionSharing: TranslationMap & Record<"draft", string>;
+      workspaceFiles: TranslationMap & Record<"copyPath", string>;
+      toolCards: TranslationMap & Record<"activity" | "review" | "verbs", TranslationMap>;
+      systemNotice: TranslationMap &
+        Record<
+          | "guardian"
+          | "restartRecovery"
+          | "automationRecovery"
+          | "gatewayRestarted"
+          | "cliHarnessContext"
+          | "claudeCliTaskNotification"
+          | "pluginSteering",
+          TranslationMap
+        >;
+      mermaid: TranslationMap;
+      questions: TranslationMap;
+      imageLightbox: TranslationMap;
+      mediaPlayer: TranslationMap;
+      attachments: TranslationMap;
+      privateDraftReload: TranslationMap;
+      startupStatus: TranslationMap;
+      progressLabels: TranslationMap;
+      pendingInputs: TranslationMap & { agentUpdate: TranslationMap };
+      sessionSuggestions: TranslationMap & { state: TranslationMap };
+      catalog: TranslationMap;
+      sessionRoute: TranslationMap;
+      codeBlock: TranslationMap;
+      commandResults: TranslationMap & { fast: TranslationMap };
+      commands: TranslationMap;
+      detailPanel: TranslationMap;
+      welcome: TranslationMap & { suggestions: TranslationMap & { whatCanYouDo: string } };
+      goals: TranslationMap;
+      messages: TranslationMap &
+        Record<
+          | "copySelection"
+          | "replyingTo"
+          | "message"
+          | "showLess"
+          | "showMore"
+          | "tooLargeToDisplay"
+          | "unattributedSender"
+          | "toolSender"
+          | "errorSender",
+          string
+        >;
+      pullRequests: TranslationMap & Record<"open" | "draft" | "merged" | "closed", string>;
+      processesPanel: TranslationMap;
+    };
+  aboutPage: TranslationMap &
+    Record<
+      | "artifactDetails"
+      | "commit"
+      | "built"
+      | "unavailable"
+      | "copyCommit"
+      | "copiedCommit"
+      | "gateway",
+      string
+    >;
+  dashboardsPage: TranslationMap;
+  configForm: TranslationMap &
+    Record<"hideValue" | "revealValue" | "defaultValue", string> & { sections: TranslationMap };
+  quickSettings: TranslationMap & {
+    appearance: TranslationMap & Record<"lobsterVisits", string>;
+    personal: TranslationMap & Record<"browserOnly", string>;
+  };
+  activityFeed: TranslationMap & Record<"viewingNow" | "showing", string>;
+  terminal: TranslationMap &
+    Record<"title" | "open" | "toggle" | "unavailable" | "startCancelled", string>;
+  configPage: TranslationMap;
+  profilePage: TranslationMap & {
+    personalInstructions: TranslationMap;
+    identity: TranslationMap &
+      Record<
+        | "title"
+        | "menuLabel"
+        | "menuButtonLabel"
+        | "description"
+        | "avatar"
+        | "chooseAvatar"
+        | "displayName"
+        | "linkedEmails",
+        string
+      >;
+  };
+  connection: TranslationMap & {
+    browserSignIn: TranslationMap;
+    switchGateway: TranslationMap;
+    help: TranslationMap;
+  };
+  channels: TranslationMap;
+  agents: TranslationMap & { overview: TranslationMap };
+  configView: TranslationMap &
+    Record<
+      | "adminRequired"
+      | "recoveryNotRestored"
+      | "recoveryUnknown"
+      | "recoveryBackup"
+      | "discardUnconfirmed"
+      | "writeGatewayChanged"
+      | "writeUnconfirmed"
+      | "reloadBlocked"
+      | "rawDraftBlocksApply"
+      | "rawDraftBlocksFormEdit"
+      | "rawDraftUnverified"
+      | "fileOpenedOnGateway",
+      string
+    >;
+  custodian: TranslationMap & { autoSetup: TranslationMap & { thisComputer: string } };
+  debug: TranslationMap & {
+    lanes: TranslationMap & Partial<Record<"lane" | "active" | "queued" | "blocked", string>>;
+    overlay: TranslationMap & { title: string } & Partial<
+        Record<
+          | "eyebrow"
+          | "move"
+          | "minimize"
+          | "expand"
+          | "lanes"
+          | "status"
+          | "activeRuns"
+          | "events"
+          | "cpu"
+          | "memory"
+          | "delayP99",
+          string
+        >
+      >;
+  };
+  // Lazy en-devices.ts assigns into this namespace.
+  devices: TranslationMap & { pairing: TranslationMap };
+  desktop: TranslationMap &
+    Record<"title" | "openWindow" | "unavailable" | "toggle" | "reconnect" | "connecting", string>;
+  worktrees: TranslationMap;
+  sessionHovercard: TranslationMap & { states: TranslationMap; checks: TranslationMap } & Record<
+      | "ariaLabel"
+      | "linkedChannel"
+      | "moreParticipants"
+      | "moreParticipantsLabel"
+      | "projectLabel"
+      | "workspaceLabel"
+      | "branchLabel"
+      | "runsOn"
+      | "machineLabel"
+      | "machineCpu"
+      | "machineMemory"
+      | "more"
+      | "changedFile"
+      | "changedFiles",
+      string
+    >;
+  filePreview: TranslationMap;
+  updates: TranslationMap &
+    Record<"confirm" | "dialog" | "triage" | "report", TranslationMap> & {
+      run: TranslationMap &
+        Partial<Record<"restarting" | "progress", string>> & { phase: TranslationMap };
+    };
+  login: TranslationMap;
+  mcpServers: TranslationMap;
+  mcpPage: TranslationMap;
+  modelSetup: TranslationMap & {
+    candidates: TranslationMap;
+    failure: TranslationMap;
+    failureGuidance: TranslationMap;
+  };
+  newSession: TranslationMap &
+    Record<"title" | "hint" | "placementReloadBlocked" | "discardUnsavedAndReload", string>;
+  commandPalette: TranslationMap;
+  palette: TranslationMap & {
+    placeholder: string;
+    attachmentPrompt: string;
+    categories: TranslationMap & { navigation: string };
+  };
+  sessionsView: TranslationMap &
+    Record<
+      | "pullRequestCount"
+      | "subagentPrefix"
+      | "automationPrefix"
+      | "actionRequiresConnection"
+      | "actionUnavailable"
+      | "actionRequiresScope"
+      | "actionRequiresOwnership"
+      | "draftCleanupFailed"
+      | "createdBy"
+      | "ownedBy"
+      | "archivedBy"
+      | "viewingNow"
+      | "owners"
+      | "allOwners"
+      | "involvingMe"
+      | "withParticipant"
+      | "withMoreParticipants"
+      | "snoozeWakes"
+      | "snoozeTomorrowTime"
+      | "user"
+      | "assistant"
+      | "opensAsDashboard"
+      | "approvalNeeded"
+      | "messageNeedsAttention"
+      | "messagesNeedAttention"
+      | "unsentDraft"
+      | "noArchivedSessions"
+      | "status"
+      | "statusLive"
+      | "statusIdle"
+      | "statusUnknown"
+      | "statusQueued"
+      | "statusRunning"
+      | "statusDone"
+      | "statusFailed"
+      | "statusInterrupted"
+      | "statusKilled"
+      | "statusTimeout"
+      | "waitingForAnswer"
+      | "waitingForApproval"
+      | "questionsNeedAnswer"
+      | "approvalsNeedApproval"
+      | "attentionMore"
+      | "runFailedReason"
+      | "childRunFailedReason"
+      | "runErrorTimedOut"
+      | "runErrorUnknown"
+      | "attentionRequired"
+      | "openSession"
+      | "provider"
+      | "lastActive"
+      | "activeRun"
+      | "subagentsWorking"
+      | "showChildSessions"
+      | "hideChildSessions"
+      | "childSessions"
+      | "showMoreChildren"
+      | "archived"
+      | "unread"
+      | "automationAttached"
+      | "incognito"
+      | "incognitoLabel"
+      | "incognitoDescription"
+      | "incognitoLimits"
+      | "cloudWorkerPlacement"
+      | "placementWorkspaceConflict"
+      | "placementWorkspaceConflicts"
+      | "cloudWorkerDiskWarning"
+      | "cloudWorkerDiskCritical"
+      | "cloudWorkerDescendantConflict"
+      | "cloudWorkerDescendantConflicts"
+      | "sessionColor"
+      | "pinSession"
+      | "unpinSession"
+      | "forkedSession"
+      | "archiveSession"
+      | "restoreSession"
+      | "deleteSessionIdentityMissing"
+      | "groupMenu"
+      | "groupOptions"
+      | "newSessionInGroup"
+      | "groupDefaultsStale"
+      | "moveToTopLevel",
+      string
+    > & { colors: TranslationMap };
+  skillWorkshop: TranslationMap;
+  systems: TranslationMap;
+  talkPage: TranslationMap;
+  usage: TranslationMap & { overview: TranslationMap; details: TranslationMap };
+};
+
+const startupEnglish = {
+  pluginUi: {
+    retryView: "Retry plugin view",
+    inlineLoading: "Loading plugin view…",
+    inlineUnavailable:
+      "This view is unavailable. Check that its plugin is installed, enabled, and allowed for your account. Reload the conversation after installing or updating the plugin.",
+    dashboardTitle: "Session dashboard",
+    customPluginsDisabled: "Custom plugin UI is off",
+    customPluginsEnableHint: "Enable Custom plugin UI in Labs.",
+    openLabs: "Open Labs",
+    surface: {},
+  },
+  capacityMeter: {},
+  agentsHome: {
+    loadFailed: "Could not load agents. Try again.",
+  },
+  outputs: {
+    dashboard: "Dashboard",
+  },
   common: {
+    uploadsDisabled: "File and image uploads are disabled.",
     health: "Health",
     ok: "OK",
     yes: "Yes",
     no: "No",
+    default: "Default",
     active: "Active",
     loading: "Loading…",
+    gatewayStarting: "Gateway starting…",
     refreshing: "Refreshing…",
-    online: "Online",
     offline: "Offline",
     connect: "Connect",
     connected: "Connected",
     refresh: "Refresh",
+    retry: "Retry",
+    staleData: "Showing stale data.",
     reload: "Reload",
     reset: "Reset",
-    probe: "Probe",
+    restore: "Restore",
+    unarchive: "Unarchive",
+    undo: "Undo",
+    probe: "Check connection",
     call: "Call",
     confirm: "Confirm",
+    dontAskAgain: "Don't ask me again",
     cancel: "Cancel",
+    close: "Close",
+    previous: "Previous",
     next: "Next",
+    continue: "Continue",
     back: "Back",
     create: "Create",
     copy: "Copy",
     copied: "Copied!",
+    copyFailed: "Copy failed",
     copyCode: "Copy code",
+    copyTable: "Copy table",
+    expandTable: "Expand table",
+    expandedTable: "Expanded table",
+    closeTable: "Close expanded table",
+    resizeSplitView: "Resize split view",
     delete: "Delete",
+    remove: "Remove",
     dismiss: "Dismiss",
+    dismissAndDontShowAgain: "Dismiss and don't show again",
     unselect: "Unselect",
     enabled: "Enabled",
     disabled: "Disabled",
+    failed: "Failed",
     none: "none",
     na: "n/a",
     never: "never",
+    justNow: "just now",
+    now: "now",
+    unknown: "Unknown",
     configured: "Configured",
     running: "Running",
+    queued: "Queued",
+    completed: "Completed",
+    cancelled: "Cancelled",
     linked: "Linked",
     mode: "Mode",
     system: "System",
@@ -44,26 +441,31 @@ export const en: TranslationMap = {
     dark: "Dark",
     baseUrl: "Base URL",
     lastStart: "Last start",
-    lastProbe: "Last probe",
-    lastInbound: "Last inbound",
+    lastProbe: "Last connection check",
     lastConnect: "Last connect",
     lastMessage: "Last message",
     authAge: "Auth age",
     credential: "Credential",
     audience: "Audience",
     publicKey: "Public Key",
-    probeOk: "Probe ok",
-    probeFailed: "Probe failed",
+    probeOk: "Connection check passed",
+    probeFailed: "Connection check failed",
     reloadConfig: "Reload Config",
+    multiSelect: {
+      addCustom: "Add “{value}”",
+      noMatches: "No matches",
+      remove: "Remove {value}",
+    },
     loadConfig: "Load config",
     loadApprovals: "Load approvals",
     settingsSections: "Settings sections",
     version: "Version",
     docs: "Docs",
-    theme: "Theme",
+    learnMore: "Learn more",
     colorMode: "Color mode",
-    resources: "Resources",
+    colorModeOption: "Color mode: {mode}",
     search: "Search",
+    pickerNoMatches: "No matches",
     save: "Save",
     saving: "Saving…",
     saveAndPublish: "Save & Publish",
@@ -72,915 +474,940 @@ export const en: TranslationMap = {
     showAdvanced: "Show Advanced",
     hideAdvanced: "Hide Advanced",
     unsavedChanges: "You have unsaved changes",
-    secondsAgo: "{count}s ago",
     working: "Working…",
     showQr: "Show QR",
     relink: "Relink",
     waitForScan: "Wait for scan",
     logout: "Logout",
+    skipToMainContent: "Skip to main content",
+  },
+  focus: {
+    unsupported: "This focused view is not supported.",
+  },
+  shortcutsOverlay: { title: "Keyboard shortcuts" },
+  optionCard: {
+    recommended: "Recommended",
+    skip: "Skip for now",
+  },
+  nativeConversation: {
+    openDashboardFailed: "Couldn't open that page in the Dashboard",
+  },
+  nativeLinkMenu: {},
+  browserLinkPreferences: {
+    openInControlUi: "Open links in Control UI browser",
+  },
+  filePreview: {
+    bundle: {},
+    label: "Support files",
+  },
+  mcpApp: {},
+  sessionHovercard: {
+    ariaLabel: "Session information",
+    linkedChannel: "Linked to {channel}",
+    moreParticipants: "+{count}",
+    moreParticipantsLabel: "{count} more participants",
+    projectLabel: "Project",
+    workspaceLabel: "Workspace",
+    branchLabel: "Branch",
+    runsOn: "Runs on {providerId} · {profileId}",
+    machineLabel: "Machine",
+    machineCpu: "{cpu} vCPU",
+    machineMemory: "{memory} GB",
+    more: "+{count} more",
+    changedFile: "{count} file",
+    changedFiles: "{count} files",
+    states: {},
+    checks: {},
+  },
+  sessionProgressCard: {
+    composerTitle: "Task progress",
+
+    clearFailed: "Could not clear saved progress card.",
+    refresh: {},
+
+    activity: {},
+    outcome: {},
+
+    status: {},
+    receipt: {
+      updating: "Updating progress",
+      failed: "Progress update failed",
+      skipped: "Progress update skipped",
+      updated: "Progress updated — {completed}/{total} · {current}",
+      noteUpdated: "Progress note updated",
+      cleared: "Progress cleared",
+    },
   },
   channels: {
-    health: {
-      title: "Channel health",
-      subtitle: "Channel status snapshots from the gateway.",
-      noSnapshotYet: "No snapshot yet.",
+    lastError: {},
+    refreshingStaleSnapshot: {},
+    hub: {},
+    pairing: {},
+    setup: {},
+    config: {},
+    generic: {},
+    discord: {},
+    googleChat: {},
+    imessage: {},
+    signal: {},
+    slack: {},
+    telegram: {},
+    whatsapp: {
+      loggedOut: "Logged out.",
+      logoutNotCleared:
+        "No stored WhatsApp session was cleared. It may already be absent, or its auth directory may require manual cleanup.",
     },
-    generic: {
-      subtitle: "Channel status and configuration.",
-    },
-    gatewayUrlConfirmation: {
-      title: "Change Gateway URL",
-      subtitle: "This will reconnect to a different gateway server",
-      warning: "Only confirm if you trust this URL. Malicious URLs can compromise your system.",
-    },
-    nostr: {
-      profile: "Profile",
-      editProfile: "Edit Profile",
-      profilePicture: "Profile picture",
-      noProfile: "No profile set.",
-      noProfileHint: 'Click "Edit Profile" to add your name, bio, and avatar.',
-      name: "Name",
-      displayName: "Display Name",
-      about: "About",
-      advanced: "Advanced",
-      profilePicturePreview: "Profile picture preview",
-      account: "Account",
-      username: "Username",
-      usernameHelp: "Short username (e.g., satoshi)",
-      bio: "Bio",
-      bioPlaceholder: "Tell people about yourself...",
-      bioHelp: "A brief bio or description",
-      displayNameHelp: "Your full display name",
-      avatarUrl: "Avatar URL",
-      avatarHelp: "HTTPS URL to your profile picture",
-      bannerUrl: "Banner URL",
-      bannerHelp: "HTTPS URL to a banner image",
-      website: "Website",
-      websiteHelp: "Your personal website",
-      nip05Identifier: "NIP-05 Identifier",
-      nip05Help: "Verifiable identifier (e.g., you@domain.com)",
-      lightningAddress: "Lightning Address",
-      lightningHelp: "Lightning address for tips (LUD-16)",
-    },
+  },
+  agentStartup: {
+    title: "Starting up",
+    description: "The agent is getting ready. This view will load automatically.",
+    short: "Starting up…",
   },
   lazyView: {
-    loadingTitle: "Loading panel",
     errorTitle: "Panel failed to load",
-    errorSubtitle:
-      "Reload the page to load the latest Control UI bundle, or retry if the network request failed.",
+    genericSubtitle: "Something went wrong while loading this panel.",
+    staleTitle: "This view could not load",
+    staleSubtitle:
+      "Some interface files could not be downloaded. Check your connection, then reload.",
+    reloading: "Reloading…",
     retry: "Retry",
-    unknownError: "Unknown module load error.",
+    stylesFailed: "Styles failed to load, so the page may look broken.",
   },
-  nodes: {
-    binding: {
-      loadConfigHint: "Load config to edit bindings.",
-      formModeHint: "Switch the Config tab to Form mode to edit bindings here.",
-      execNodeBinding: "Exec node binding",
-      execNodeBindingSubtitle: "Pin agents to a specific node when using exec host=node.",
-      defaultBinding: "Default binding",
-      defaultBindingHint: "Used when agents do not override a node binding.",
-      node: "Node",
+  communityInvite: {
+    title: "Pull up a chair.",
+    body: "There’s a place for you in the AI future. Join the Community on Reddit, Discord, and X.",
+    join: "Join",
+    follow: "Follow",
+    dismissForever: "Dismiss and don't show again",
+    dismissFailed: "Invitation dismissed, but your preference couldn't be saved.",
+    joinPlatform: "Join the OpenClaw community on {platform}",
+    followPlatform: "Follow OpenClaw on {platform}",
+  },
+  updates: {
+    campaign: {
+      countdown: "Updating in {time}",
+      waitingForIdle: "Waiting for active work · forced update in {time}",
+      held: "Update held · resumes in {time}",
+      applying: "Applying update…",
     },
+
+    run: {
+      phase: {},
+    },
+    confirm: {},
+    target: {
+      version: "v{version}",
+      commitBehind: "{count} commit behind",
+      commitsBehind: "{count} commits behind",
+    },
+    sidebar: {
+      waitingForIdle: "Waiting for active work",
+    },
+    dialog: {},
+    channel: {},
+    installKind: {},
+    page: {},
+    coalescedRestart:
+      "Update installed. A gateway restart is already in progress; status will refresh after it reconnects.",
+    error: "Update error: {error}",
+    checkError: "Could not check for updates: {error}",
+    status: "Update {status}: {reason}. {guidance}",
+    verificationFailedWithIdentity:
+      "Update finished, but the running install does not match the expected revision. Expected {expected}, running {actual}. Run `openclaw triage` on the Gateway host before retrying.",
+    handoffTimeout:
+      "Update completion was not confirmed. Run `openclaw triage` on the Gateway host and inspect the result before retrying.",
+    outcomeUnknown:
+      "The update outcome is unknown. Run `openclaw triage` on the Gateway host and inspect the result before retrying.",
+    triage: {
+      hostHint:
+        "If Ask OpenClaw is unavailable, run `openclaw triage` on the Gateway host to open a local coding agent for diagnosis and repair. Diagnose the cause before retrying.",
+    },
+    report: {},
+    failureReasons: {
+      dirty: "Commit or stash changes, then retry.",
+      noUpstream: "Set an upstream branch, then retry.",
+      notGitInstall:
+        "Not a git checkout. Run `openclaw update` from the CLI for a global reinstall.",
+      notOpenclawRoot:
+        "Run the update from an OpenClaw checkout or use the CLI global reinstall path.",
+      depsInstallFailed: "Dependency install failed. Fix the install error and retry.",
+      buildFailed: "Build failed. Fix the build error and retry.",
+      buildDirty:
+        "The selected revision's build changed checkout files. Retry with a revision that includes its generated artifacts.",
+      uiBuildFailed: "The control UI rebuild failed. Fix the UI build error and retry.",
+      globalInstallFailed:
+        "The global package install did not verify on disk. Retry or reinstall from the CLI.",
+      restartDisabled:
+        "The update was not applied because gateway restarts are disabled. Enable restarts in config, then retry.",
+      restartUnavailable:
+        "This global install cannot be safely replaced while restarts are disabled and no supervisor is present.",
+      externalSupervisorUpdateRequired:
+        "This Gateway is managed by an external supervisor. Use your server or deployment's update workflow to update OpenClaw and restart the Gateway. The Control UI and `openclaw update` cannot update this installation. No package changes or Gateway restart were attempted.",
+      restartUnhealthy:
+        "The replacement process never became healthy. The previous process stayed up so you can recover.",
+      restartRevisionMismatch:
+        "The restarted Gateway is running a different revision. Check the service install root and retry.",
+      restartRevisionUnavailable:
+        "The restarted Gateway could not report its revision. Check the service install root and logs before retrying.",
+      alreadyCurrent: "This checkout is already at its tracked upstream revision.",
+      managedServiceHandoffAlreadyRunning:
+        "Another managed update is already running. Wait for it to complete, then refresh update status.",
+      managedServiceHandoffUnavailable:
+        "Stop the foreground Gateway, run `openclaw update`, then launch it again. For automatic updates, install a managed Gateway service.",
+      doctorFailed: "Doctor repair failed. Run `openclaw doctor --non-interactive` and retry.",
+      managedServiceHandoffFailed:
+        "The update helper stopped before finishing. Run `openclaw update` in the terminal to see why.",
+      managedServiceHandoffSpawnFailed:
+        "The Gateway could not start the update helper. Run `openclaw update` in the terminal instead.",
+      managedServiceHandoffParentTimeout:
+        "The Gateway stayed up too long for the update helper. Start the update again, or run `openclaw update`.",
+      default: "See the gateway logs for the exact failure and retry once the cause is fixed.",
+    },
+    failedAtStep: "The update failed at {step}: {cause}.",
+    succeededVersion: "Gateway updated to v{version}.",
+    succeededCommit: "Gateway updated · now on {sha}.",
+    succeeded: "Gateway updated and restarted.",
   },
-  instances: {
-    title: "Connected Instances",
-    subtitle: "Presence beacons from the gateway and clients.",
-    showHosts: "Show hosts and IPs",
-    hideHosts: "Hide hosts and IPs",
-    toggleHostVisibility: "Toggle host visibility",
-    noInstances: "No instances reported yet.",
-    lastInput: "Last input {time}",
-    reason: "Reason {reason}",
+  devices: {
+    readOnly: {},
+    // The trigger and load failure stay eager; dialog copy follows its lazy renderer.
+    pairing: {
+      button: "Pair device",
+      adminRequired: "Administrator access is required to create setup codes.",
+      title: "Pair a device",
+      loadFailed: "Could not load the pairing dialog. Check your connection and try again.",
+    },
+    binding: {},
+    inventory: {},
+    // Lazy: en-devices.ts registers this subtree when the Devices page renders chips.
+    capabilities: {},
+    execApprovals: {},
+  },
+  worktrees: {},
+  agentChip: agentEn.agentChip,
+  agentScope: agentEn.agentScope,
+  newSession: {
+    title: "New session",
+    hint: "Pick where this session works, then say what to do.",
+    placementReloadBlocked: "Recovery needs a reload. Unsaved starts will be lost.",
+    discardUnsavedAndReload: "Discard unsaved starts and reload",
+  },
+  dashboardsPage: {},
+  dashboardDocument: {
+    close: "Close dashboard",
+    missingSession: "No dashboard session was specified.",
+    notFound: "This session could not be found.",
+    unavailable: "Session dashboards are unavailable for this connection.",
+    loadFailed:
+      "Could not load this dashboard: {error}. Check the Gateway connection and try again.",
   },
   sessionsView: {
-    title: "Sessions",
-    subtitle: "Active session keys and per-session overrides.",
-    store: "Store: {path}",
-    active: "Updated within",
-    limit: "Limit",
-    filters: "Filters",
-    showFilters: "Show filters",
-    hideFilters: "Hide filters",
-    sourceFilters: "Session source filters",
-    global: "Global",
-    unknown: "Unknown",
-    showArchived: "Show archived",
-    activeTooltip: "Loads sessions updated in the last {count} minutes.",
-    limitTooltip: "Max sessions to load.",
-    globalTooltip: "Include global sessions.",
-    unknownTooltip: "Include unknown sessions.",
-    showArchivedTooltip: "Include archived sessions.",
-    minutesPlaceholder: "min",
-    searchPlaceholder: "Filter by key, agent, label, kind…",
-    selected: "{count} selected",
-    deleteSelected: "Delete",
-    selectAllOnPage: "Select all on page",
-    selectSession: "Select session",
-    optionalPlaceholder: "(optional)",
-    key: "Key",
-    label: "Label",
-    kind: "Kind",
-    updated: "Updated",
-    tokens: "Tokens",
-    compaction: "Compaction",
-    goal: "Goal",
-    goalNote: "Goal note",
-    thinking: "Thinking",
-    fast: "Fast",
-    verbose: "Verbose",
-    reasoning: "Reasoning",
-    actions: "Actions",
-    addToWorkboard: "Add to Workboard",
-    openWorkboardCard: "Open Workboard card",
-    noSessions: "No sessions found.",
-    noSessionsMatchFilters: "No sessions match your filters.",
-    showAll: "Show all",
-    inherit: "inherit",
-    defaultOption: "Default ({value})",
-    offExplicit: "off (explicit)",
-    auto: "auto",
-    on: "on",
-    off: "off",
-    full: "full",
-    stream: "stream",
-    customOption: "{value} (custom)",
-    manual: "manual",
-    autoThreshold: "auto-threshold",
-    overflowRetry: "overflow retry",
-    timeoutRetry: "timeout retry",
-    tokenRange: "{before} to {after} tokens",
-    tokensBefore: "{count} tokens before",
-    tokenDeltaUnavailable: "token delta unavailable",
-    checkpoints: "{count} Checkpoints",
-    checkpoint: "{count} Checkpoint",
-    showSessionDetails: "Show session details for {count}",
-    hideSessionDetails: "Hide session details for {count}",
-    sessionDetails: "Session details",
-    compactionHistory: "Compaction history",
+    pullRequestCount: "{count} pull requests",
+    subagentPrefix: "Subagent:",
+    automationPrefix: "Automation:",
+    actionRequiresConnection: "Connect to the Gateway to change sessions.",
+    actionUnavailable: "This Gateway does not support this session action.",
+    actionRequiresScope: "This action requires {scope} access.",
+    actionRequiresOwnership: "Only the session creator or an admin can make this change.",
+    draftCleanupFailed: "Session deleted; browser draft remains. Clear site data.",
+    createdBy: "Created by {name}",
+    ownedBy: "Owned by {name}",
+    archivedBy: "Archived by {name}",
+    viewingNow: "viewing now",
+    owners: "Owners",
+    allOwners: "All owners",
+    involvingMe: "Involving me",
+    withParticipant: "with {name}",
+    withMoreParticipants: "+{count} more",
+    snoozeWakes: "Wakes {time}",
+    snoozeTomorrowTime: "tomorrow {time}",
+    user: "User",
+    assistant: "Assistant",
+    opensAsDashboard: "Opens as dashboard",
+    approvalNeeded: "Approval needed",
+    messageNeedsAttention: "{count} message needs attention",
+    messagesNeedAttention: "{count} messages need attention",
+    unsentDraft: "Unsent draft",
+    noArchivedSessions: "No archived sessions.",
     status: "Status",
     statusLive: "Live",
     statusIdle: "Idle",
     statusUnknown: "Unknown",
+    statusQueued: "Queued",
     statusRunning: "Running",
     statusDone: "Done",
     statusFailed: "Failed",
+    statusInterrupted: "Interrupted",
     statusKilled: "Killed",
     statusTimeout: "Timed out",
-    model: "Model",
+    waitingForAnswer: "Waiting for your answer",
+    waitingForApproval: "Waiting for approval",
+    questionsNeedAnswer: "{count} questions need your answer",
+    approvalsNeedApproval: "{count} requests need approval",
+    attentionMore: "+{count} more",
+    runFailedReason: "Run failed: {reason}",
+    childRunFailedReason: "Child session {label} failed: {reason}",
+    runErrorTimedOut: "Timed out",
+    runErrorUnknown: "Unknown error",
+    attentionRequired: "Session needs attention",
+    openSession: "Open session",
     provider: "Provider",
-    runtime: "Runtime",
-    surface: "Surface",
-    subject: "Subject",
-    room: "Room",
-    space: "Space",
-    sessionId: "Session ID",
+    lastActive: "Last active {time}",
     activeRun: "Active run",
+    subagentsWorking: "Subagents working",
+    showChildSessions: "Show {count} child sessions for {session}",
+    hideChildSessions: "Hide {count} child sessions for {session}",
+    childSessions: "Child sessions",
+    showMoreChildren: "Show {count} more",
     archived: "Archived",
-    loadingCheckpoints: "Loading checkpoints…",
-    noCheckpoints: "No compaction checkpoints recorded for this session.",
-    noSummary: "No summary captured.",
-    branchFromCheckpoint: "Branch from checkpoint",
-    restoreCheckpoint: "Restore checkpoint",
+    unread: "Unread",
+    automationAttached: "Automation attached",
+    incognito: "Incognito session",
+    incognitoLabel: "Incognito",
+    incognitoDescription:
+      "Incognito session. History expires 24 hours after creation or when the Gateway restarts, whichever comes first.",
+    incognitoLimits:
+      "Your model provider still processes messages. Tools, plugins, and uploads may save data.",
+    cloudWorkerPlacement: "Placement: {state}",
+    placementWorkspaceConflict: "{placement} · 1 workspace conflict",
+    placementWorkspaceConflicts: "{placement} · {count} workspace conflicts",
+    cloudWorkerDiskWarning: "Cloud session disk space is low",
+    cloudWorkerDiskCritical: "Cloud session disk space is critically low",
+    cloudWorkerDescendantConflict: "Cloud worker child: 1 workspace conflict",
+    cloudWorkerDescendantConflicts: "Cloud worker children: {count} workspace conflicts",
+    sessionColor: "Session color: {color}",
+    colors: {
+      red: "Red",
+      blue: "Blue",
+      green: "Green",
+      yellow: "Yellow",
+      purple: "Purple",
+      orange: "Orange",
+      pink: "Pink",
+      cyan: "Cyan",
+    },
+    pinSession: "Pin session",
+    unpinSession: "Unpin session",
+    forkedSession: "Forked session",
+    archiveSession: "Archive session",
+    restoreSession: "Restore session",
+    deleteSessionStale: {},
+    deleteSessionIdentityMissing:
+      'Cannot queue deletion of "{session}" without its session identity. Refresh after reconnecting and try again.',
+    deleteSessionsStale: {},
+    groupMenu: "Group options for {group}",
+    groupOptions: "Group options",
+    newSessionInGroup: "New session in {group}",
+    groupDefaultsStale: "Gateway connection replaced before the defaults were saved. Try again.",
+    moveToTopLevel: "Move to top level",
   },
   agents: {
     noAgents: "No agents",
-    copyId: "Copy ID",
-    copyIdTitle: "Copy agent ID to clipboard",
+    createdBy: {},
+    defaults: {},
+    copyId: {},
     default: "Default",
-    setDefault: "Set Default",
-    alreadyDefaultTitle: "Already the default agent",
-    setDefaultTitle: "Set as the default agent",
-    selectTitle: "Select an agent",
-    selectSubtitle: "Pick an agent to inspect its workspace and tools.",
-    tabs: {
-      overview: "Overview",
-      files: "Files",
-      tools: "Tools",
-      skills: "Skills",
-      channels: "Channels",
-      cronJobs: "Cron Jobs",
+    setDefault: {},
+    ...agentEn.pinning,
+    selectTitle: {},
+    selectSubtitle: {},
+    tabs: {},
+    context: {},
+    identity: {},
+    overview: {
+      title: {},
+      subtitle: {},
+      selectedSkills: "{count} selected",
+      allSkills: "all skills",
+      unsavedConfig: {},
+      modelSelection: {},
+      primaryModel: {},
+      primaryModelDefault: {},
+      notSet: {},
+      inheritDefault: {},
+      inheritDefaultModel: {},
+      fallbacks: {},
+      addFallback: {},
     },
-    context: {
-      title: "Agent Context",
-      workspace: "Workspace",
-      openFilesTab: "Open Files tab",
-      primaryModel: "Primary Model",
-      runtime: "Runtime",
-      thinkingDefault: "Thinking Default",
-      identityName: "Identity Name",
-      identityAvatar: "Identity Avatar",
-      skillsFilter: "Skills Filter",
-      default: "Default",
-      configurationSubtitle: "Workspace, identity, and model configuration.",
-      schedulingSubtitle: "Workspace and scheduling targets.",
-    },
-    channels: {
-      title: "Channels",
-      subtitle: "Gateway-wide channel status snapshot.",
-      lastRefresh: "Last refresh: {time}",
-      loadHint: "Load channels to see live status.",
-      empty: "No channels found.",
-      connectedCount: "{connected}/{total} connected",
-      noAccounts: "no accounts",
-      configuredCount: "{count} configured",
-      notConfigured: "not configured",
-      enabledCount: "{count} enabled",
-      setupGuide: "Setup guide",
-    },
-    cronPanel: {
-      schedulerTitle: "Scheduler",
-      schedulerSubtitle: "Gateway cron status.",
-      jobs: "Jobs",
-      nextWake: "Next wake",
-      agentJobsTitle: "Agent Cron Jobs",
-      agentJobsSubtitle: "Scheduled jobs targeting this agent.",
-      noJobs: "No jobs assigned.",
-      runNow: "Run Now",
-    },
-    files: {
-      emptyDraft: "Empty draft",
-      minRead: "{count} min read",
-      markdownPreview: "Markdown Preview",
-      extensionPreview: "{ext} Preview",
-      preview: "Preview",
-      expandPreview: "Expand preview",
-      collapsePreview: "Collapse preview",
-      editFile: "Edit file",
-      closePreview: "Close preview",
-      coreFilesTitle: "Core Files",
-      coreFilesSubtitle: "Bootstrap persona, identity, and tool guidance.",
-      workspace: "Workspace",
-      loadHint: "Load the agent workspace files to edit core instructions.",
-      empty: "No files found.",
-      missing: "missing",
-      selectFile: "Select a file to edit.",
-      previewMarkdownTitle: "Preview rendered markdown",
-      willCreateOnSave: "Will Create on Save",
-      liveDraftPreview: "Live Draft Preview",
-      savedPreview: "Saved Preview",
-      updated: "Updated {time}",
-      notCreatedYet: "Not Created Yet",
-      updatedUnknown: "Updated Unknown",
-      missingHint: "This file is missing. Saving will create it in the agent workspace.",
-      content: "Content",
-      words: "{count} words",
-      lines: "lines",
-    },
+    toolCatalog: {},
+    skillsPanel: {},
+    channels: {},
+    cronPanel: {},
+    files: {},
   },
   debug: {
-    snapshotsTitle: "Snapshots",
-    snapshotsSubtitle: "Status, health, and heartbeat data.",
-    status: "Status",
-    health: "Health",
-    lastHeartbeat: "Last heartbeat",
-    security: {
-      audit: "Security audit",
-      critical: "{count} critical",
-      warnings: "{count} warnings",
-      noCriticalIssues: "No critical issues",
-      info: "{count} info",
-      runPrefix: "Run",
-      runSuffix: "for details.",
+    lanes: {},
+    overlay: {
+      title: "System busyness",
     },
-    manualRpcTitle: "Manual RPC",
-    manualRpcSubtitle: "Send a raw gateway method with JSON params.",
-    method: "Method",
-    selectMethod: "Select a method…",
-    paramsJson: "Params (JSON)",
-    modelsTitle: "Models",
-    modelsSubtitle: "Catalog from models.list.",
-    eventLogTitle: "Event Log",
-    eventLogSubtitle: "Latest gateway events.",
-    noEvents: "No events yet.",
   },
+  configForm: {
+    hideValue: "Hide value",
+    revealValue: "Reveal value",
+    defaultValue: "Default: {value}",
+    sections: {},
+  },
+  // Historical namespace from the pre-restructure "quick settings" page; its
+  // keys now serve Models, Privacy & Security, Appearance, and Profile.
+  // Renaming would force retranslation of every key, so the name stays.
   quickSettings: {
-    security: {
-      browserEnabled: "Browser enabled",
-      toolProfile: "Tool profile",
+    appearance: {
+      lobsterVisits: "Lobster visits",
     },
+    personal: {
+      browserOnly: "Stored in this browser only.",
+    },
+  },
+  configPage: {},
+  configView: {
+    adminRequired: "Configuration changes require operator.admin access.",
+    categories: {},
+    sections: {},
+    themes: {},
+    textSizes: {},
+    notifications: {},
+    appearance: {},
+    chatPrefs: {},
+    sidebarPrefs: {},
+    sessionObserver: {},
+    connection: {},
+    fileOpenedOnGateway: "Configuration file opened on Gateway host.",
+    recoveryNotRestored:
+      "Settings could not be restored. Your draft is kept. Check {path} before saving again.",
+    recoveryUnknown:
+      "Settings restoration could not be confirmed. Your draft is kept. Check {path} before saving again.",
+    recoveryBackup: "Inspect the recovery backup at {path}.",
+    discardUnconfirmed:
+      "The last save could not be confirmed. Your draft is kept. Reload configuration before discarding this setting.",
+    writeGatewayChanged:
+      "This unsettled change belongs to a different Gateway. Reconnect to that Gateway to retry, or discard the draft.",
+    writeUnconfirmed:
+      "The last configuration change could not be confirmed. Your draft is kept. Retry before changing other settings.",
+    reloadBlocked: "Finish saving or discard pending config changes before reloading.",
+    rawDraftBlocksApply: "Save or discard edits in the Raw editor before applying changes.",
+    rawDraftBlocksFormEdit:
+      "Unsaved raw config edits could not be parsed; resolve them in the Raw editor before changing settings.",
+    rawDraftUnverified:
+      "Cannot verify the raw draft against the saved configuration; reload and retry.",
   },
   execApproval: {
-    expiresIn: "expires in {time}",
-    expired: "expired",
-    execApprovalNeeded: "Exec approval needed",
-    pluginApprovalNeeded: "Plugin approval needed",
-    pending: "{count} pending",
-    allowOnce: "Allow once",
-    alwaysAllow: "Always allow",
-    allowAlwaysUnavailable:
-      "The effective approval policy requires approval every time, so Allow Always is unavailable.",
-    deny: "Deny",
-    labels: {
-      host: "Host",
-      agent: "Agent",
-      session: "Session",
-      cwd: "CWD",
-      resolved: "Resolved",
-      security: "Security",
-      ask: "Ask",
-      severity: "Severity",
-      plugin: "Plugin",
+    scope: {
+      standingGrant:
+        'Always allow runs this exact command for "{automation}" without asking, until revoked (revocable)',
+      standingGrantDays:
+        'Always allow runs this exact command for "{automation}" without asking, for {count} days (revocable)',
+      messageSend: "Sends to {count} recipient(s) via {target}",
+      payment: "Pays {amount} {currency} to {target}",
+      externalPost: "Posts externally to {target}",
     },
+
+    agentPendingOne: "{count} pending approval",
+    agentPending: "{count} pending approvals",
+
+    reviewOnly: "You don’t have permission to approve.",
+
+    labels: {},
   },
-  agentTools: {
-    connectedSource: "Connected: {id}",
-    connected: "Connected",
-    channelSource: "Channel: {id}",
-    channel: "Channel",
-    builtIn: "Built-in",
-  },
+  approvalPage: {},
+  agentTools: {},
+  skillGroups: {},
+  skillsPage: {},
+  skillStatus: {},
   nav: {
-    chat: "Chat",
-    control: "Control",
-    agent: "Agent",
+    gateway: {
+      sectionLabel: "Gateway",
+      menuLabel: "Gateway: {gateway}",
+      primaryTag: "primary",
+      setPrimary: "Set as primary…",
+      openSettings: "Gateway settings",
+      connected: "Connected",
+      unreachable: "Unreachable",
+      unknown: "Unknown status",
+    },
+    owner: "Owner",
+    back: "Back",
+    forward: "Forward",
     settings: "Settings",
+    askOpenClaw: "Ask OpenClaw",
+    askBrand: "Ask {brand}",
+    settingsGroupDevice: "This Mac",
+    settingsGroupThisComputer: "This computer",
+    settingsGroupThisIPhone: "This iPhone",
+    settingsGroupThisIPad: "This iPad",
+    settingsGroupThisDevice: "This device",
+    settingsGroupConnections: "Connections",
+    settingsGroupAgents: "Agents & Tools",
+    settingsGroupSecurity: "Privacy & Security",
+    settingsGroupSystem: "System",
+    settingsSearchLabel: "Search settings",
+    settingsSearchPlaceholder: "Search settings…",
+    settingsSearchNoResults: "No matching settings.",
+    settingsSearchClear: "Clear settings search",
+    settingsLoadFailed: "Settings navigation could not load.",
+    exitSettings: "Back to app",
     expand: "Expand sidebar",
     collapse: "Collapse sidebar",
     resize: "Resize sidebar",
+    more: "More",
+    home: "Home",
+    pages: "Pages",
+    pin: "Pin",
+    unpin: "Unpin",
+    customize: "Edit pinned items",
+    customizeReset: "Reset pinned items",
+    workboardGroup: "WorkBoard",
+  },
+  terminal: {
+    title: "Terminal",
+    toggle: "Toggle terminal",
+    open: "Open terminal",
+    startCancelled: "Terminal start was cancelled. Try again.",
+    unavailable: "The terminal is not available on this gateway.",
+  },
+  browser: {
+    nativeTab: {},
+    remoteTab: {},
+    stop: {},
+    profile: {},
+    title: "Browser",
+    open: "Open",
+    openPanel: "Open browser panel",
+    moreActions: "More actions",
+    copyUrl: "Copy URL",
+    openNewTab: "Open in new tab",
+    openWithinOpenClaw: "Open in OpenClaw",
+    toggle: "Toggle browser panel",
+    close: {},
+    resize: {},
+    newTab: "New tab",
+    closeTab: "Close tab",
+    untitledTab: {},
+    tweetPost: "Post on X",
+    openPost: "Open post",
+    back: {},
+    forward: {},
+    reload: {},
+    openExternal: "Open in your browser",
+    urlPlaceholder: {},
+    dockBottom: {},
+    dockRight: {},
+    annotate: {},
+    inspect: {},
+    annotateSend: {},
+    annotateUndo: {},
+    annotateClear: {},
+    annotateDone: {},
+    annotateHint: {},
+    inspectName: {},
+    inspectRole: {},
+    inspectFocusable: {},
+    loading: {},
+    notRunning: {},
+    start: {},
+    errors: {},
+    annotatePrompt: {},
+  },
+  desktop: {
+    title: "Desktop",
+    openWindow: "Open desktop in new window",
+    unavailable: "Desktop viewing is unavailable for this connection.",
+    toggle: "Toggle desktop panel",
+    reconnect: "Reconnect",
+    connecting: "Connecting to desktop…",
+  },
+  systems: {},
+  routeTitles: {
+    modelProviders: "Models",
+    notifications: "Notifications",
+    advanced: "Advanced",
   },
   tabs: {
+    device: "This Mac",
+    devicePermissions: "Permissions",
+    agentsHome: "Agents",
     agents: "Agents",
     activity: "Activity",
-    overview: "Overview",
+    meetings: "Meetings",
+    apps: "Apps",
+    portals: "Portals",
+    approvals: "Approvals",
     workboard: "Workboard",
+    worktrees: "Worktrees",
     channels: "Channels",
-    instances: "Instances",
+    connection: "Gateway",
     sessions: "Sessions",
+    systems: "Systems",
     usage: "Usage",
-    cron: "Cron Jobs",
+    cron: "Automations",
     skills: "Skills",
-    skillWorkshop: "Skill Workshop",
-    nodes: "Nodes",
+    plugins: "Plugins",
+    skillWorkshop: "Skill workshop",
+    devices: "Devices",
+    claws: "Claws",
+    cloudWorkers: "Cloud environments",
     chat: "Chat",
-    config: "Config",
+    dashboards: "Dashboards",
+    custodian: "OpenClaw",
+    profile: "Profile",
     communications: "Communications",
     appearance: "Appearance",
+    lobsterdex: "Lobsterdex",
     automation: "Automation",
     mcp: "MCP",
+    memory: "Memory",
+    search: "Search",
+    talk: "Talk",
     infrastructure: "Infrastructure",
-    aiAgents: "AI & Agents",
+    labs: "Labs",
+    updates: "Updates",
+    about: "About",
+    aiAgents: "Agent Defaults",
+    modelSetup: "Model Setup",
+    memoryImport: "Import Memory",
+    security: "Privacy & Security",
+    secrets: "Secrets",
     debug: "Debug",
     logs: "Logs",
-    dreams: "Dreaming",
+    plugin: "Plugin",
   },
-  subtitles: {
-    agents: "Workspaces, tools, identities.",
-    activity: "Browser-local tool activity summaries.",
-    overview: "Status, entry points, health.",
-    workboard: "Agent work queue and session handoff.",
-    channels: "Channels and settings.",
-    instances: "Connected clients and nodes.",
-    sessions: "Active sessions and defaults.",
-    usage: "API usage and costs.",
-    cron: "Wakeups and recurring runs.",
-    skills: "Skills and API keys.",
-    skillWorkshop: "Review, refine, and apply proposals before they become live skills.",
-    nodes: "Paired devices and commands.",
-    chat: "Gateway chat for quick interventions.",
-    config: "Edit openclaw.json.",
-    communications: "Channels, messages, and audio settings.",
-    appearance: "Theme, UI, and setup wizard settings.",
-    automation: "Commands, hooks, cron, and plugins.",
-    mcp: "MCP servers, auth, tools, and diagnostics.",
-    infrastructure: "Gateway, web, browser, and media settings.",
-    aiAgents: "Agents, models, skills, tools, memory, session.",
-    debug: "Snapshots, events, RPC.",
-    logs: "Live gateway logs.",
-    dreams: "Memory dreaming, consolidation, and reflection.",
+  subtitles: {},
+  meetingCapture: {
+    title: "Meeting capture",
+    description: "Choose which sources can save meeting notes on this Gateway.",
+    sources: "Auto-start sources",
   },
-  skillWorkshop: {
-    header: {
-      useCurrentChat: "Use current chat",
-      useCurrentChatAria: "Use current chat for revision requests",
-      useCurrentChatTooltip:
-        "Send revision requests to the current chat session instead of the proposal's workshop session.",
+  cloudWorkersPage: {},
+  portalsPage: {},
+  modelSetup: {
+    discovery: {},
+    missingAuth: "No provider credential is configured for this model. Set it up in Model Setup.",
+    commandHint: "Try /models or /help.",
+    heading: {},
+    intro: {},
+    required: {
+      title: "No AI provider configured",
+      body: "Connect a provider and choose a model to send messages.",
+      action: "Connect an AI provider",
+    },
+    loading: {},
+    testing: {},
+    retry: {},
+    checkAgain: {},
+    recovery: {},
+    verify: {},
+    access: {},
+    candidates: {
+      title: {},
+      recommended: {},
+      credentialsReady: {},
+      signInNeeded: "Sign-in needed",
+      detected: {},
+      testAndUse: {},
+      retry: {},
+      testingButton: {},
+    },
+    nativeDiscovery: {},
+    nativeModels: {},
+    empty: {},
+    signIn: {},
+    prepare: {},
+    manual: {},
+    success: {},
+    utility: {},
+    failure: {
+      auth: "Authentication failed",
+    },
+    failureGuidance: {
+      auth: "Review the provider credential or sign-in, then retry.",
+    },
+    errors: {},
+    wizard: {},
+    waitingForApproval: {},
+    providerConnected: {},
+  },
+  memoryImport: {},
+  onboarding: {
+    memoryImport: {
+      title: "Bring your assistant memory with you",
     },
   },
+  assistantPanel: {
+    title: "Assistant sidebar",
+    home: "Home",
+    toggle: "Talk to your Home agent",
+    openHome: "Open Home full page",
+    close: "Close assistant sidebar",
+    resize: "Resize assistant sidebar",
+    dockBottom: "Dock assistant sidebar at bottom",
+    dockRight: "Dock assistant sidebar at right",
+
+    contextOff: "Work context off",
+  },
+  custodian: {
+    title: {},
+    subtitleCaretaker: {},
+    exitSetup: {},
+    newAgent: "New agent",
+    hatchDraft: {},
+    placeholder: {},
+    sensitivePlaceholder: {},
+    sensitiveReply: {},
+    cancel: {},
+    send: {},
+    thinking: {},
+    earlier: {},
+    requestFailed: {},
+    connectionChanged: {},
+    sessionRestarted: {},
+    unsupportedGateway: {},
+    accessRequired: {},
+    autoSetup: { thisComputer: "This computer" },
+    panel: {},
+    history: {},
+    nudge: {},
+  },
+  mcpServers: {},
+  mcpPage: {},
+  talkPage: {},
+  memoryPage: {},
+  sessionsPage: {
+    hubTablistLabel: "Session sections",
+  },
+  pluginsPage: {
+    installed: "Installed",
+    official: "Official",
+    install: "Install",
+  },
+  labsPage: {
+    intro:
+      "Labs contains experimental capabilities that may change, break, or disappear between releases.",
+    sectionTitle: "Experimental features",
+    sectionDescription:
+      "Changes save without restarting the Gateway. Code Mode and Tool Search apply to future agent runs.",
+    documentation: "Documentation",
+    restartRequired: "Gateway restart required.",
+    saveErrorTitle: "Could not update feature",
+    saveFailed: "The feature setting could not be saved.",
+    decisionAssistance: {},
+    codeMode: {},
+
+    swarm: {
+      title: "Swarm",
+
+      defaultPhase: "Unphased",
+    },
+    toolSearch: {},
+
+    customPluginUi: {},
+
+    hostDesktop: {},
+    workerDesktop: {},
+  },
+  aboutPage: {
+    artifactDetails: "Control UI build details",
+    commit: "Commit",
+    built: "Built",
+    unavailable: "Unavailable",
+    copyCommit: "Copy full commit hash",
+    copiedCommit: "Commit hash copied",
+    gateway: "Gateway",
+  },
+  appsPage: {},
+  presence: {
+    sharedOwner: {
+      name: "Shared owner",
+      named: "{name} · Shared owner",
+      hint: "Connected with the Gateway token or over a tunnel, not a personal sign-in.",
+    },
+    rosterTitle: "Online",
+    usersTitle: "Users",
+    allUsers: "All users",
+    directoryFailed: "Could not load all users. Retry",
+    filters: {
+      label: "Filter & sort people",
+      noMatches: "No people match this filter",
+      presence: "Active people first",
+      reset: "Reset to defaults",
+      running: "Running sessions",
+      total: "Total sessions",
+      name: "Name",
+    },
+    active: "Active",
+    onlineActive: "Online · Active",
+    onlineIdle: "Online · Idle",
+    idle: "Idle",
+    offline: "Offline",
+    sessions: {
+      openCount: "{count}\u00a0open",
+      runningCount: "{count}\u00a0running",
+      openHint:
+        "Owned, unarchived conversations you can access across agents. Excludes hidden subagents, automation, and system sessions.",
+      runningHint: "Open sessions actively executing an agent turn. Queued work is not running.",
+      counts: "{open} open sessions, {running} running",
+      unavailable: "Session counts unavailable",
+      retry: "Counts may be out of date. Retry",
+    },
+    card: {
+      details: "Details for {name}",
+      loadFailed: "Could not open details. Try again, or open this person’s Activity page.",
+      ariaLabel: "Activity for {name}",
+      person: "Person",
+      onlineFor: "Online for",
+      where: "Where",
+      reportedTimeZone: "Reported time zone: {zone}",
+      lastActivity: "Last interaction",
+      notObserved: "Activity unavailable",
+      viewingNow: "Viewing now",
+      recentSessions: "Recent sessions",
+      noVisibleSessions: "No visible sessions being viewed.",
+      noRecentSessions: "No recent visible sessions.",
+      sessionUpdated: "Session updated",
+      ago: "ago",
+      viewActivity: "View activity",
+      web: "Web app",
+      cli: "Command line",
+      terminal: "Terminal",
+      app: "App",
+    },
+  },
+  activityFeed: {
+    showing: "Showing {shown} of {total}",
+    viewingNow: "Viewing now",
+  },
+  githubPublication: {
+    newAction: "Choose a new publication",
+    capacity:
+      'Too many publications are awaiting review. Finish an existing publication, then select "{newAction}" to make room. Existing retries remain available.',
+  },
+  githubConnections: {
+    title: "GitHub connections",
+    mine: "My GitHub",
+    system: "System GitHub",
+    forMe: "For me",
+    forSystem: "For the system",
+  },
+  profilePage: {
+    personalInstructions: {
+      title: "Personal instructions",
+      description:
+        "Tell this agent about you and how you like to work. This edits only your personal USER.md, not the shared workspace file.",
+    },
+    offline: "Connect to the gateway to meet your agent.",
+    access: {},
+    usageStatistics: "Usage statistics",
+    usageStatisticsDescription: "View activity, costs, and usage trends.",
+    identity: {
+      title: "Identity",
+      menuLabel: "Identity menu",
+      menuButtonLabel: "Identity and app menu for {name}",
+      description: "Your profile on this gateway.",
+      avatar: "Avatar",
+      chooseAvatar: "Choose image",
+      displayName: "Display name",
+      linkedEmails: "Linked emails",
+    },
+    modelAccounts: {},
+  },
+  skillWorkshop: {},
+  // Chat swarm summaries render before the lazy Activity catalog loads.
+  // Keep their shared label in startup English; Activity replaces the full namespace on entry.
   activity: {
-    title: "Activity",
-    subtitle: "Ephemeral tool activity derived from live session events.",
-    visibleCount: "{visible} of {total}",
-    filtersLabel: "Activity filters",
-    search: "Search",
-    searchPlaceholder: "Filter by tool, summary, run, session",
-    toolFilter: "Tool",
-    allTools: "All tools",
-    statusFilters: "Status filters",
-    autoFollow: "Auto-follow",
-    expandAll: "Expand all",
-    collapseAll: "Collapse all",
-    clear: "Clear",
-    empty: "No tool activity yet.",
-    emptyFiltered: "No activity matches these filters.",
-    entrySummary: "{argumentSummary}",
-    argumentHiddenOne: "1 argument hidden",
-    argumentsHidden: "{count} arguments hidden",
-    streamLabel: "Tool activity entries",
-    toolCallId: "Tool call",
-    runId: "Run",
-    session: "Session",
-    outputTruncated: "Preview redacted and truncated.",
-    noOutputPreview: "No output preview.",
     status: {
-      running: "Running",
-      done: "Done",
-      error: "Error",
-    },
-    duration: {
-      ms: "{count} ms",
-      seconds: "{count} s",
-      minutes: "{minutes}m {seconds}s",
-    },
-  },
-  logsView: {
-    title: "Logs",
-    subtitle: "Gateway file logs (JSONL).",
-    exportButton: "Export {label}",
-    exportLabels: {
-      filtered: "filtered",
-      visible: "visible",
-    },
-    filter: "Filter",
-    searchPlaceholder: "Search logs",
-    autoFollow: "Auto-follow",
-    file: "File: {file}",
-    truncated: "Log output truncated; showing latest chunk.",
-    empty: "No log entries.",
-  },
-  workboard: {
-    disabledHelpStart: "Workboard is disabled. Enable",
-    enableConfigKey: "plugins.entries.workboard.enabled = true",
-    disabledHelpEnd: ", then reload this tab.",
-    status: {
-      triage: "Triage",
-      backlog: "Backlog",
-      todo: "Todo",
-      scheduled: "Scheduled",
-      ready: "Ready",
-      running: "Running",
-      review: "Review",
-      blocked: "Blocked",
       done: "Done",
     },
-    noLinkedSession: "No linked session",
-    stopSession: "Stop session",
-    editCard: "Edit card",
-    editCardHelp: "Update queue metadata and session handoff.",
-    newCard: "New card",
-    newCardHelp: "Queue work for an agent session.",
-    archiveCard: "Archive card",
-    unarchiveCard: "Restore from archive",
-    archived: "Archived",
-    deleteCard: "Delete card",
-    viewDetails: "View details",
-    detailTitle: "Card details",
-    detailTask: "Gateway task",
-    detailRun: "Run",
-    detailUpdated: "Updated",
-    detailProof: "Proof",
-    detailDiagnostics: "Diagnostics",
-    detailWorkerLogs: "Worker logs",
-    detailWorkerProtocol: "Worker protocol",
-    detailAutomation: "Automation",
-    detailUpdatedValue: "Updated: {time}",
-    detailAutomationTenant: "Tenant: {tenant}",
-    detailAutomationBoard: "Board: {board}",
-    detailAutomationSkills: "Skills: {skills}",
-    detailAutomationWorkspace: "Workspace: {workspace}",
-    detailAutomationSummary: "Summary: {summary}",
-    detailOperatorNotes: "Operator notes",
-    detailNoNotes: "No operator notes yet.",
-    detailNotePlaceholder: "Add a decision, blocker, or proof note...",
-    detailAddNote: "Add note",
-    openSession: "Open session",
-    openLinkedSession: "Open linked session",
-    defaultAgent: "Default agent",
-    allAgents: "All agents",
-    agentFilter: "Filter by agent",
-    agentFilterUnassigned: "Unassigned (uses {agent})",
-    agentFilterUnassignedHelp: "Cards without an explicit agent.",
-    agentFilterConfiguredDefault: "{agent} (default)",
-    agentFilterConfiguredDefaultHelp: "Cards explicitly assigned to the configured default agent.",
-    agentCurrentUnconfigured: "{agent} (not configured)",
-    viewPreset: "Workboard view",
-    viewAll: "All cards",
-    viewDefaultAgent: "Default agent",
-    viewReady: "Ready",
-    viewRunning: "Running",
-    viewBlocked: "Blocked",
-    viewReview: "Review",
-    viewStale: "Stale",
-    viewMissingProof: "Missing proof",
-    viewRecentlyDone: "Recently done",
-    viewPresetCount: "{count} cards",
-    agentLinked: "Linked to {agent}",
-    agentDefaultLinked: "Using default agent {agent}",
-    engineOpenAI: "OpenAI",
-    engineClaude: "Claude",
-    engineDisabledRuntime:
-      "{agent} uses the {runtime} ACP runtime. Use default start for that session.",
-    runEngine: "Run {engine}",
-    openEngine: "Open {engine}",
-    runDefaultAgent: "Run default agent",
-    run: "Run",
-    open: "Open",
-    start: "Start",
-    dependencies: "Dependencies",
-    dependenciesReady: "{count} ready",
-    dependenciesReadyTitle: "{count} dependencies are done.",
-    dependenciesBlocked: "{count} blocked",
-    dependenciesBlockedTitle: "Waiting on dependencies: {parents}.",
-    dependencyMissing: "{parent} (missing)",
-    dependencyStatusMissing: "Missing",
-    unknownStatus: "Unknown",
-    showArchived: "Show archived cards",
-    hideArchived: "Hide archived cards",
-    showArchivedShort: "Archived",
-    hideArchivedShort: "Hide archived",
-    layout: "Card layout",
-    layoutCompact: "Compact card density",
-    layoutComfortable: "Comfortable card density",
-    dispatch: "Dispatch ready work",
-    dispatchSummary:
-      "Dispatch complete: started {started}, promoted {promoted}, blocked {blocked}, reclaimed {reclaimed}, orchestrated {orchestrated}, failures {failures}.",
-    dispatchSummaryEmpty: "Dispatch complete: no ready work changed.",
-    autoRefresh: "Auto-refresh",
-    autoRefreshOff: "Off",
-    autoRefresh5s: "5s",
-    autoRefresh15s: "15s",
-    autoRefresh30s: "30s",
-    autoRefresh60s: "60s",
-    lastRefreshed: "Updated {time}",
-    refreshError: "Refresh failed",
-    healthLabel: "Workboard health",
-    healthRunning: "running",
-    healthBlocked: "blocked",
-    healthStale: "stale",
-    healthReadyUnassigned: "ready unassigned",
-    healthMissingProof: "missing proof",
-    healthFailedAttempts: "failed attempts",
-    ageHours: "{count}h",
-    live: "live",
-    fieldTitle: "Title",
-    fieldNotes: "Notes",
-    fieldStatus: "Status",
-    fieldPriority: "Priority",
-    fieldAgent: "Agent",
-    fieldSession: "Session",
-    fieldLabels: "Labels",
-    templatesLabel: "Card templates",
-    template: {
-      bugfix: "Bugfix",
-      docs: "Docs",
-      release: "Release",
-      pr_review: "PR review",
-      plugin: "Plugin",
-    },
-    badgeAttempts: "{count} attempts",
-    badgeFailures: "{count} failed",
-    badgeComments: "{count} comments",
-    badgeLinks: "{count} links",
-    badgeProof: "{count} proof",
-    badgeHeartbeat: "heartbeat {age}",
-    badgeArtifacts: "{count} artifacts",
-    badgeAttachments: "{count} attachments",
-    badgeWorkerLogs: "{count} worker logs",
-    badgeWorkerProtocol: "worker {state}",
-    badgeTenant: "tenant {tenant}",
-    badgeSkills: "{count} skills",
-    badgeDispatches: "{count} dispatches",
-    badgeTaskLinked: "task linked",
-    badgeClaimed: "claimed by {owner}",
-    badgeDiagnostics: "{count} diagnostics",
-    badgeStale: "stale",
-    titlePlaceholder: "Card title",
-    notesPlaceholder: "Notes, acceptance criteria, links",
-    labelsPlaceholder: "ui, docs",
-    searchPlaceholder: "Search cards",
-    allPriorities: "All priorities",
-    hideEmptyColumns: "Hide empty columns",
-    emptyColumn: "Drop work here",
-    emptyFilteredTitle: "No cards match this view",
-    emptyFilteredHint: "Change the view, search, priority, agent, or archive filter.",
-    lifecycleUnlinked: "No session",
-    lifecycleUnlinkedDetail: "Start or link a session",
-    lifecycleMissing: "Session missing",
-    lifecycleMissingDetail: "Reload sessions or relink this card",
-    lifecycleLinked: "Linked",
-    lifecycleIdleDetail: "No active run",
-    lifecycleRunning: "Running",
-    lifecycleRunningDetail: "Active run in progress",
-    lifecycleStale: "Stale",
-    lifecycleStaleDetail: "No recent session activity",
-    lifecycleDone: "Done",
-    lifecycleDoneDetail: "Moved to review",
-    lifecycleNeedsReview: "Needs review",
-    lifecycleNeedsReviewDetail: "Run stopped or failed",
-    taskStatus: {
-      queued: "Task queued",
-      running: "Task running",
-      completed: "Task complete",
-      failed: "Task failed",
-      cancelled: "Task cancelled",
-      timed_out: "Task timed out",
-    },
-    eventsLabel: "Card events",
-    eventCreated: "Created",
-    eventEdited: "Edited",
-    eventMoved: "Moved",
-    eventMovedTo: "Moved to {status}",
-    eventLinked: "Linked session",
-    eventSpecified: "Specified",
-    eventDecomposed: "Decomposed",
-    eventClaimed: "Claimed",
-    eventHeartbeat: "Heartbeat",
-    eventExecutionUpdated: "Agent updated",
-    eventAttemptStarted: "Attempt started",
-    eventAttemptUpdated: "Attempt updated",
-    eventCommentAdded: "Comment added",
-    eventLinkAdded: "Link added",
-    eventProofAdded: "Proof added",
-    eventArtifactAdded: "Artifact added",
-    eventAttachmentAdded: "Attachment added",
-    eventDiagnostic: "Diagnostic",
-    eventNotification: "Notification",
-    eventDispatch: "Dispatch",
-    eventOrchestration: "Orchestration",
-    eventProtocolViolation: "Protocol violation",
-    eventArchived: "Archived",
-    eventUnarchived: "Unarchived",
-    eventStale: "Stale session",
   },
-  overview: {
-    access: {
-      title: "Gateway Access",
-      subtitle: "Where the dashboard connects and how it authenticates.",
-      wsUrl: "WebSocket URL",
-      token: "Gateway Token",
-      password: "Password (not stored)",
-      passwordPlaceholder: "system or shared password",
-      sessionKey: "Default Session Key",
-      language: "Language",
-      connectHint: "Click Connect to apply connection changes.",
-      trustedProxy: "Authenticated via trusted proxy.",
-      showToken: "Show token",
-      hideToken: "Hide token",
-      toggleTokenVisibility: "Toggle token visibility",
-      showPassword: "Show password",
-      hidePassword: "Hide password",
-      togglePasswordVisibility: "Toggle password visibility",
+  gatewayLogs: {},
+  pluginTabs: {
+    unavailableTitle: "Plugin panel unavailable",
+    unavailableSubtitle:
+      "The plugin that owns this tab is not active on the connected gateway, or it did not provide a panel.",
+  },
+  logbook: {},
+  board: {
+    announcement: {},
+    widget: {
+      resizeHandle: "Resize {title}",
+      menuLabel: "Widget options",
+      moveToTab: "Move to tab",
+      noOtherTabs: "No other tabs",
+      resize: "Resize",
+      autoHeight: "Auto height",
+      remove: "Delete",
     },
-    snapshot: {
-      title: "Snapshot",
-      subtitle: "Latest gateway handshake information.",
-      status: "Status",
-      uptime: "Uptime",
-      tickInterval: "Tick Interval",
-      lastChannelsRefresh: "Last Channels Refresh",
-      channelsHint: "Use Channels to link WhatsApp, Telegram, Discord, Signal, or iMessage.",
+  },
+  connection: {
+    browserSignIn: {
+      title: "Sign in to continue loading content",
+      description:
+        "Your website sign-in has expired. Images and files cannot load until you sign in again. Your conversation and draft will stay open.",
+      action: "Sign in",
+      dismiss: "Not now",
+      returnHint: {},
+      checkAgain: {},
+      checking: {},
+      stillRequired: {},
+      unavailable: {},
     },
-    stats: {
-      instances: "Instances",
-      instancesHint: "Presence beacons in the last 5 minutes.",
-      sessions: "Sessions",
-      sessionsHint: "Recent session keys tracked by the gateway.",
-      cron: "Cron",
-      cronNext: "Next wake {time}",
-    },
-    notes: {
-      title: "Notes",
-      subtitle: "Quick reminders for remote control setups.",
-      tailscaleTitle: "Tailscale serve",
-      tailscaleText: "Prefer serve mode to keep the gateway on loopback with tailnet auth.",
-      sessionTitle: "Session hygiene",
-      sessionText: "Use /new or sessions.patch to reset context.",
-      cronTitle: "Cron reminders",
-      cronText: "Use isolated sessions for recurring runs.",
-    },
-    auth: {
-      required: "This gateway requires auth. Add a token or password, then click Connect.",
-      failed:
-        "Auth failed. Re-copy a tokenized URL with {command}, or update the token, then click Connect.",
-    },
-    pairing: {
-      hint: "This device needs pairing approval from the gateway host.",
-      scopeUpgradeTitle: "Scope upgrade pending approval.",
-      scopeUpgradeSummary:
-        "This device is already paired, but the requested wider scope is waiting for approval.",
-      roleUpgradeTitle: "Role upgrade pending approval.",
-      roleUpgradeSummary:
-        "This device is already paired, but the requested role change is waiting for approval.",
-      metadataUpgradeTitle: "Device metadata change pending approval.",
-      metadataUpgradeSummary:
-        "This device is already paired, but the metadata change is waiting for approval.",
-      mobileHint:
-        "On mobile? Copy the full URL (including #token=...) from openclaw dashboard --no-open on your desktop.",
-      docsTitle: "Device pairing docs (opens in new tab)",
-      docsLink: "Docs: Device pairing",
-    },
-    insecure: {
-      hint: "This page is HTTP, so the browser blocks device identity. Use HTTPS (Tailscale Serve) or open {url} on the gateway host.",
-      stayHttp: "If you must stay on HTTP, set {config} (token-only).",
-    },
-    connection: {
-      title: "How to connect",
-      step1: "Start the gateway on your host machine:",
-      step2: "Get a tokenized dashboard URL:",
-      step3: "Paste the WebSocket URL and token above, or open the tokenized URL directly.",
-      step4: "Or generate a reusable token:",
-      docsHint: "For remote access, Tailscale Serve is recommended. ",
-      docsLink: "Read the docs →",
-      authDocsTitle: "Control UI auth docs (opens in new tab)",
-      authDocsLink: "Docs: Control UI auth",
-      tailscaleDocsTitle: "Tailscale Serve docs (opens in new tab)",
-      tailscaleDocsLink: "Docs: Tailscale Serve",
-      insecureHttpDocsTitle: "Insecure HTTP docs (opens in new tab)",
-      insecureHttpDocsLink: "Docs: Insecure HTTP",
+    connecting: "Connecting…",
+    starting: "Starting…",
+    restoring: "Restoring…",
+    "reload-required": "Refresh required",
+    offline: "Disconnected",
+    reconnecting: "Reconnecting…",
+    interruptedRetrying:
+      "Connection to the Gateway was interrupted. Reconnecting automatically. (WebSocket {code})",
+    interrupted:
+      "Connection to the Gateway was interrupted. Check your connection and try again. (WebSocket {code})",
+    restarting: "Restarting…",
+    suspending: "Suspending…",
+    suspended: "Suspended",
+    retryNow: "Retry now",
+    queued: "{count} queued",
+    offlineChangesDiscarded: "Offline changes discarded: {count}",
+    offlineChangesReloadBlocked:
+      "Offline changes are waiting to reconnect. Reloading would discard them.",
+    sessionMoveRefreshFailed: "The session move was saved, but refreshing the list failed: {error}",
+    sessionMoveUncertain:
+      "The session move could not be confirmed. Refresh and check its group before retrying. {error}",
+    sessionOperationCompletedPreviousConnection:
+      "The session operation completed on the previous connection. Check the current session list before continuing.",
+    sessionOperationCompletedPreviousConnectionWithRefreshError:
+      "The session operation completed on the previous connection, but refreshing the current session list failed: {error}",
+    scopeUpgrade: {},
+    // Settings → Gateway copy lives in the lazy en-settings catalog; the anchor keeps its merge target.
+    access: {},
+    switchGateway: {},
+    help: {
+      title: {},
+      step1: {},
+      step2: {},
+      step3: {},
+      docsLink: {},
       copyCommand: "Copy command",
       copyCommandAria: "Copy command: {command}",
     },
-    cards: {
-      cost: "Cost",
-      skills: "Skills",
-      recentSessions: "Recent Sessions",
-      modelAuth: "Model Auth",
-      modelAuthOk: "{count} ok",
-      modelAuthExpired: "{count} expired",
-      modelAuthExpiring: "{count} expiring",
-      modelAuthProviders: "{count} providers",
-      modelAuthUsageLeft: "{pct}% left",
-      modelAuthExpiresIn: "expires {when}",
-      modelAuthAttentionExpiredTitle: "Model auth expired",
-      modelAuthAttentionExpiringTitle: "Model auth expiring soon",
-      modelAuthAttentionExpiredDesc: "{providers} — re-authenticate with openclaw models auth",
-      modelAuthAttentionExpiringEntry: "{provider} ({when})",
-    },
-    attention: {
-      title: "Attention",
-    },
-    eventLog: {
-      title: "Event Log",
-    },
-    logTail: {
-      title: "Gateway Logs",
-    },
-    quickActions: {
-      newSession: "New Session",
-      automation: "Automation",
-      refreshAll: "Refresh All",
-      terminal: "Terminal",
-    },
-    palette: {
-      placeholder: "Type a command…",
-      noResults: "No results",
-      categories: {
-        search: "Search",
-        navigation: "Navigation",
-        skills: "Skills",
-      },
-      items: {
-        overview: "Overview",
-        sessions: "Sessions",
-        scheduled: "Scheduled",
-        skills: "Skills",
-        settings: "Settings",
-        agents: "Agents",
-        shellCommand: "Shell Command",
-        debugMode: "Debug Mode",
-      },
-      descriptions: {
-        shellCommand: "Run shell",
-        debugMode: "Toggle debug",
-      },
-      footer: {
-        navigate: "navigate",
-        select: "select",
-        close: "close",
-      },
-    },
   },
-  dreaming: {
-    agentSelect: {
-      label: "Agent",
-      ariaLabel: "Dreaming agent",
-    },
-    tabs: {
-      scene: "Scene",
-      diary: "Diary",
-      advanced: "Advanced",
-    },
-    header: {
-      refresh: "Refresh",
-      refreshing: "Refreshing…",
-      on: "Dreaming On",
-      off: "Dreaming Off",
-    },
-    restartConfirmation: {
-      title: "Restart Gateway to Apply Change",
-      subtitle: "Changing Dreaming mode restarts the gateway.",
-      warning:
-        "This action will restart the Gateway and may temporarily interrupt chats, automations, and connected channels.",
-      confirm: "Confirm Restart",
-      restarting: "Restarting…",
-      failed: "Could not apply change. Check your connection and try again.",
-    },
-    status: {
-      active: "Dreaming Active",
-      idle: "Dreaming Idle",
-      promotedSuffix: "promoted",
-      nextSweepPrefix: "next sweep",
-    },
-    scene: {
-      backfill: "Backfill",
-      dedupeDiary: "Dedupe Diary",
-      reset: "Reset",
-      clearGrounded: "Clear Replayed",
-      repairCache: "Repair Dream Cache",
-      working: "Working…",
-    },
-    phase: {
-      light: "Light",
-      deep: "Deep",
-      rem: "Rem",
-      off: "off",
-    },
-    advanced: {
-      eyebrow: "Review",
-      title: "Daily Log Review",
-      description:
-        "Review what came from the daily log, what is waiting for promotion, and what was promoted recently.",
-      summaryFromDailyLog: "from daily log",
-      summaryWaiting: "waiting",
-      summaryPromotedToday: "promoted today",
-      stagedTitle: "From the Daily Log",
-      stagedDescription: "Replay candidates pulled from older daily log entries.",
-      shortTermTitle: "Waiting for Promotion",
-      shortTermDescription: "Current short-term candidates waiting to graduate into real memory.",
-      sortRecent: "Most recent",
-      sortSignals: "Strongest support",
-      originDailyLog: "replayed",
-      originLive: "live",
-      originMixed: "mixed",
-      promotedTitle: "Recent Promotions",
-      promotedDescription: "Items that already made it through promotion.",
-      emptyGrounded: "No staged grounded replay entries right now.",
-      emptyShortTerm: "No short-term entries to inspect.",
-      emptyPromoted: "No recent promotions to inspect.",
-      updatedPrefix: "updated",
-    },
-    stats: {
-      shortTerm: "Short-term",
-      grounded: "Grounded",
-      signals: "Signals",
-      promoted: "Promoted",
-      phaseHits: "Phase Hits",
-    },
-    trace: {
-      shortTerm: "Short-term",
-      grounded: "Grounded",
-      signals: "Signals",
-      promoted: "Promoted",
-      groundedLed: "grounded-led",
-      emptyShortTerm: "No active short-term items.",
-      emptyGrounded: "No staged grounded items.",
-      emptySignals: "No active signals.",
-      emptyPromoted: "Nothing promoted yet today.",
-    },
-    diary: {
-      title: "Dream Diary",
-      noDreamsYet: "No dreams yet",
-      noDreamsHint: "Dreams will appear here after the first dreaming cycle runs.",
-      waitingTitle: "The diary is waiting",
-      waitingHint: "Narrative entries will appear after the next dreaming cycle.",
-      older: "Older",
-      newer: "Newer",
-      reload: "Reload",
-      reloading: "Reloading…",
-    },
-    phrases: {
-      consolidatingMemories: "consolidating memories…",
-      tidyingKnowledgeGraph: "tidying the knowledge graph…",
-      replayingConversations: "replaying today's conversations…",
-      weavingShortTerm: "weaving short-term into long-term…",
-      defragmentingMindPalace: "defragmenting the mind palace…",
-      filingLooseThoughts: "filing away loose thoughts…",
-      connectingDots: "connecting distant dots…",
-      compostingContext: "composting old context windows…",
-      alphabetizingSubconscious: "alphabetizing the subconscious…",
-      promotingHunches: "promoting promising hunches…",
-      forgettingNoise: "forgetting what doesn't matter…",
-      dreamingEmbeddings: "dreaming in embeddings…",
-      reorganizingAttic: "reorganizing the memory attic…",
-      indexingDay: "softly indexing the day…",
-      nurturingInsights: "nurturing fledgling insights…",
-      simmeringIdeas: "simmering half-formed ideas…",
-      whisperingVectorStore: "whispering to the vector store…",
-    },
+  // The Inbox loader renders before its diagnostics catalog loads.
+  attention: {
+    issues: "Inbox",
   },
+  standingGrants: {},
+  approvalHistory: {},
+  commandPalette: {},
+  palette: {
+    placeholder: "Search or start a task…",
+    attachmentPrompt: "What would you like to do with these files?",
+    categories: { navigation: "Navigation" },
+  },
+  dreaming: {},
+  modelProviders: {},
+  searchPage: {},
   usage: {
     common: {
       emptyValue: "—",
       unknown: "unknown",
+      atLeast: "≥ {value}",
+      approx: "≈ {value}",
     },
     loading: {
       title: "Usage Overview",
@@ -992,89 +1419,46 @@ export const en: TranslationMap = {
       session: "session",
       sessions: "sessions",
     },
-    presets: {
+    heatmap: {
+      title: "Token Activity",
+      subtitle: "Daily token intensity for the selected range, up to one year.",
+      cellTokens: "{tokens} tokens",
+      less: "Less",
+      more: "More",
+    },
+    providerUsage: {
+      title: "Provider plans & billing",
+      subtitle: "Live plan, quota, balance, and budget data reported by configured providers.",
+      stalled: "Provider usage did not finish loading. Refresh to retry.",
+      unavailable: "Provider usage is unavailable; the last request failed. Refresh to retry.",
+      balance: "Balance",
+      spend: "Usage",
+      budget: "Budget",
       today: "Today",
-      last7d: "7d",
-      last30d: "30d",
-      last90d: "90d",
-      last1y: "1y",
-      all: "All",
+      last7Days: "7 days",
+      lastDays: "{count} days",
+      dailyCost: "Daily provider cost",
+      requests: "{count} requests",
+      inputTokens: "{count} input",
+      cacheTokens: "{count} cache",
+      outputTokens: "{count} output",
+      topModels: "Top models",
+      costCategories: "Cost categories",
+      remaining: "{percent}% left",
+      resets: "Resets {date}",
+      exhausted: "{label} is used up.",
+      checkFailed: "Check failed",
+      exhaustedUntil: "{label} is used up until {date}.",
     },
-    scope: {
-      instance: "Current instance",
-      instanceHint: "Show only the active session id for each logical session.",
-      family: "Historical lineage",
-      familyHint: "Roll up known rotated transcript-backed session ids.",
-      familyIncluded: "Historical lineage includes {count} session instances.",
-    },
-    filters: {
-      title: "Filters",
-      to: "to",
-      startDate: "Start date",
-      endDate: "End date",
-      timeZone: "Time zone",
-      timeZoneLocal: "Local",
-      timeZoneUtc: "UTC",
-      pin: "Pin",
-      pinned: "Pinned",
-      unpin: "Unpin filters",
-      selectAll: "Select All",
-      clear: "Clear",
-      clearAll: "Clear All",
-      remove: "Remove filter",
-      all: "All",
-      days: "Days",
-      hours: "Hours",
-      session: "Session",
-      agent: "Agent",
-      channel: "Channel",
-      provider: "Provider",
-      model: "Model",
-      tool: "Tool",
-      daysCount: "{count} days",
-      hoursCount: "{count} hours",
-      sessionsCount: "{count} sessions",
-    },
-    query: {
-      placeholder:
-        "Filter sessions (e.g. key:agent:main:cron* model:gpt-4o has:errors minTokens:2000)",
-      apply: "Filter (client-side)",
-      matching: "{shown} of {total} sessions match",
-      inRange: "{total} sessions in range",
-      tip: "Tip: use filters or click bars to refine days.",
-    },
-    export: {
-      label: "Export",
-      sessionsCsv: "Sessions CSV",
-      dailyCsv: "Daily CSV",
-      json: "JSON",
-    },
-    cacheStatus: {
-      warning: "Usage cache is rebuilding in the background. Displayed totals may be stale.",
-      title: "{status}: {pending} pending, {stale} stale, {cached} cached",
-      status: {
-        refreshing: "refreshing",
-        stale: "stale",
-        partial: "partial",
-      },
-    },
-    empty: {
-      title: "Start with a date range",
-      subtitle:
-        "Load usage data to compare costs, inspect sessions, and drill into timelines without leaving the dashboard.",
-      hint: "Select a date range and click Refresh to load usage.",
-      noData: "No data",
-      featureOverview: "Overview cards",
-      featureSessions: "Session ranking",
-      featureTimeline: "Timeline drilldown",
-    },
-    daily: {
-      title: "Daily Usage",
-      total: "Total",
-      byType: "By Type",
-      tokensTitle: "Daily Token Usage",
-      costTitle: "Daily Cost",
-    },
+    presets: {},
+    scope: {},
+    filters: {},
+    query: {},
+    export: {},
+    cacheStatus: {},
+    empty: {},
+    daily: {},
+    costWindows: {},
     breakdown: {
       output: "Output",
       input: "Input",
@@ -1086,635 +1470,535 @@ export const en: TranslationMap = {
     },
     overview: {
       title: "Usage Overview",
-      messages: "Messages",
-      messagesHint: "Total user and assistant messages in range.",
-      messagesAbbrev: "msgs",
-      user: "user",
-      assistant: "assistant",
-      toolCalls: "Tool Calls",
-      toolCallsHint: "Total tool call count across sessions.",
-      toolsUsed: "tools used",
-      errors: "Errors",
-      errorsHint: "Total message and tool errors in range.",
-      toolResults: "tool results",
-      avgTokens: "Avg Tokens / Msg",
-      avgTokensHint: "Average tokens per message in this range.",
-      avgCost: "Avg Cost / Msg",
-      avgCostHint: "Average cost per message when providers report costs.",
-      avgCostHintMissing:
-        "Average cost per message when providers report costs. Cost data is missing for some or all sessions in this range.",
-      acrossMessages: "Across {count} messages",
-      sessions: "Sessions",
-      sessionsHint: "Distinct sessions in the range.",
-      sessionsInRange: "of {count} in range",
-      throughput: "Throughput",
-      throughputHint: "Throughput shows tokens per minute over active time. Higher is better.",
-      tokensPerMinute: "tok/min",
-      perMinute: "/ min",
-      errorRate: "Error Rate",
-      errorHint: "Error rate = errors / total messages. Lower is better.",
-      avgSession: "avg session",
-      cacheHitRate: "Cache Hit Rate",
-      cacheHint:
-        "Cache hit rate = cache read / (input + cache read + cache write). Higher is better.",
-      cached: "cached",
-      prompt: "prompt",
-      calls: "calls",
-      topModels: "Top Models",
-      topProviders: "Top Providers",
-      topTools: "Top Tools",
-      topAgents: "Top Agents",
-      topChannels: "Top Channels",
-      peakErrorDays: "Peak Error Days",
-      peakErrorHours: "Peak Error Hours",
-      noModelData: "No model data",
-      noProviderData: "No provider data",
-      noToolCalls: "No tool calls",
-      noAgentData: "No agent data",
-      noChannelData: "No channel data",
-      noErrorData: "No error data",
     },
-    sessions: {
-      title: "Sessions",
-      shown: "{count} shown",
-      total: "{count} total",
-      avg: "avg",
-      all: "All",
-      recent: "Recently viewed",
-      recentShort: "Recent",
-      sort: "Sort",
-      ascending: "Ascending",
-      descending: "Descending",
-      clearSelection: "Clear Selection",
-      noRecent: "No recent sessions",
-      noneInRange: "No sessions in range",
-      more: "+{count} more",
-      selected: "Selected ({count})",
-      copy: "Copy",
-      copyName: "Copy session name",
-      limitReached: "Showing first 1,000 sessions. Narrow date range for complete results.",
-    },
+    sessions: {},
+    // Sidebar collapse stays eager; Usage registers the remaining detail copy.
     details: {
-      noUsageData: "No usage data for this session.",
-      duration: "Duration",
-      modelMix: "Model Mix",
-      filtered: "(filtered)",
-      close: "Close session details",
-      noTimeline: "No timeline data",
-      noDataInRange: "No data in range",
-      usageOverTime: "Usage Over Time",
-      reset: "Reset",
-      perTurn: "Per Turn",
-      cumulative: "Cumulative",
-      turnRange: "Turns {start}–{end} of {total}",
-      assistantOutputTokens: "Assistant output tokens",
-      userToolInputTokens: "User + tool input tokens",
-      tokensWrittenToCache: "Tokens written to cache",
-      tokensReadFromCache: "Tokens read from cache",
-      noContextData: "No context data",
-      systemPromptBreakdown: "System Prompt Breakdown",
+      noUsageData: {},
+      duration: {},
+      modelMix: {},
+      filtered: {},
+      close: {},
+      noTimeline: {},
+      loadFailed: {},
+      noDataInRange: {},
+      usageOverTime: {},
+      rangeStart: {},
+      rangeEnd: {},
+      reset: {},
+      perTurn: {},
+      cumulative: {},
+      turnRange: {},
+      assistantOutputTokens: {},
+      userToolInputTokens: {},
+      tokensWrittenToCache: {},
+      tokensReadFromCache: {},
+      noContextData: {},
+      contextOutOfDate: {},
+      systemPromptBreakdown: {},
       collapse: "Collapse",
-      collapseAll: "Collapse All",
-      expandAll: "Expand All",
-      baseContextPerMessage: "Base context per message",
-      system: "System",
-      systemShort: "Sys",
-      skills: "Skills",
-      tools: "Tools",
-      files: "Files",
-      ofInput: "of input",
-      of: "of",
-      timelineFiltered: "timeline filtered",
-      conversation: "Conversation",
-      noMessages: "No messages",
-      tool: "Tool",
-      toolResult: "Tool result",
-      hasTools: "Has tools",
-      searchConversation: "Search conversation",
-      you: "You",
-      noMessagesMatch: "No messages match the filters.",
+      collapseAll: {},
+      expandAll: {},
+      baseContextPerMessage: {},
+      system: {},
+      systemShort: {},
+      skills: {},
+      tools: {},
+      files: {},
+      ofInput: {},
+      of: {},
+      timelineFiltered: {},
+      loadedIntervalMessages: {},
+      conversation: {},
+      noMessages: {},
+      tool: {},
+      toolResult: {},
+      hasTools: {},
+      searchConversation: {},
+      filterByRole: {},
+      filterByTool: {},
+      you: {},
+      noMessagesMatch: {},
     },
-    mosaic: {
-      title: "Activity by Time",
-      subtitleEmpty: "Estimates require session timestamps.",
-      subtitle: "Estimated from session spans (first/last activity). Time zone: {zone}.",
-      noTimelineData: "No timeline data yet.",
-      dayOfWeek: "Day of Week",
-      midnight: "Midnight",
-      fourAm: "4am",
-      eightAm: "8am",
-      noon: "Noon",
-      fourPm: "4pm",
-      eightPm: "8pm",
-      legend: "Low → High token density",
-      sun: "Sun",
-      mon: "Mon",
-      tue: "Tue",
-      wed: "Wed",
-      thu: "Thu",
-      fri: "Fri",
-      sat: "Sat",
-    },
+    mosaic: {},
   },
-  login: {
-    subtitle: "Gateway Dashboard",
-    passwordPlaceholder: "optional",
-    showToken: "Show token",
-    hideToken: "Hide token",
-    toggleTokenVisibility: "Toggle token visibility",
-    showPassword: "Show password",
-    hidePassword: "Hide password",
-    togglePasswordVisibility: "Toggle password visibility",
-    failure: {
-      rawError: "Raw error",
-      docsAuth: "Control UI auth docs",
-      docsPairing: "Device pairing docs",
-      docsInsecure: "Insecure HTTP docs",
-      authRequired: {
-        title: "Auth required",
-        summary:
-          "The Gateway is reachable, but it needs a matching token or password before this browser can connect.",
-        stepPaste:
-          "Paste the token from openclaw dashboard --no-open or enter the configured password.",
-        stepGenerate:
-          "If no token is configured, run openclaw doctor --generate-gateway-token on the gateway host.",
-        stepConnect: "Click Connect again after updating the credential.",
-      },
-      authFailed: {
-        title: "Auth did not match",
-        summary:
-          "The supplied credential was rejected. The most common cause is a stale token or a token copied from another Gateway URL.",
-        stepDashboard:
-          "Run openclaw dashboard --no-open and open the fresh URL or paste its token.",
-        stepReplace:
-          "Replace stale token/password values; do not reuse a token from another Gateway URL.",
-        stepMode:
-          "Use one matching auth mode at a time: gateway token for token mode, password for password mode.",
-      },
-      rateLimited: {
-        title: "Too many failed attempts",
-        summary: "The Gateway is temporarily limiting authentication attempts for this client.",
-        stepStop: "Stop retrying from this tab for a moment.",
-        stepWait:
-          "Wait for the auth limiter to cool down, then reconnect with the corrected credential.",
-        stepCheckClients: "If this is a shared host, check other clients for repeated bad retries.",
-      },
-      pairing: {
-        title: "Device pairing required",
-        scopeTitle: "Scope upgrade pending",
-        roleTitle: "Role upgrade pending",
-        metadataTitle: "Device refresh pending",
-        summary:
-          "This browser needs one-time approval from the Gateway host before it can use the Control UI.",
-        upgradeSummary:
-          "This browser is already known, but the requested access changed and needs a fresh approval.",
-        stepList: "Run openclaw devices list on the Gateway host.",
-        stepApproveId: "Approve this request: openclaw devices approve {requestId}.",
-        stepApprove: "Approve the pending browser/device request from that list.",
-        stepReconnect: "Reconnect after the approval completes.",
-      },
-      insecure: {
-        title: "Secure browser context required",
-        summary:
-          "This page is running over plain HTTP, so the browser cannot create the device identity the Gateway expects.",
-        stepHttps: "Use HTTPS/Tailscale Serve, or open http://127.0.0.1:18789 on the Gateway host.",
-        stepLocalCompat:
-          "For local token-only compatibility, set gateway.controlUi.allowInsecureAuth: true.",
-        stepAvoidDisable: "Avoid disabling device auth for remote HTTP access.",
-      },
-      origin: {
-        title: "Browser origin not allowed",
-        summary:
-          "The Gateway rejected this page origin before accepting the Control UI connection.",
-        stepAllowedOrigins: "Add this browser origin to gateway.controlUi.allowedOrigins.",
-        stepFullOrigin: "Use full origins such as http://localhost:5173, not wildcard patterns.",
-        stepRestart: "Restart or reload the Gateway after changing allowed origins.",
-      },
-      protocol: {
-        title: "Protocol mismatch",
-        summary:
-          "The served Control UI and the running Gateway do not agree on the supported connection protocol.",
-        stepDashboard:
-          "Reopen the served dashboard with openclaw dashboard so the UI and Gateway come from the same install.",
-        stepDevUi:
-          "If using pnpm ui:dev, rebuild or restart the dev UI against the current checkout.",
-        stepRestart:
-          "Restart the Gateway after updating OpenClaw so it serves the current protocol.",
-      },
-      network: {
-        title: "Could not connect",
-        summary:
-          "The browser could not complete the Gateway connection. Check the target and transport before retrying credentials.",
-        stepGateway: "Confirm the Gateway is running with openclaw status or openclaw gateway run.",
-        stepUrl:
-          "Check the WebSocket URL and use wss:// when the Gateway is behind HTTPS/Tailscale Serve.",
-        stepDashboard:
-          "Reopen the dashboard with openclaw dashboard --no-open to recopy the current URL and auth details.",
-      },
-    },
-  },
+  // Login copy lives in the lazy en-login catalog; the anchor keeps its merge target.
+  login: {},
   chat: {
-    disconnected: "Disconnected from gateway.",
-    refreshTitle: "Refresh chat data",
-    settings: "Chat settings",
-    thinkingToggle: "Toggle assistant thinking/working output",
-    toolCallsToggle: "Toggle tool calls and tool results",
-    autoScrollMode: "Auto-scroll mode",
-    autoScrollAlways: "Always",
-    autoScrollNearBottom: "Near bottom",
-    autoScrollOff: "Off",
-    hideCronSessions: "Hide cron sessions",
-    showCronSessions: "Show cron sessions",
-    showCronSessionsHidden: "Show cron sessions ({count} hidden)",
-    onboardingDisabled: "Disabled during setup",
-    gatewayStatus: "Gateway status: {status}",
-    commandPaletteTitle: "Search or jump to… (⌘K)",
-    openCommandPalette: "Open command palette",
-    docsOpensInNewTab: "{label} (opens in new tab)",
-    updateAvailable: "Update available:",
-    runningVersion: "running v{version}",
-    updating: "Updating…",
-    updateNow: "Update now",
-    dismissUpdateBanner: "Dismiss update banner",
-    switchedSession: "Switched to {session}",
-    welcome: {
-      ready: "Ready to chat",
-      hintBeforeShortcut: "Type a message below ·",
-      hintAfterShortcut: "for commands",
-      suggestions: {
-        whatCanYouDo: "What can you do?",
-        summarizeRecentSessions: "Summarize my recent sessions",
-        configureChannel: "Help me configure a channel",
-        checkSystemHealth: "Check system health",
-      },
+    sessionAutomation: {},
+    activityPills: {},
+    mobileDetails: {
+      people: "People",
+      outputs: "Outputs",
+      generatedFiles: "Generated files",
     },
+    sessionDetails: {
+      automations: "Automations",
+      progressOptions: "Task progress options",
+      automationError: "Couldn't load automations.",
+      automationUnavailable: "Automations unavailable for this session.",
+      automationLoading: "Loading automations…",
+      automationEmpty: "No automations for this session",
+      automationMore: "Load more automations",
+      automationAttention: "Needs attention",
+      automationPaused: "Paused",
+      automationEnabled: "Enabled",
+    },
+    agentDatabaseWarming: "This agent is still starting. Retry in a moment.",
+    historyRequestTimedOut: "Chat history request timed out. Retry to load the conversation.",
+    clawhub: {},
+    modelAccounts: {
+      section: "Account",
+      automatic: "Automatic (new-chat default)",
+      manage: "Manage saved accounts…",
+    },
+    mentions: {},
+    cloudWorkerFailed: "Runner failed: {error}",
+    errorDetails: "Error details",
+    errorReplySummary: "Couldn't finish this reply. Check the conversation before trying again.",
+    errorReplyTitle: "Couldn’t finish this reply",
+    historyUnavailableTitle: "Couldn’t load this conversation",
+    historyUnavailableBody: "Try again to load its messages.",
+    recovery: {
+      retrying: "Retrying…",
+      retryingIn: "Retrying in {seconds}s",
+      tryingFallback: "Trying fallback model…",
+      failedTitle: "Unable to finish this reply",
+      failedRepeatCount: "{count} times",
+      failedHelp: "Automatic recovery has stopped. Check any completed work before trying again.",
+      tryAgain: "Try again",
+      continuePrompt:
+        "Continue from where you stopped. Check which actions already completed before retrying anything.",
+    },
+    errorBusySummary: "OpenClaw is busy. Check status before trying again.",
+    errorSignInSummary: "Couldn't sign in to the AI service. Sign in again under Models.",
+    errorStartSummary: "Couldn't start this conversation. Open Settings → Logs for details.",
+    checkStatus: "Check status",
+    details: "Details",
+    usageLimit: {},
+    copyError: "Copy error",
+    providerAccessRemoved:
+      "This reply stopped because the provider was signed out. Sign in again or choose another model.",
+    providerReview: {},
+    providerPolicy: {},
+    diskSpace: {},
+    workerRuntimeInstall: {},
+    sendErrors: {},
+    waitingForApproval: "Waiting for approval…",
+    waitingOnSubagents: "Waiting on subagents",
+    waitingForMessage: "Waiting for a message",
+    waitingOnSubagent: "Waiting on {name}",
+    subagentsRunning: "{count} subagents running",
+    subagentsRunningOne: "1 subagent running",
+    startupStatus: {
+      preparingWorkspace: "Preparing workspace…",
+      namingWorktree: "Naming worktree…",
+      updatingRepository: "Updating repository…",
+      creatingWorktree: "Creating worktree…",
+      runningSetup: "Running setup…",
+      provisioningEnvironment: "Provisioning environment…",
+      startingFromSnapshot: "Starting from snapshot…",
+      preparingCloudEnvironment: "Preparing cloud environment…",
+      savingSnapshot: "Saving snapshot…",
+      preparingContext: "Preparing this turn…",
+      waitingForTurn: "Waiting for turn to start…",
+      memoryFlushing: "Saving conversation memory…",
+      startingModel: "Waiting for a response",
+      waitingForLocalModel: "Waiting for the local model to respond",
+      waitingForModelSlot: "Waiting for a free model slot",
+      waitingForState: "Temporarily busy—retrying…",
+    },
+    archivedSessionDisabled: "This session is archived. Unarchive it to continue the conversation.",
+    subagentViewOnly: "View-only subagent",
+    subagentSessionDisabled: "Continue in {parent}.",
+    processesPanel: { title: "Processes", refresh: "Refresh processes" },
+    subagentsPanel: {},
+    parentSession: "the parent session",
+    openParentSession: "Open parent session",
+    parentSessionUnavailable: "Parent session information is unavailable.",
+    sessionRoute: {},
+    commandResults: {
+      startingNewThread: "Starting new session...",
+      resettingThread: "Resetting session...",
+      stoppingCurrentRun: "Stopping current run...",
+      chatHistoryCleared: "Chat history cleared.",
+      emptyExport: "There are no messages to export yet.",
+      exportPathUnsupported:
+        "Control UI exports Markdown through your browser. Run /export without a file path.",
+      help: {},
+      compaction: {},
+      model: {},
+      thinking: {},
+      verbose: {},
+      fast: {
+        autoValue: "auto ({seconds} sec)",
+        on: "on",
+        off: "off",
+        sourceSession: " (session)",
+        sourceAgent: " (default: agent)",
+        sourceModel: " (default: model)",
+        sourceDefault: " (default)",
+        current: "Current fast mode: {value}",
+      },
+      usage: {},
+      agents: {},
+      steer: {},
+      redirect: {},
+    },
+    sessionSharing: {
+      draft: "Draft",
+    },
+    reactions: {},
+    sessionSuggestions: {
+      state: {},
+    },
+    sessionHeader: {},
+    board: {},
+    codexSupervisionDisabled:
+      "Codex supervision is off. Enable it in plugin settings to continue this session.",
+    openCodexSettings: "Open settings",
+    catalog: {},
+    taskSuggestions: {},
+    pullRequests: {
+      open: "Open",
+      draft: "Draft",
+      merged: "Merged",
+      closed: "Closed",
+    },
+    usageRemaining: "Usage Remaining",
+    view: {},
+
+    sendShortcutModifierEnter: "⌘/Ctrl+Enter",
+
+    followUpModeSteer: "Steer into the active run",
+
+    catalogOutputTruncated: "[Output truncated]",
+    onboardingDisabled: "Disabled during setup",
+    commandPaletteTitle: "Search or jump to… (⌘K)",
+    openCommandPalette: "Command palette",
+
+    actions: {
+      copyAsMarkdown: "Copy as markdown",
+      dismissError: "Dismiss error",
+      exitFocusMode: "Exit focus mode",
+      scrollToLatest: "Scroll to latest",
+    },
+    markdown: {
+      truncated: "… truncated ({total} chars, showing first {shown}).",
+    },
+    mermaid: {},
+    codeBlock: {},
+    workspaceConflict: {},
+    compaction: {
+      label: "Compacted history",
+      savedTokens: "saved {count} tokens",
+    },
+    sessionReset: {
+      label: "Session reset",
+      description: "The earlier conversation was cleared.",
+    },
+    outboxRecoveryReviewTitle: {},
+    outboxRecoveryConfirm: {},
+    outboxRecoveryRestore: {},
+    outboxRecoveryConflict: {},
+    outboxRecoveryStorageFailed: {},
+    outboxRecoveryFull: {},
+    outboxRecoveryDraft: {},
+    outboxRecoveryQueued: {},
+    outboxRecoverySource: {},
+    outboxRecoveryUpdated: {},
+    outboxRecoveryGoal: {},
+    outboxRecoveryReply: {},
+    outboxRecoveryAttachments: {},
+    outboxRecoveryUnconfirmedLabel: {},
+    outboxRecoveryUnconfirmed: {},
+    outboxRecoveryAttachmentMissing: {},
+    outboxRecoveryDelete: {},
+    outboxRecoveryDeleteTitle: {},
+    outboxRecoveryDeleteConfirm: {},
+    outboxRecoveryDeleteConflict: {},
+    privateDraftReload: {
+      blocked: "An unsent Incognito draft is keeping this tab open. Review it before refreshing.",
+      review: "Review private draft",
+      changed:
+        "The draft changed while you were reviewing it. It has not been discarded; review the current draft before refreshing.",
+      unavailable:
+        "The private draft could not be opened. It remains in this tab; try Review private draft again.",
+    },
+    incognitoExpiredTitle: "Incognito session expired",
+    incognitoExpiredBody:
+      "Incognito sessions last for 24 hours or until the Gateway restarts. Your unsent input stays in this tab.",
+    newIncognitoSession: "New Incognito session",
+    restartRecoveryTitle: "This task was interrupted by a restart.",
+    restartRecoveryDisabled: "Your transcript is safe. Resume to continue in this session.",
+    restartRecoveryNewSession:
+      "This provider cannot safely resume tool work here. Your transcript can continue in a new session.",
+    resumeSession: "Resume",
+    resumeInNewSession: "Resume in new session",
+    resumingSession: "Resuming…",
+    systemNotice: {
+      guardian: {},
+      restartRecovery: {},
+      automationRecovery: {},
+      gatewayRestarted: {},
+      cliHarnessContext: {},
+      claudeCliTaskNotification: {},
+      pluginSteering: {},
+    },
+    skillLearned: {},
+    progressLabels: {},
+    turnRecap: {
+      doneIn: "Done in {duration}",
+      tokens: "{count} output tokens",
+      tokensOne: "1 output token",
+    },
+    commands: {},
+    skills: {
+      menu: "Skill references",
+      label: "Skills",
+      loading: "Loading skills…",
+    },
+    splitView: {
+      chooseConversation: "Choose a conversation",
+      missingOwner:
+        "Select this pane, then choose Home or a conversation in the sidebar to restore it.",
+      open: "Open split view",
+      splitRight: "Split right",
+      splitDown: "Split down",
+      closePane: "Close pane",
+      panePosition: "Column {column}, row {row} ({pane})",
+      dropSplit: "Split",
+      dropOpenHere: "Open here",
+    },
+    sidebar: {
+      mySessions: "My sessions",
+
+      threads: "Sessions",
+      pinned: "Pinned",
+      otherSessions: "Other",
+      groups: "Groups",
+      coding: "Coding",
+      catalogViewOptions: "View options",
+      reorderItem: "Reorder {item}",
+      moveUp: "Move up",
+      moveDown: "Move down",
+      hideFromSidebar: "Hide from sidebar",
+      sectionHidden: "{section} hidden.",
+      sectionHiddenRecovery: "Show it again in Settings > Appearance > Sidebar.",
+
+      catalogGroupByProject: "Project",
+      catalogGroupByPerson: "Person",
+      openSessionMenu: "Open session menu",
+      sortBy: "Sort by",
+      sortCreated: "Created",
+      menuFilters: "Filters",
+      menuDisplay: "Display",
+      hideEmpty: "Hide empty",
+      activeFilterCount: "Active filters: {count}",
+      sortSessions: "Filter & sort",
+      sessionSources: "Session sources",
+      showAllSessions: "Show all sessions",
+      noActiveSessionsForFilter: "No active sessions match this filter",
+      sortUpdated: "Last updated",
+      sessionMenu: "Actions for {session}",
+      sessionMenuMany: "Actions for {count} sessions",
+      catalogDiscoveryHelp:
+        "{error}. Configure automatic session discovery in Settings > Appearance > Session sources.",
+      catalogPaginationFailed: "Session catalog returned a repeated page cursor",
+      catalogPageMissingHost: "Session catalog page did not include the requested host",
+    },
+    welcome: { suggestions: { whatCanYouDo: "What can you do?" } },
     runControls: {
       newSession: "New session",
-      export: "Export",
+      newSessionWorktree: "New session in worktree",
       exportChat: "Export chat",
       queue: "Queue",
       queueMessage: "Queue message",
       stop: "Stop",
+      stopWithShortcut: "Stop (Esc)",
       stopGenerating: "Stop generating",
       send: "Send",
       sendMessage: "Send message",
     },
-    queue: {
-      retry: "Retry",
-      retrySend: "Retry send",
-      retryQueuedMessage: "Retry queued message",
+    queue: {},
+    goals: {},
+    asyncQuestions: {},
+    questions: {
+      showSecret: "Show secret",
+      hideSecret: "Hide secret",
+      answer: "Answer",
+      disconnected: "Not connected. Try again after reconnecting.",
     },
-    composer: {
-      placeholder: "Message {name} (Enter to send)",
-      placeholderWithAttachments: "Add a message or paste more images...",
-      placeholderDisconnected: "Connect to the gateway to start chatting...",
-      attachFile: "Attach file",
-      dismissTalkError: "Dismiss Talk error",
-      startTalk: "Start Talk",
-      stillListening: "Still listening",
-      talkTranscript: "Talk transcript",
-      stopTalk: "Stop Talk",
+    imageLightbox: {},
+    externalImage: { notLoaded: "External image not loaded", open: "Open image" },
+    messages: {
+      copySelection: "Copy",
+      replyingTo: "Replying to {name}",
+      message: "message",
+      showLess: "Show less",
+      showMore: "Show more",
+      tooLargeToDisplay: "This message is too large to display here.",
+      unattributedSender: "Message",
+      toolSender: "Tool",
+      errorSender: "Error",
     },
+    mediaPlayer: {},
+    youtube: {},
+    modelControls: {},
+    nativeRuntimeRecovery: {},
+    permissionControls: {},
+    rail: {},
+    detailPanel: {},
+    sidebarColumns: {
+      close: "Close {panel}",
+    },
+    sidePanel: {
+      context: "Context",
+      contextEmpty: "Send a message to capture context usage.",
+      label: "Side panel",
+      quickAccess: "Quick access",
+      explorePanels: "Explore panels",
+      addTab: "Add side panel tab",
+      closeNewTab: "Close New tab",
+      closeAll: "Close all",
+      closeAllTabs: "Close all tabs",
+      closeOtherTabs: "Close other tabs",
+      closeFileChanges: "Save changes to {file} before closing?",
+      reviewFileChanges: "Open the file to review its unsaved changes before closing.",
+      expand: "Focus",
+      expandPanel: "Expand {panel}",
+      restore: "Restore split",
+      useViewAsDefault: "Use current view as default",
+      currentViewIsDefault: "This is the default view",
+      defaultViewDescription:
+        "Used when anyone opens this dashboard. Personal layout choices still apply.",
+      savingDefault: "Saving default…",
+      defaultSaved: "Dashboard default saved for future opens.",
+      defaultSaveFailed:
+        "Could not save the dashboard default. Check the connection and try again.",
+      defaultSaveError: "Could not save the dashboard default: {error}",
+      swap: "Swap {main} and {side}",
+      layout: "Layout",
+      panelPosition: "Panel position",
+      dockLeft: "Move side panel left",
+      dockRight: "Move side panel right",
+      dockBottom: "Move side panel below",
+      positionLeft: "Left",
+      positionRight: "Right",
+      positionBelow: "Below",
+      conversation: "Chat",
+      showChat: "Show this conversation",
+      hideChat: "Hide this conversation",
+      conversationEmpty: "The conversation for this task.",
+      minimize: "Minimize side panel",
+      resize: "Resize side panel",
+      review: "Review",
+      reviewEmpty: "Open a change, file, image, or tool result to review it here.",
+      terminal: "Terminal",
+      terminalEmpty: "Open a shell for this session's workspace.",
+      browser: "Browser",
+      browserEmpty: "A shared browser for you and the agent.",
+      browserUnavailableReason: {
+        permission: "You need operator.admin to use Browser.",
+        disconnected: "Disconnected.",
+        unavailable: "Browser unavailable.",
+      },
+      files: "Files",
+      filesEmpty: "Browse files, artifacts, and changes from this session.",
+      companion: "Side chat",
+      companionEmpty: "Ask a focused question about this session.",
+      processes: "Processes",
+      processesEmpty: "Inspect background commands and their output for this conversation.",
+      subagents: "Subagents",
+      subagentsEmpty: "Follow delegated work from this conversation.",
+      desktop: "Desktop",
+      desktopEmpty: "Connect to an available remote desktop.",
+      portal: "Portal",
+      portalEmpty: "Preview a web application running for this task.",
+      discussion: "Discussion",
+      discussionEmpty: "Open the shared discussion for this session.",
+      dashboard: "Dashboard",
+      dashboardOptions: "Dashboard options",
+      dashboardSize: "Size",
+      dashboardEmpty: "This task does not have a dashboard yet.",
+    },
+    thread: {},
+    pendingInputs: {
+      agentUpdate: {},
+    },
+    pairingQrExpired: {
+      title: "Pairing QR expired",
+      reason: "Run /pair qr again to generate a fresh setup code.",
+      badge: "Expired",
+    },
+    composer: {},
+    attachments: {
+      previewUnavailable: "Preview unavailable",
+    },
+    voice: {},
     selectors: {
-      agentFilter: "Filter sessions by agent",
-      session: "Chat session",
-      sessionSearch: "Search sessions",
-      clearSessionSearch: "Clear session search",
-      loadMoreSessions: "Load more sessions",
+      loadMoreSessions: "Show more",
+      loadMoreRosterSessions: "Load more sessions",
       model: "Chat model",
+      modelSection: "Model",
+      modelLocked: "Locked",
+      modelLockedLabel: "Model selection controlled for this session",
+      lockedSessionModel: "Session model",
       thinkingLevel: "Chat thinking level",
     },
+    permissions: {},
     toolCards: {
-      toolError: "Tool error",
+      activity: {},
+      review: {},
+      verbs: {},
     },
+    workRun: {
+      workedFor: "Worked for {duration}",
+      worked: "Worked",
+      toolCallsOne: "1 tool call",
+      toolCallsMany: "{count} tool calls",
+    },
+    sessionDiff: {
+      title: "Changes",
+      show: "Show session changes",
+    },
+    sessionDiscussion: {},
     workspaceFiles: {
-      label: "Session workspace",
-      expand: "Expand session workspace",
-      collapse: "Collapse session workspace",
-      workspace: "Session",
-      files: "Workspace",
-      refresh: "Refresh session workspace",
-      loading: "Loading session workspace…",
-      empty: "No files touched in this session yet",
-      changed: "Changed",
-      read: "Read",
-      artifacts: "Artifacts",
-      browser: "Project files",
-      path: "Workspace path",
-      root: "Root",
-      search: "Search files",
-      searchResults: "Search results",
-      parentFolder: "Parent folder",
-      noBrowserFiles: "No files in this folder.",
-      noSearchResults: "No matching files.",
-      truncated: "Showing the first matching files. Refine the search to narrow results.",
-      session: "Session",
-      missing: "Missing",
-      summary: "Session workspace summary",
-      changedCount: "{count} changed",
-      readCount: "{count} read",
-      artifactCount: "{count} artifacts",
-      browserCount: "{count} shown",
-      actions: "Workspace file actions",
-      preview: "Preview",
       copyPath: "Copy path",
     },
   },
-  languages: {
-    en: "English",
-    zhCN: "简体中文 (Simplified Chinese)",
-    zhTW: "繁體中文 (Traditional Chinese)",
-    ptBR: "Português (Brazilian Portuguese)",
-    de: "Deutsch (German)",
-    es: "Español (Spanish)",
-    jaJP: "日本語 (Japanese)",
-    ko: "한국어 (Korean)",
-    fr: "Français (French)",
-    ar: "العربية (Arabic)",
-    it: "Italiano (Italian)",
-    tr: "Türkçe (Turkish)",
-    uk: "Українська (Ukrainian)",
-    id: "Bahasa Indonesia (Indonesian)",
-    pl: "Polski (Polish)",
-    th: "ไทย (Thai)",
-    vi: "Tiếng Việt (Vietnamese)",
-    nl: "Nederlands (Dutch)",
-    fa: "فارسی (Persian)",
+
+  languages: {},
+  // Navigation and in-chat secret requests render before the Secrets page loads.
+  secretsStore: {
+    allowedHosts: "Allowed hosts",
+    allowedHostsPlaceholder: "api.example.com",
+    protectedSecret: "Protected secret",
+    agentReadable: "Agent-readable environment",
+    hint: "Choose protected, write-only secrets or intentionally agent-readable Gateway environment values.",
   },
   cron: {
-    quickCreate: {
-      schedules: {
-        everyMorning: {
-          label: "Every morning",
-          description: "Daily at 8:00 AM",
-        },
-        everyEvening: {
-          label: "Every evening",
-          description: "Daily at 6:00 PM",
-        },
-        hourly: {
-          label: "Hourly",
-          description: "Every hour",
-        },
-        weekdays: {
-          label: "Weekdays",
-          description: "Mon–Fri at 9:00 AM",
-        },
-        weekly: {
-          label: "Weekly",
-          description: "Every Monday at 9:00 AM",
-        },
-        once: {
-          label: "Run once",
-          description: "One-time, delete after run",
-        },
-      },
-      delivery: {
-        notify: {
-          label: "Notify me",
-          description: "Deliver results to chat",
-        },
-        silent: {
-          label: "Silent",
-          description: "Run without notification",
-        },
-        isolated: {
-          label: "Independent session",
-          description: "Run in its own session",
-        },
-      },
-      steps: {
-        what: "What",
-        when: "When",
-        how: "How",
-      },
-      defaultName: "Automation",
-      whatHeading: "What should it do?",
-      whatHint: "Describe the task in natural language. The agent will run this prompt each time.",
-      promptPlaceholder: "e.g., Check my inbox for urgent emails and summarize them...",
-      nameOptional: "Name (optional)",
-      namePlaceholder: "e.g., Morning inbox check",
-      whenHeading: "When should it run?",
-      whenHint: "Pick a schedule. You can fine-tune it later.",
-      howHeading: "How should it work?",
-      howHint: "Choose how results are delivered.",
-      title: "New Cron Job",
-    },
-    summary: {
-      enabled: "Enabled",
-      yes: "Yes",
-      no: "No",
-      jobs: "Jobs",
-      nextWake: "Next wake",
-      refreshing: "Refreshing...",
-      refresh: "Refresh",
-    },
-    jobs: {
-      title: "Jobs",
-      subtitle: "All scheduled jobs stored in the gateway.",
-      shownOf: "{shown} shown of {total}",
-      searchJobs: "Search jobs",
-      searchPlaceholder: "Name, description, or agent",
-      enabled: "Enabled",
-      schedule: "Schedule",
-      lastRun: "Last run",
-      all: "All",
-      sort: "Sort",
-      nextRun: "Next run",
-      recentlyUpdated: "Recently updated",
-      name: "Name",
-      direction: "Direction",
-      ascending: "Ascending",
-      descending: "Descending",
-      reset: "Reset",
-      emptyTitle: "No scheduled jobs yet.",
-      emptyHint: "Create one from a plain-language prompt; advanced fields can wait.",
-      emptyFilteredHint: "Clear or change filters to see scheduled jobs.",
-      noMatching: "No matching jobs.",
-      loading: "Loading...",
-      loadMore: "Load more jobs",
-    },
-    runs: {
-      title: "Run history",
-      subtitleAll: "Latest runs across all jobs.",
-      subtitleJob: "Latest runs for {title}.",
-      scope: "Scope",
-      allJobs: "All jobs",
-      selectedJob: "Selected job",
-      searchRuns: "Search runs",
-      searchPlaceholder: "Summary, error, or job",
-      newestFirst: "Newest first",
-      oldestFirst: "Oldest first",
-      status: "Status",
-      delivery: "Delivery",
-      clear: "Clear",
-      allStatuses: "All statuses",
-      allDelivery: "All delivery",
-      selectJobHint: "Select a job to inspect run history.",
-      noMatching: "No matching runs.",
-      loadMore: "Load more runs",
-      runStatusOk: "OK",
-      runStatusError: "Error",
-      runStatusSkipped: "Skipped",
-      runStatusUnknown: "Unknown",
-      deliveryDelivered: "Delivered",
-      deliveryNotDelivered: "Not delivered",
-      deliveryUnknown: "Unknown",
-      deliveryNotRequested: "Not requested",
-    },
-    form: {
-      editJob: "Edit Job",
-      newJob: "New Job",
-      advancedJob: "Advanced job",
-      updateSubtitle: "Update the selected scheduled job.",
-      createSubtitle: "Create a scheduled wakeup or agent run.",
-      required: "Required",
-      requiredSr: "required",
-      basics: "Basics",
-      basicsSub: "Name it, choose the assistant, and set enabled state.",
-      fieldName: "Name",
-      description: "Description",
-      agentId: "Agent ID",
-      namePlaceholder: "Morning brief",
-      descriptionPlaceholder: "Optional context for this job",
-      agentPlaceholder: "main or ops",
-      agentHelp: "Start typing to pick a known agent, or enter a custom one.",
-      schedule: "Schedule",
-      scheduleSub: "Control when this job runs.",
-      every: "Every",
-      at: "At",
-      cronOption: "Cron",
-      runAt: "Run at",
-      unit: "Unit",
-      minutes: "Minutes",
-      hours: "Hours",
-      days: "Days",
-      expression: "Expression",
-      expressionPlaceholder: "0 7 * * *",
-      everyAmountPlaceholder: "30",
-      timezoneOptional: "Timezone (optional)",
-      timezonePlaceholder: "America/Los_Angeles",
-      timezoneHelp: "Pick a common timezone or enter any valid IANA timezone.",
-      jitterHelp: "Need jitter? Use Advanced → Stagger window / Stagger unit.",
-      execution: "Execution",
-      executionSub: "Choose when to wake, and what this job should do.",
-      session: "Session",
-      main: "Main",
-      isolated: "Isolated",
-      sessionHelp: "Main posts a system event. Isolated runs a dedicated agent turn.",
-      wakeMode: "Wake mode",
-      now: "Now",
-      nextHeartbeat: "Next heartbeat",
-      wakeModeHelp: "Now triggers immediately. Next heartbeat waits for the next cycle.",
-      payloadKind: "What should run?",
-      command: "Command",
-      systemEvent: "Post message to main timeline",
-      agentTurn: "Run assistant task (isolated)",
-      systemEventHelp:
-        "Sends your text to the gateway main timeline (good for reminders/triggers).",
-      agentTurnHelp: "Starts an assistant run in its own session using your prompt.",
-      timeoutSeconds: "Timeout (seconds)",
-      timeoutPlaceholder: "Optional, e.g. 90",
-      timeoutHelp:
-        "Optional. Leave blank to use the gateway default timeout behavior for this run.",
-      mainTimelineMessage: "Main timeline message",
-      assistantTaskPrompt: "Assistant task prompt",
-      deliverySection: "Delivery",
-      deliverySub: "Choose where run summaries are sent.",
-      resultDelivery: "Result delivery",
-      announceDefault: "Announce summary (default)",
-      webhookPost: "Webhook POST",
-      noneInternal: "None (internal)",
-      deliveryHelp: "Announce posts a summary to chat. None keeps execution internal.",
-      webhookUrl: "Webhook URL",
-      channel: "Channel",
-      webhookPlaceholder: "https://example.com/cron",
-      channelHelp: "Choose which connected channel receives the summary.",
-      webhookHelp: "Send run summaries to a webhook endpoint.",
-      to: "To",
-      toPlaceholder: "+1555... or chat id",
-      toHelp: "Optional recipient override (chat id, phone, or user id).",
-      advanced: "Advanced",
-      advancedHelp:
-        "Optional overrides for delivery guarantees, schedule jitter, and model controls.",
-      deleteAfterRun: "Delete after run",
-      deleteAfterRunHelp: "Best for one-shot reminders that should auto-clean up.",
-      clearAgentOverride: "Clear agent override",
-      clearAgentHelp: "Force this job to use the gateway default assistant.",
-      exactTiming: "Exact timing (no stagger)",
-      exactTimingHelp: "Run on exact cron boundaries with no spread.",
-      staggerWindow: "Stagger window",
-      staggerUnit: "Stagger unit",
-      staggerPlaceholder: "30",
-      seconds: "Seconds",
-      model: "Model",
-      modelPlaceholder: "openai/gpt-5.2",
-      modelHelp: "Start typing to pick a known model, or enter a custom one.",
-      thinking: "Thinking",
-      thinkingPlaceholder: "low",
-      thinkingHelp: "Use a suggested level or enter a provider-specific value.",
-      bestEffortDelivery: "Best effort delivery",
-      bestEffortHelp: "Do not fail the job if delivery itself fails.",
-      cantAddYet: "Can't add job yet",
-      fillRequired: "Fill the required fields below to enable submit.",
-      fixFields: "Fix {count} field to continue.",
-      fixFieldsPlural: "Fix {count} fields to continue.",
-      saving: "Saving...",
-      saveChanges: "Save changes",
-      addJob: "Add job",
-      cancel: "Cancel",
-    },
-    jobList: {
-      allJobs: "all jobs",
-      selectJob: "(select a job)",
-      enabled: "enabled",
-      disabled: "disabled",
-      edit: "Edit",
-      clone: "Clone",
-      disable: "Disable",
-      enable: "Enable",
-      run: "Run",
-      history: "History",
-      remove: "Remove",
-    },
-    jobDetail: {
-      system: "System",
-      command: "Command",
-      cwd: "CWD",
-      prompt: "Prompt",
-      delivery: "Delivery",
-      agent: "Agent",
-    },
-    jobState: {
-      status: "Status",
-      next: "Next",
-      last: "Last",
-    },
-    runEntry: {
-      noSummary: "No summary.",
-      runAt: "Run at",
-      openRunChat: "Open run chat",
-      next: "Next {rel}",
-      due: "Due {rel}",
-    },
-    errors: {
-      nameRequired: "Name is required.",
-      scheduleAtInvalid: "Enter a valid date/time.",
-      everyAmountInvalid: "Interval must be greater than 0.",
-      cronExprRequired: "Cron expression is required.",
-      staggerAmountInvalid: "Stagger must be greater than 0.",
-      systemTextRequired: "System text is required.",
-      agentMessageRequired: "Agent message is required.",
-      timeoutInvalid: "If set, timeout must be greater than 0 seconds.",
-      webhookUrlRequired: "Webhook URL is required.",
-      webhookUrlInvalid: "Webhook URL must start with http:// or https://.",
-      invalidRunTime: "Invalid run time.",
-      invalidIntervalAmount: "Invalid interval amount.",
-      cronExprRequiredShort: "Cron expression required.",
-      invalidStaggerAmount: "Invalid stagger amount.",
-      systemEventTextRequired: "System event text required.",
-      agentMessageRequiredShort: "Agent message required.",
-      nameRequiredShort: "Name required.",
-    },
+    adminRequired: {},
+    tabs: {},
+    list: {},
+    suggestions: {},
+    stats: {},
+    detail: {},
+    actions: {},
+    runNotStarted: {},
+    jobs: {},
+    runs: {},
+    form: {},
+    jobState: {},
+    runEntry: {},
+    errors: {},
   },
-};
+
+  linkReader: {
+    loadingPreview: "Loading preview…",
+    title: "Link reader",
+    urlPlaceholder: "Supported link URL",
+  },
+} satisfies TranslationMap;
+
+export const en: typeof startupEnglish & EnglishCatalog = startupEnglish;

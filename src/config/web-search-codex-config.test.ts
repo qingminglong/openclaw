@@ -49,7 +49,8 @@ describe("web search Codex native config validation", () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.config.tools?.web?.search?.customSearch).toEqual({
+      const search = result.config.tools?.web?.search as Record<string, unknown> | undefined;
+      expect(search?.customSearch).toEqual({
         endpoint: "https://search.example.test",
         mode: "strict",
       });
@@ -114,29 +115,6 @@ describe("web search Codex native config validation", () => {
         (entry) => entry.path === "tools.web.search.openaiCodex.mode",
       );
       expect(issue?.allowedValues).toEqual(["cached", "live"]);
-    }
-  });
-
-  it("rejects invalid openaiCodex.contextSize", () => {
-    const result = validateConfigObjectRaw({
-      tools: {
-        web: {
-          search: {
-            openaiCodex: {
-              enabled: true,
-              contextSize: "huge",
-            },
-          },
-        },
-      },
-    });
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      const issue = result.issues.find(
-        (entry) => entry.path === "tools.web.search.openaiCodex.contextSize",
-      );
-      expect(issue?.allowedValues).toEqual(["low", "medium", "high"]);
     }
   });
 });

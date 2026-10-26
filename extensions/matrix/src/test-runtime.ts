@@ -1,16 +1,49 @@
 // Matrix plugin module implements test runtime behavior.
+import fs from "node:fs";
+import path from "node:path";
 import {
   implicitMentionKindWhen,
   resolveInboundMentionDecision,
 } from "openclaw/plugin-sdk/channel-mention-gating";
-import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
+import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
+import type {
+  OpenAsyncKeyedStoreOptions,
+  OpenBlobStoreOptions,
+  OpenKeyedStoreOptions,
+} from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
+  createPluginBlobStoreForTests,
+  resetPluginBlobStoreForTests,
   createPluginStateKeyedStoreForTests,
+  createPluginStateKeyedStoreV2ForTests,
   createPluginStateSyncKeyedStoreForTests,
+  resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { vi } from "vitest";
-import type { PluginRuntime } from "./runtime-api.js";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
+import { afterAll, vi } from "vitest";
 import { setMatrixRuntime } from "./runtime.js";
+
+const defaultStateDir = fs.realpathSync(
+  fs.mkdtempSync(path.join(resolvePreferredOpenClawTmpDir(), "openclaw-matrix-test-state-")),
+);
+
+export async function resetMatrixTestStores(): Promise<void> {
+  await closeOpenClawStateDatabaseAsync();
+  resetPluginBlobStoreForTests({ closeDatabase: false });
+  resetPluginStateStoreForTests();
+}
+
+afterAll(async () => {
+  await resetMatrixTestStores();
+  fs.rmSync(defaultStateDir, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 20,
+  });
+});
 
 type MatrixTestRuntimeOptions = {
   cfg?: Record<string, unknown>;
@@ -19,13 +52,32 @@ type MatrixTestRuntimeOptions = {
   stateDir?: string;
 };
 
+type MatrixNoticeCall = [roomId: string, payload: { body?: string }];
+type MatrixNoticeSendMock = { mock: { calls: MatrixNoticeCall[] } };
+
+export function getSentNoticeBody(sendMessage: MatrixNoticeSendMock, index = 0): string {
+  return getSentNoticeBodyFromCall(sendMessage.mock.calls[index]);
+}
+
+export function getSentNoticeBodyFromCall(call: MatrixNoticeCall | undefined): string {
+  return call?.[1].body ?? "";
+}
+
+export function getSentNoticeBodies(sendMessage: MatrixNoticeSendMock): string[] {
+  return sendMessage.mock.calls.map(getSentNoticeBodyFromCall);
+}
+
 type MatrixRuntimeStub = {
   config: Pick<PluginRuntime["config"], "current" | "mutateConfigFile" | "replaceConfigFile">;
   channel?: PluginRuntime["channel"];
   logging?: PluginRuntime["logging"];
   state: Pick<
     NonNullable<PluginRuntime["state"]>,
-    "openKeyedStore" | "openSyncKeyedStore" | "resolveStateDir"
+    | "openBlobStore"
+    | "openKeyedStore"
+    | "openKeyedStoreV2"
+    | "openSyncKeyedStore"
+    | "resolveStateDir"
   >;
 };
 
@@ -50,21 +102,25 @@ function createMatrixRuntimeMediaMock(
       path: "/tmp/test-media.jpg",
       contentType: "image/jpeg",
     }) as NonNullable<PluginRuntime["channel"]>["media"]["saveMediaBuffer"],
+    deleteMediaBuffer: vi
+      .fn<NonNullable<PluginRuntime["channel"]>["media"]["deleteMediaBuffer"]>()
+      .mockResolvedValue(),
     ...overrides,
   };
 }
 
 export function installMatrixTestRuntime(options: MatrixTestRuntimeOptions = {}): void {
-  const osHomedirForTest = () => "/tmp";
+  const stateDir = options.stateDir ?? defaultStateDir;
   const defaultStateDirResolver: NonNullable<PluginRuntime["state"]>["resolveStateDir"] = (
     _env,
-    homeDir,
-  ) => options.stateDir ?? (homeDir ?? (() => "/tmp"))();
-  const resolvePluginStateEnv = (storeOptions: OpenKeyedStoreOptions): NodeJS.ProcessEnv => ({
+    _homeDir,
+  ) => stateDir;
+  const resolvePluginStateEnv = (
+    storeOptions: Pick<OpenKeyedStoreOptions, "env">,
+  ): NodeJS.ProcessEnv => ({
     ...(storeOptions.env ?? process.env),
     OPENCLAW_STATE_DIR:
-      storeOptions.env?.OPENCLAW_STATE_DIR?.trim() ||
-      defaultStateDirResolver(storeOptions.env, osHomedirForTest),
+      storeOptions.env?.OPENCLAW_STATE_DIR?.trim() || defaultStateDirResolver(storeOptions.env),
   });
   const getRuntimeConfig = () => options.cfg ?? {};
   const logging: PluginRuntime["logging"] | undefined = options.logging
@@ -89,11 +145,25 @@ export function installMatrixTestRuntime(options: MatrixTestRuntimeOptions = {})
     ...(logging ? { logging } : {}),
     state: {
       resolveStateDir: defaultStateDirResolver,
-      openKeyedStore: (<T>(storeOptions: OpenKeyedStoreOptions) =>
+      openBlobStore: (<T>(storeOptions: OpenBlobStoreOptions) =>
+        createPluginBlobStoreForTests<T>("matrix", storeOptions, {
+          ...process.env,
+          OPENCLAW_STATE_DIR: defaultStateDirResolver(process.env),
+        })) as PluginRuntime["state"]["openBlobStore"],
+      openKeyedStore: <T>(storeOptions: OpenAsyncKeyedStoreOptions) =>
         createPluginStateKeyedStoreForTests<T>("matrix", {
           ...storeOptions,
           env: resolvePluginStateEnv(storeOptions),
-        })) as PluginRuntime["state"]["openKeyedStore"],
+        }),
+      openKeyedStoreV2: <T>(
+        storeOptions: OpenAsyncKeyedStoreOptions,
+        authority?: Parameters<PluginRuntime["state"]["openKeyedStoreV2"]>[1],
+      ) =>
+        createPluginStateKeyedStoreV2ForTests<T>(
+          "matrix",
+          { ...storeOptions, env: resolvePluginStateEnv(storeOptions) },
+          authority ?? { assertCurrent() {} },
+        ),
       openSyncKeyedStore: (<T>(storeOptions: OpenKeyedStoreOptions) =>
         createPluginStateSyncKeyedStoreForTests<T>("matrix", {
           ...storeOptions,
@@ -116,7 +186,9 @@ export function installMatrixMonitorTestRuntime(
   installMatrixTestRuntime({
     cfg: options.cfg,
     stateDir: options.stateDir,
+    logging: {},
     channel: {
+      inbound: createPluginRuntimeMock().channel.inbound,
       mentions: {
         buildMentionRegexes: () => [],
         matchesMentionPatterns:

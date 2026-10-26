@@ -1,7 +1,5 @@
-// Runtime import tests cover lazy runtime import caching and failure handling.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { toSafeImportPath } from "./import-specifier.js";
-import { importRuntimeModule, resolveRuntimeImportSpecifier } from "./runtime-import.js";
 
 describe("runtime-import", () => {
   afterEach(() => {
@@ -22,59 +20,11 @@ describe("runtime-import", () => {
     );
   });
 
-  it("resolves runtime imports from Windows absolute base paths", () => {
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-
-    expect(
-      resolveRuntimeImportSpecifier("C:\\Users\\alice\\openclaw\\dist\\subagent-registry.js", [
-        "./subagent-registry.runtime.js",
-      ]),
-    ).toBe("file:///C:/Users/alice/openclaw/dist/subagent-registry.runtime.js");
-  });
-
-  it("resolves runtime imports from file URL base paths", () => {
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-
-    expect(
-      resolveRuntimeImportSpecifier("file:///C:/Users/alice/openclaw/dist/subagent-registry.js", [
-        "./subagent-registry.runtime.js",
-      ]),
-    ).toBe("file:///C:/Users/alice/openclaw/dist/subagent-registry.runtime.js");
-  });
-
-  it("resolves absolute Windows runtime import parts directly", () => {
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-
-    expect(
-      resolveRuntimeImportSpecifier("file:///C:/Users/alice/openclaw/dist/subagent-registry.js", [
-        "D:\\OpenClaw\\dist\\subagent-registry.runtime.js",
-      ]),
-    ).toBe("file:///D:/OpenClaw/dist/subagent-registry.runtime.js");
-  });
-
   it("keeps non-Windows import paths unchanged", () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("linux");
 
     expect(toSafeImportPath("C:\\Users\\alice\\plugin\\index.mjs")).toBe(
       "C:\\Users\\alice\\plugin\\index.mjs",
     );
-  });
-
-  it("imports with the normalized runtime specifier", async () => {
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    const importModule = vi.fn(async (specifier: string) => ({ specifier }));
-
-    const result = await importRuntimeModule(
-      "C:\\Users\\alice\\openclaw\\dist\\subagent-registry.js",
-      ["./subagent-registry.runtime.js"],
-      importModule,
-    );
-
-    expect(importModule).toHaveBeenCalledWith(
-      "file:///C:/Users/alice/openclaw/dist/subagent-registry.runtime.js",
-    );
-    expect(result).toEqual({
-      specifier: "file:///C:/Users/alice/openclaw/dist/subagent-registry.runtime.js",
-    });
   });
 });

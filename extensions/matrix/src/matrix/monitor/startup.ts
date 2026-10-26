@@ -1,5 +1,5 @@
-// Matrix plugin module implements startup behavior.
-import type { RuntimeLogger } from "../../runtime-api.js";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import type { RuntimeLogger } from "openclaw/plugin-sdk/plugin-runtime";
 import type { CoreConfig, MatrixConfig } from "../../types.js";
 import type { MatrixAuth } from "../client.js";
 import type { MatrixClient } from "../sdk.js";
@@ -17,62 +17,38 @@ type MatrixStartupClient = Pick<
   | "uploadContent"
 >;
 
-export type MatrixStartupMaintenanceDeps = {
-  updateMatrixAccountConfig: typeof import("../config-update.js").updateMatrixAccountConfig;
-  summarizeMatrixDeviceHealth: typeof import("../device-health.js").summarizeMatrixDeviceHealth;
-  syncMatrixOwnProfile: typeof import("../profile.js").syncMatrixOwnProfile;
-  maybeRestoreLegacyMatrixBackup: typeof import("./legacy-crypto-restore.js").maybeRestoreLegacyMatrixBackup;
-  ensureMatrixStartupVerification: typeof import("./startup-verification.js").ensureMatrixStartupVerification;
-};
-
-let matrixStartupMaintenanceDepsPromise: Promise<MatrixStartupMaintenanceDeps> | undefined;
-
-async function loadMatrixStartupMaintenanceDeps(): Promise<MatrixStartupMaintenanceDeps> {
-  matrixStartupMaintenanceDepsPromise ??= Promise.all([
+const loadMatrixStartupMaintenanceDeps = createLazyRuntimeModule(() =>
+  Promise.all([
     import("../config-update.js"),
     import("../device-health.js"),
     import("../profile.js"),
-    import("./legacy-crypto-restore.js"),
     import("./startup-verification.js"),
-  ]).then(
-    ([
-      configUpdateModule,
-      deviceHealthModule,
-      profileModule,
-      legacyCryptoRestoreModule,
-      startupVerificationModule,
-    ]) => ({
-      updateMatrixAccountConfig: configUpdateModule.updateMatrixAccountConfig,
-      summarizeMatrixDeviceHealth: deviceHealthModule.summarizeMatrixDeviceHealth,
-      syncMatrixOwnProfile: profileModule.syncMatrixOwnProfile,
-      maybeRestoreLegacyMatrixBackup: legacyCryptoRestoreModule.maybeRestoreLegacyMatrixBackup,
-      ensureMatrixStartupVerification: startupVerificationModule.ensureMatrixStartupVerification,
-    }),
-  );
-  return await matrixStartupMaintenanceDepsPromise;
-}
+  ]).then(([configUpdateModule, deviceHealthModule, profileModule, startupVerificationModule]) => ({
+    updateMatrixAccountConfig: configUpdateModule.updateMatrixAccountConfig,
+    listStaleOpenClawMatrixDevices: deviceHealthModule.listStaleOpenClawMatrixDevices,
+    syncMatrixOwnProfile: profileModule.syncMatrixOwnProfile,
+    ensureMatrixStartupVerification: startupVerificationModule.ensureMatrixStartupVerification,
+  })),
+);
 
-export async function runMatrixStartupMaintenance(
-  params: {
-    client: MatrixStartupClient;
-    auth: MatrixAuth;
-    accountId: string;
-    effectiveAccountId: string;
-    accountConfig: MatrixConfig;
-    logger: RuntimeLogger;
-    logVerboseMessage: (message: string) => void;
-    getRuntimeConfig: () => CoreConfig;
-    replaceConfigFile: (cfg: never) => Promise<void>;
-    loadWebMedia: (
-      url: string,
-      maxBytes: number,
-    ) => Promise<{ buffer: Buffer; contentType?: string; fileName?: string }>;
-    env?: NodeJS.ProcessEnv;
-    abortSignal?: AbortSignal;
-  },
-  deps?: MatrixStartupMaintenanceDeps,
-): Promise<void> {
-  const runtimeDeps = deps ?? (await loadMatrixStartupMaintenanceDeps());
+export async function runMatrixStartupMaintenance(params: {
+  client: MatrixStartupClient;
+  auth: MatrixAuth;
+  accountId: string;
+  effectiveAccountId: string;
+  accountConfig: MatrixConfig;
+  logger: RuntimeLogger;
+  logVerboseMessage: (message: string) => void;
+  getRuntimeConfig: () => CoreConfig;
+  replaceConfigFile: (cfg: CoreConfig) => Promise<void>;
+  loadWebMedia: (
+    url: string,
+    maxBytes: number,
+  ) => Promise<{ buffer: Buffer; contentType?: string; fileName?: string }>;
+  env?: NodeJS.ProcessEnv;
+  abortSignal?: AbortSignal;
+}): Promise<void> {
+  const runtimeDeps = await loadMatrixStartupMaintenanceDeps();
   throwIfMatrixStartupAborted(params.abortSignal);
   try {
     const profileSync = await runtimeDeps.syncMatrixOwnProfile({
@@ -80,7 +56,7 @@ export async function runMatrixStartupMaintenance(
       userId: params.auth.userId,
       displayName: params.accountConfig.name,
       avatarUrl: params.accountConfig.avatarUrl,
-      loadAvatarFromUrl: async (url, maxBytes) => await params.loadWebMedia(url, maxBytes),
+      loadAvatarFromUrl: params.loadWebMedia,
     });
     throwIfMatrixStartupAborted(params.abortSignal);
     if (profileSync.displayNameUpdated) {
@@ -98,7 +74,7 @@ export async function runMatrixStartupMaintenance(
       const updatedCfg = runtimeDeps.updateMatrixAccountConfig(latestCfg, params.accountId, {
         avatarUrl: profileSync.resolvedAvatarUrl,
       });
-      await params.replaceConfigFile(updatedCfg as never);
+      await params.replaceConfigFile(updatedCfg);
       throwIfMatrixStartupAborted(params.abortSignal);
       params.logVerboseMessage(
         `matrix: persisted converted avatar URL for account ${params.accountId} (${profileSync.resolvedAvatarUrl})`,
@@ -117,12 +93,12 @@ export async function runMatrixStartupMaintenance(
 
   try {
     throwIfMatrixStartupAborted(params.abortSignal);
-    const deviceHealth = runtimeDeps.summarizeMatrixDeviceHealth(
+    const staleOpenClawDevices = runtimeDeps.listStaleOpenClawMatrixDevices(
       await params.client.listOwnDevices(),
     );
-    if (deviceHealth.staleOpenClawDevices.length > 0) {
+    if (staleOpenClawDevices.length > 0) {
       params.logger.warn(
-        `matrix: stale OpenClaw devices detected for ${params.auth.userId}: ${deviceHealth.staleOpenClawDevices.map((device) => device.deviceId).join(", ")}. Run 'openclaw matrix devices prune-stale --account ${params.effectiveAccountId}' to keep encrypted-room trust healthy.`,
+        `matrix: stale OpenClaw devices detected for ${params.auth.userId}: ${staleOpenClawDevices.map((device) => device.deviceId).join(", ")}. Run 'openclaw matrix devices prune-stale --account ${params.effectiveAccountId}' to keep encrypted-room trust healthy.`,
       );
     }
   } catch (err) {
@@ -177,42 +153,6 @@ export async function runMatrixStartupMaintenance(
       throw err;
     }
     params.logger.debug?.("Failed to resolve matrix verification status (non-fatal)", {
-      error: String(err),
-    });
-  }
-
-  try {
-    throwIfMatrixStartupAborted(params.abortSignal);
-    const legacyCryptoRestore = await runtimeDeps.maybeRestoreLegacyMatrixBackup({
-      client: params.client,
-      auth: params.auth,
-      env: params.env,
-    });
-    throwIfMatrixStartupAborted(params.abortSignal);
-    if (legacyCryptoRestore.kind === "restored") {
-      params.logger.info(
-        `matrix: restored ${legacyCryptoRestore.imported}/${legacyCryptoRestore.total} room key(s) from legacy encrypted-state backup`,
-      );
-      if (legacyCryptoRestore.localOnlyKeys > 0) {
-        params.logger.warn(
-          `matrix: ${legacyCryptoRestore.localOnlyKeys} legacy local-only room key(s) were never backed up and could not be restored automatically`,
-        );
-      }
-    } else if (legacyCryptoRestore.kind === "failed") {
-      params.logger.warn(
-        `matrix: failed restoring room keys from legacy encrypted-state backup: ${legacyCryptoRestore.error}`,
-      );
-      if (legacyCryptoRestore.localOnlyKeys > 0) {
-        params.logger.warn(
-          `matrix: ${legacyCryptoRestore.localOnlyKeys} legacy local-only room key(s) were never backed up and may remain unavailable until manually recovered`,
-        );
-      }
-    }
-  } catch (err) {
-    if (isMatrixStartupAbortError(err)) {
-      throw err;
-    }
-    params.logger.warn("matrix: failed restoring legacy encrypted-state backup", {
       error: String(err),
     });
   }

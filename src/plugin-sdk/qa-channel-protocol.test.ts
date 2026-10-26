@@ -1,76 +1,105 @@
-// QA channel protocol tests cover synthetic channel payload validation and parsing.
-import { describe, expect, it } from "vitest";
-import { sanitizeQaBusToolCalls } from "./qa-channel-protocol.js";
+import { execFile } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { afterEach, expect, it } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import {
+  buildQaTarget,
+  parseQaTarget,
+  sanitizeQaBusToolCalls,
+  type QaTargetParts,
+} from "./qa-channel-protocol.js";
 
-describe("qa-channel protocol", () => {
-  it("sanitizes QA bus tool-call arguments before persistence", () => {
-    const toolCalls = sanitizeQaBusToolCalls([
-      null,
-      { name: 123 },
-      {
-        name: " exec ",
-        arguments: {
-          command: "cat README.md",
-          apiToken: "secret-token",
-          headers: {
-            Authorization: "Bearer sk_test_12345678901234567890",
-          },
-          notes: "raw key sk-proj-12345678901234567890",
-          commandLine: "curl --password hunter2 -H 'x-api-key: abc123' https://example.test",
-          hyphenFlagCommand: "cmd --client-secret abc123 --ok yes",
-          envCommand: "NPM_TOKEN=secret GITHUB_TOKEN=secret pnpm test",
-          authCommand: "curl -H 'Authorization: Bearer eyJ1234567890abcd' https://example.test",
-          cookieCommand: "curl -H 'Cookie: a=b; c=d' https://example.test",
-          debugText: "token=abc123; keep going",
-          headerPairs: [
-            ["X-API-Key", "secret"],
-            ["Accept", "application/json"],
-          ],
-          argv: ["gh", "api", "--token", "secret-token", "repos/openclaw/openclaw"],
-          hyphenArgv: ["cmd", "--access-token", "abc123", "--ok"],
-          values: ["ok", { password: "hunter2" }],
-        },
-      },
-    ]);
+const temp = useAutoCleanupTempDirTracker(afterEach);
+const execute = promisify(execFile);
+const targets: Array<[string, QaTargetParts["chatType"], string, string?]> = [
+  ["dm:Case/Room", "direct", "Case/Room"],
+  ["group:Case/Room", "group", "Case/Room"],
+  ["channel:Case/Room", "channel", "Case/Room"],
+  ["thread:Room/Topic", "channel", "Room", "Topic"],
+  ["thread:/v1/dm/Alice/Topic", "direct", "Alice", "Topic"],
+  ["thread:/v1/group/Room%2FOne/Topic%2FTwo", "group", "Room/One", "Topic/Two"],
+];
 
-    expect(toolCalls).toEqual([
-      {
-        name: "exec",
-        arguments: {
-          command: "[redacted]",
-          apiToken: "[redacted]",
-          headers: {
-            Authorization: "[redacted]",
-          },
-          notes: "[redacted]",
-          commandLine: "[redacted]",
-          hyphenFlagCommand: "[redacted]",
-          envCommand: "[redacted]",
-          authCommand: "[redacted]",
-          cookieCommand: "[redacted]",
-          debugText: "[redacted]",
-          headerPairs: [
-            ["[redacted]", "[redacted]"],
-            ["[redacted]", "[redacted]"],
-          ],
-          argv: ["[redacted]", "[redacted]", "[redacted]", "[redacted]", "[redacted]"],
-          hyphenArgv: ["[redacted]", "[redacted]", "[redacted]", "[redacted]"],
-          values: ["[redacted]", { password: "[redacted]" }],
-        },
-      },
-    ]);
+it("loads natively when the private QA SDK alias selects its source", async () => {
+  // Only the SDK resolver uses tsx; the source facade must load natively.
+  const root = fs.realpathSync(temp.make("qa-channel-protocol-native-"));
+  fs.writeFileSync(path.join(root, "package.json"), '{"name":"qa-probe","type":"module"}\n');
+  const entry = path.join(root, "index.mjs");
+  fs.writeFileSync(
+    entry,
+    'export { parseQaTarget } from "openclaw/plugin-sdk/qa-channel-protocol";\n',
+  );
+  const resolverUrl = new URL("../plugins/plugin-sdk-native-resolver.ts", import.meta.url).href;
+  const { stdout } = await execute(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { tsImport } from ${JSON.stringify(import.meta.resolve("tsx/esm/api"))};
+         const { installOpenClawPluginSdkNativeResolver } = await tsImport(${JSON.stringify(resolverUrl)}, {
+           parentURL: import.meta.url,
+           tsconfig: ${JSON.stringify(path.resolve("tsconfig.json"))},
+         });
+         installOpenClawPluginSdkNativeResolver({ pluginModulePath: ${JSON.stringify(entry)}, pluginSdkResolution: "src" });
+         const { parseQaTarget } = await import(${JSON.stringify(pathToFileURL(entry).href)});
+         console.log(JSON.stringify(parseQaTarget("thread:/v1/dm/Case%2FID/Thread")));`,
+    ],
+    { env: { ...process.env, OPENCLAW_ENABLE_PRIVATE_QA_CLI: "1" } },
+  );
+  expect(JSON.parse(stdout)).toEqual({
+    chatType: "direct",
+    conversationId: "Case/ID",
+    threadId: "Thread",
   });
+});
 
-  it("caps QA bus tool-call sanitization before processing the tail", () => {
-    const toolCalls = Array.from({ length: 50 }, (_, index) => ({
-      name: `tool-${index}`,
-    }));
-    toolCalls.push({
-      get name(): string {
-        throw new Error("tail should not be sanitized");
-      },
+it("builds and parses canonical targets without folding ids", () => {
+  for (const [target, chatType, conversationId, threadId] of targets) {
+    expect(buildQaTarget({ chatType, conversationId, threadId })).toBe(target);
+    expect(parseQaTarget(target)).toEqual({
+      chatType,
+      conversationId,
+      ...(threadId ? { threadId } : {}),
     });
-
-    expect(sanitizeQaBusToolCalls(toolCalls)?.map((toolCall) => toolCall.name)).toHaveLength(50);
+  }
+  expect(parseQaTarget("bare-id", { defaultChatType: "group" })).toEqual({
+    chatType: "group",
+    conversationId: "bare-id",
   });
+  expect(() => parseQaTarget("CHANNEL:CaseSensitive")).toThrow(
+    "qa-channel target prefixes must be lowercase",
+  );
+  expect(() => parseQaTarget("")).toThrow("qa-channel target is required");
+  expect(() => parseQaTarget("dm:")).toThrow("invalid qa-channel dm target");
+  const invalidThread = "invalid qa-channel thread target";
+  expect(() => parseQaTarget("thread:Room/")).toThrow(invalidThread);
+  expect(() => parseQaTarget("thread:/v1/group/Room/%GG")).toThrow(invalidThread);
+});
+
+it("preserves QA bus tool-call arguments while normalizing calls", () => {
+  const args = {
+    apiToken: "secret-token",
+    headers: { Authorization: "Bearer sk_test_12345678901234567890" },
+    headerPairs: [["X-API-Key", "secret"]],
+    argv: ["--token", "secret-token"],
+    values: [{ password: "hunter2" }],
+  };
+  const expectedArgs = structuredClone(args);
+  expect(
+    sanitizeQaBusToolCalls([null, { name: 123 }, { name: " exec ", arguments: args }]),
+  ).toEqual([{ name: "exec", arguments: expectedArgs }]);
+});
+
+it("caps QA bus tool-call sanitization before processing the tail", () => {
+  const toolCalls = Array.from({ length: 50 }, (_, index) => ({ name: `tool-${index}` }));
+  toolCalls.push({
+    get name(): string {
+      throw new Error("tail should not be sanitized");
+    },
+  });
+
+  expect(sanitizeQaBusToolCalls(toolCalls)?.map((toolCall) => toolCall.name)).toHaveLength(50);
 });

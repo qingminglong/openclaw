@@ -1,4 +1,3 @@
-// Gateway Client module implements readiness behavior.
 import type { GatewayClientOptions } from "./client.js";
 import {
   waitForEventLoopReady,
@@ -21,31 +20,10 @@ export type GatewayClientStartReadinessOptions = {
   timeoutMs?: number;
   clientOptions?: Pick<
     GatewayClientOptions,
-    "connectChallengeTimeoutMs" | "connectDelayMs" | "env" | "preauthHandshakeTimeoutMs"
+    "connectChallengeTimeoutMs" | "env" | "preauthHandshakeTimeoutMs"
   >;
   signal?: AbortSignal;
 };
-
-function resolveGatewayClientStartReadinessTimeoutMs(
-  options: GatewayClientStartReadinessOptions = {},
-): number {
-  if (typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)) {
-    return options.timeoutMs;
-  }
-  const clientOptions = options.clientOptions ?? {};
-  const timeoutOverride =
-    typeof clientOptions.connectChallengeTimeoutMs === "number" &&
-    Number.isFinite(clientOptions.connectChallengeTimeoutMs)
-      ? clientOptions.connectChallengeTimeoutMs
-      : typeof clientOptions.connectDelayMs === "number" &&
-          Number.isFinite(clientOptions.connectDelayMs)
-        ? clientOptions.connectDelayMs
-        : undefined;
-  return resolveConnectChallengeTimeoutMs(timeoutOverride, {
-    env: clientOptions.env,
-    configuredTimeoutMs: clientOptions.preauthHandshakeTimeoutMs,
-  });
-}
 
 /** Starts a gateway client only after the supplied readiness probe succeeds. */
 export async function startGatewayClientWithReadinessWait(
@@ -53,8 +31,18 @@ export async function startGatewayClientWithReadinessWait(
   client: GatewayClientStartable,
   options: GatewayClientStartReadinessOptions = {},
 ): Promise<EventLoopReadyResult> {
+  let maxWaitMs: number;
+  if (typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)) {
+    maxWaitMs = options.timeoutMs;
+  } else {
+    const clientOptions = options.clientOptions ?? {};
+    maxWaitMs = resolveConnectChallengeTimeoutMs(clientOptions.connectChallengeTimeoutMs, {
+      env: clientOptions.env,
+      configuredTimeoutMs: clientOptions.preauthHandshakeTimeoutMs,
+    });
+  }
   const readiness = await waitForReady({
-    maxWaitMs: resolveGatewayClientStartReadinessTimeoutMs(options),
+    maxWaitMs,
     signal: options.signal,
   });
   if (readiness.ready && !readiness.aborted && options.signal?.aborted !== true) {

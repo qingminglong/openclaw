@@ -1,77 +1,74 @@
 import type { SessionConfig } from "@github/copilot-sdk";
 import {
-  buildAgentHarnessUserInputAnswers,
-  deliverAgentHarnessUserInputPrompt,
   embeddedAgentLog,
+  runAgentHarnessGatewayQuestion,
   type AgentHarnessUserInputQuestion,
-  type EmbeddedRunAttemptParams,
+  type EmbeddedRunAttemptParamsV2,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-
-type PendingCopilotUserInput = {
-  question: AgentHarnessUserInputQuestion;
-  resolve: (value: CopilotUserInputResponse) => void;
-  cleanup: () => void;
-};
+import {
+  escapeChatDisplayText as escapeCopilotChatText,
+  sanitizeChatDisplayText as sanitizeCopilotDisplayText,
+} from "openclaw/plugin-sdk/string-normalization-runtime";
 
 type CopilotUserInputHandler = NonNullable<SessionConfig["onUserInputRequest"]>;
 type CopilotUserInputRequest = Parameters<CopilotUserInputHandler>[0];
 type CopilotUserInputResponse = Awaited<ReturnType<CopilotUserInputHandler>>;
 
-type CopilotUserInputBridge = {
+export type CopilotUserInputBridge = {
   onUserInputRequest: CopilotUserInputHandler;
-  handleQueuedMessage: (text: string) => boolean;
   cancelPending: () => void;
 };
 
 const COPILOT_USER_INPUT_QUESTION_ID = "answer";
+const DEFAULT_USER_INPUT_TIMEOUT_MS = 15 * 60_000;
 
 export function createCopilotUserInputBridge(params: {
-  paramsForRun: EmbeddedRunAttemptParams;
+  paramsForRun: EmbeddedRunAttemptParamsV2;
   signal?: AbortSignal;
+  gatewayCall?: Parameters<typeof runAgentHarnessGatewayQuestion>[0]["gatewayCall"];
 }): CopilotUserInputBridge {
-  let pending: PendingCopilotUserInput | undefined;
-
-  const resolvePending = (value: CopilotUserInputResponse) => {
-    const current = pending;
-    if (!current) {
-      return;
-    }
-    pending = undefined;
-    current.cleanup();
-    current.resolve(value);
-  };
+  let pending: AbortController | undefined;
 
   return {
-    onUserInputRequest(request) {
-      const question = toQuestion(request);
-      resolvePending(emptyCopilotUserInputResponse());
-      return new Promise<CopilotUserInputResponse>((resolve) => {
-        const abortListener = () => resolvePending(emptyCopilotUserInputResponse());
-        const cleanup = () => params.signal?.removeEventListener("abort", abortListener);
-        pending = { question, resolve, cleanup };
-        params.signal?.addEventListener("abort", abortListener, { once: true });
-        if (params.signal?.aborted) {
-          resolvePending(emptyCopilotUserInputResponse());
-          return;
-        }
-        void deliverAgentHarnessUserInputPrompt(params.paramsForRun, [question], {
-          intro: "Copilot needs input:",
-          formatText: formatCopilotDisplayText,
-        }).catch((error: unknown) => {
-          embeddedAgentLog.warn("failed to deliver copilot user input prompt", { error });
+    async onUserInputRequest(request) {
+      pending?.abort(new Error("Copilot user input request replaced"));
+      const abort = new AbortController();
+      pending = abort;
+      try {
+        const question = toQuestion(request);
+        const result = await runAgentHarnessGatewayQuestion({
+          questions: [question],
+          sessionKey: params.paramsForRun.sessionKey ?? params.paramsForRun.sessionId,
+          agentId: params.paramsForRun.agentId,
+          runId: params.paramsForRun.runId,
+          timeoutMs: params.paramsForRun.timeoutMs ?? DEFAULT_USER_INPUT_TIMEOUT_MS,
+          gatewayCall: params.gatewayCall,
+          delivery: params.paramsForRun,
+          promptOptions: {
+            intro: "Copilot needs input:",
+            formatText: formatCopilotDisplayText,
+          },
+          signal: params.signal ? AbortSignal.any([params.signal, abort.signal]) : abort.signal,
         });
-      });
-    },
-    handleQueuedMessage(text) {
-      const current = pending;
-      if (!current) {
-        return false;
+        if (result.status !== "answered") {
+          return emptyCopilotUserInputResponse();
+        }
+        const selected = result.answers.answers[COPILOT_USER_INPUT_QUESTION_ID]?.[0] ?? "";
+        return {
+          answer: selected,
+          wasFreeform: !isChoiceAnswer(question, selected),
+        };
+      } catch (error) {
+        embeddedAgentLog.warn("failed to bridge copilot user input through gateway", { error });
+        return emptyCopilotUserInputResponse();
+      } finally {
+        if (pending === abort) {
+          pending = undefined;
+        }
       }
-      resolvePending(buildCopilotUserInputResponse(current.question, text));
-      return true;
     },
     cancelPending() {
-      resolvePending(emptyCopilotUserInputResponse());
+      pending?.abort(new Error("Copilot user input request cancelled"));
     },
   };
 }
@@ -79,7 +76,7 @@ export function createCopilotUserInputBridge(params: {
 function toQuestion(request: CopilotUserInputRequest): AgentHarnessUserInputQuestion {
   return {
     id: COPILOT_USER_INPUT_QUESTION_ID,
-    header: "Copilot needs input",
+    header: "Copilot",
     question: request.question,
     isOther: request.allowFreeform !== false,
     isSecret: false,
@@ -87,18 +84,6 @@ function toQuestion(request: CopilotUserInputRequest): AgentHarnessUserInputQues
       request.choices && request.choices.length > 0
         ? request.choices.map((choice: string) => ({ label: choice }))
         : null,
-  };
-}
-
-function buildCopilotUserInputResponse(
-  question: AgentHarnessUserInputQuestion,
-  inputText: string,
-): CopilotUserInputResponse {
-  const rawAnswers = buildAgentHarnessUserInputAnswers([question], inputText);
-  const selected = rawAnswers.answers[COPILOT_USER_INPUT_QUESTION_ID]?.answers[0] ?? "";
-  return {
-    answer: selected,
-    wasFreeform: !isChoiceAnswer(question, selected),
   };
 }
 
@@ -116,46 +101,4 @@ function isChoiceAnswer(question: AgentHarnessUserInputQuestion, answer: string)
 function formatCopilotDisplayText(value: string): string {
   const safe = sanitizeCopilotDisplayText(value).trim();
   return escapeCopilotChatText(safe || "<unknown>");
-}
-
-function sanitizeCopilotDisplayText(value: string): string {
-  let safe = "";
-  for (const character of value) {
-    const codePoint = character.codePointAt(0);
-    safe += codePoint != null && isUnsafeDisplayCodePoint(codePoint) ? "?" : character;
-  }
-  return safe;
-}
-
-function escapeCopilotChatText(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll("@", "\uff20")
-    .replaceAll("`", "\uff40")
-    .replaceAll("[", "\uff3b")
-    .replaceAll("]", "\uff3d")
-    .replaceAll("(", "\uff08")
-    .replaceAll(")", "\uff09")
-    .replaceAll("*", "\u2217")
-    .replaceAll("_", "\uff3f")
-    .replaceAll("~", "\uff5e")
-    .replaceAll("|", "\uff5c");
-}
-
-function isUnsafeDisplayCodePoint(codePoint: number): boolean {
-  return (
-    codePoint <= 0x001f ||
-    (codePoint >= 0x007f && codePoint <= 0x009f) ||
-    codePoint === 0x00ad ||
-    codePoint === 0x061c ||
-    codePoint === 0x180e ||
-    (codePoint >= 0x200b && codePoint <= 0x200f) ||
-    (codePoint >= 0x202a && codePoint <= 0x202e) ||
-    (codePoint >= 0x2060 && codePoint <= 0x206f) ||
-    codePoint === 0xfeff ||
-    (codePoint >= 0xfff9 && codePoint <= 0xfffb) ||
-    (codePoint >= 0xe0000 && codePoint <= 0xe007f)
-  );
 }

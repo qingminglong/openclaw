@@ -1,154 +1,293 @@
-// Covers ACP diagnostic event propagation and sanitized error formatting.
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AcpRuntimeError, formatAcpErrorChain } from "../../acp/runtime/errors.js";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { ACP_TURN_TIMEOUT_DETAIL_CODE } from "../../acp/control-plane/manager.turn-timeout.js";
+import { AcpRuntimeError } from "../../acp/runtime/errors.js";
 import {
   type AgentEventPayload,
+  onAgentAuditEvent,
   onAgentEvent,
   resetAgentEventsForTest,
 } from "../../infra/agent-events.js";
 import {
+  onTrustedToolExecutionEvent,
+  resetDiagnosticEventsForTest,
+  type TrustedToolExecutionEvent,
+} from "../../infra/diagnostic-events.js";
+import {
+  buildAcpResult,
+  createAcpToolLifecycleTracker,
+  emitAcpLifecycleStart,
+  emitAcpLifecycleEnd,
   emitAcpLifecycleError,
   emitAcpPromptSubmitted,
   emitAcpRuntimeEvent,
-} from "./attempt-execution.js";
+  resolveAcpLifecycleEndFields,
+} from "./acp-lifecycle.js";
 
-let captured: AgentEventPayload[] = [];
-let unsubscribe: (() => void) | undefined;
+let captured: AgentEventPayload[];
+let capturedTools: TrustedToolExecutionEvent[];
+let unsubscribe: () => void;
+let unsubscribeTools: () => void;
+let toolTracker = createAcpToolLifecycleTracker();
+const runId = "run-acp";
+type RuntimeParams = Parameters<typeof emitAcpRuntimeEvent>[0];
+type ToolEvent = Extract<RuntimeParams["event"], { type: "tool_call" }>;
+const sessionKey = "agent:main:acp:child";
+const token = "sk-abcdefghijklmnopqrstuvwxyz123456";
+
+function emit(event: RuntimeParams["event"], params: Partial<Omit<RuntimeParams, "event">> = {}) {
+  emitAcpRuntimeEvent({ runId, toolTracker, ...params, event });
+}
+
+function emitTool(
+  event: Partial<ToolEvent> = {},
+  params: Partial<Omit<RuntimeParams, "event">> = {},
+) {
+  emit(
+    {
+      type: "tool_call",
+      text: "running",
+      kind: "execute",
+      toolCallId: "call",
+      tag: "tool_call",
+      status: "in_progress",
+      ...event,
+    },
+    params,
+  );
+}
+function update(status = "completed", toolCallId = "call") {
+  emitTool({ tag: "tool_call_update", status, toolCallId });
+}
+function toolEvent(type: string, fields: object = {}) {
+  return { type: `tool.execution.${type}`, toolCallId: "call", ...fields };
+}
+
+function end(
+  resultStatus: "completed" | "cancelled" = "completed",
+  abortSignal?: AbortSignal,
+  stopReason?: string,
+  context = { runId, toolTracker },
+) {
+  emitAcpLifecycleEnd({
+    ...context,
+    endFields: resolveAcpLifecycleEndFields(abortSignal, stopReason, resultStatus),
+  });
+}
+
+function expectCompletedTools(offset = 0) {
+  expect(capturedTools.slice(offset).map((event) => event.type)).toEqual([
+    "tool.execution.started",
+    "tool.execution.completed",
+  ]);
+}
+function fail(error: Error, auditOnly = false) {
+  emitAcpLifecycleError({ runId, toolTracker, error, auditOnly });
+}
 
 beforeEach(() => {
   resetAgentEventsForTest();
+  resetDiagnosticEventsForTest();
+  toolTracker = createAcpToolLifecycleTracker();
   captured = [];
-  // Subscribe to the process-level event bus so tests observe exactly what
-  // parent relay diagnostics would receive.
-  unsubscribe = onAgentEvent((evt) => {
-    captured.push(evt);
-  });
+  capturedTools = [];
+  unsubscribe = onAgentEvent((event) => captured.push(event));
+  unsubscribeTools = onTrustedToolExecutionEvent((event) => capturedTools.push(event));
+});
+afterEach(() => {
+  unsubscribe();
+  unsubscribeTools();
+  resetAgentEventsForTest();
+  resetDiagnosticEventsForTest();
+  vi.unstubAllEnvs();
 });
 
-describe("ACP diagnostic events", () => {
-  it("emits prompt-submitted state with proxy env names but not values", () => {
-    const previous = process.env.HTTPS_PROXY;
-    process.env.HTTPS_PROXY = "http://proxy.example.invalid:8080";
-    try {
-      emitAcpPromptSubmitted({
-        runId: "run-prompt",
-        sessionKey: "agent:codex:acp:child",
-        at: 123,
-      });
-    } finally {
-      if (previous === undefined) {
-        delete process.env.HTTPS_PROXY;
-      } else {
-        process.env.HTTPS_PROXY = previous;
-      }
-    }
+it("preserves cancelled result metadata without a stop reason", () => {
+  expect(
+    buildAcpResult({
+      payloadText: "",
+      terminalReply: { disposition: "empty" },
+      startedAt: Date.now(),
+      resultStatus: "cancelled",
+    }).meta,
+  ).toMatchObject({ aborted: true, stopReason: "stop" });
+});
 
-    const event = captured[0];
-    expect(event?.stream).toBe("acp");
-    expect(event?.sessionKey).toBe("agent:codex:acp:child");
-    expect(event?.data).toMatchObject({
+it("emits prompt-submitted state with proxy env names but not values", () => {
+  vi.stubEnv("HTTPS_PROXY", "http://proxy.example.invalid:8080");
+  emitAcpPromptSubmitted({ runId, sessionKey, at: 123 });
+  expect(captured[0]).toMatchObject({
+    stream: "acp",
+    sessionKey,
+    data: {
       phase: "prompt_submitted",
       at: 123,
       proxyEnvKeys: expect.arrayContaining(["HTTPS_PROXY"]),
-    });
-    expect(JSON.stringify(event?.data)).not.toContain("proxy.example.invalid");
+    },
   });
+  expect(JSON.stringify(captured[0]?.data)).not.toContain("proxy.example.invalid");
+});
 
-  it("emits sanitized non-text runtime events for parent relay diagnostics", () => {
-    emitAcpRuntimeEvent({
-      runId: "run-status",
-      event: {
-        type: "status",
-        text: "connecting token=sk-abcdefghijklmnopqrstuvwxyz123456",
-        tag: "session_info_update",
-      },
-    });
+it("emits sanitized non-text runtime events for parent relay diagnostics", () => {
+  emit({ type: "status", text: `connecting token=${token}`, tag: "session_info_update" });
+  expect(captured[0]).toMatchObject({
+    stream: "acp",
+    data: { phase: "runtime_event", eventType: "status", tag: "session_info_update" },
+  });
+  expect(String(captured[0]?.data.text)).toContain("connecting");
+  expect(String(captured[0]?.data.text)).not.toContain(token);
+});
 
-    const event = captured[0];
-    expect(event?.stream).toBe("acp");
-    expect(event?.data).toMatchObject({
-      phase: "runtime_event",
-      eventType: "status",
-      tag: "session_info_update",
-    });
-    expect(String(event?.data.text)).toContain("connecting");
-    expect(String(event?.data.text)).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456");
+it("keeps audit-only ACP lifecycle and runtime events off the shared bus", () => {
+  const secret = "private ACP cause chain";
+  const auditEvents: AgentEventPayload[] = [];
+  const stopAudit = onAgentAuditEvent((event) => auditEvents.push(event));
+  try {
+    emitAcpLifecycleStart({ runId, sessionKey, startedAt: 123, auditOnly: true });
+    emitTool(
+      { text: "private command payload", status: "completed" },
+      { sessionKey, auditOnly: true },
+    );
+    fail(new Error(secret), true);
+  } finally {
+    stopAudit();
+  }
+  expect(captured).toEqual([]);
+  expect(auditEvents.map((event) => [event.stream, event.data.phase])).toEqual([
+    ["lifecycle", "start"],
+    ["lifecycle", "error"],
+  ]);
+  expectCompletedTools();
+  expect(JSON.stringify(auditEvents)).not.toContain("private command payload");
+  expect(JSON.stringify(auditEvents)).not.toContain(secret);
+});
+
+it("emits metadata-only tool lifecycle events without ACP text or title", () => {
+  const text = "secret tool payload";
+  const event = { text, title: text, kind: "read" } satisfies Partial<ToolEvent>;
+  const identity = { sessionKey, agentId: "main" };
+  emitTool(event, identity);
+  emitTool({ ...event, tag: "tool_call_update", status: "completed" }, identity);
+  expect(capturedTools).toMatchObject([
+    toolEvent("started", { runId, ...identity, toolName: "acp_read" }),
+    toolEvent("completed", { runId, ...identity, toolName: "acp_read" }),
+  ]);
+  expect(JSON.stringify(capturedTools)).not.toContain(event.text);
+});
+
+it.each(["failed", "cancelled"] as const)("tracks terminal tool status %s", (status) => {
+  emitTool();
+  emitTool({ tag: "tool_call_update", text: status, status });
+  end();
+  expect(capturedTools).toHaveLength(2);
+  expect(capturedTools[1]).toMatchObject(
+    toolEvent("error", {
+      terminalReason: status,
+      ...(status === "cancelled" ? { errorCategory: "aborted" } : {}),
+    }),
+  );
+});
+
+it("deduplicates repeated terminal tool updates until the ACP run ends", () => {
+  emitTool();
+  update();
+  update();
+  update("in_progress");
+  expectCompletedTools();
+  end();
+  update();
+  expectCompletedTools(2);
+});
+
+it("fails closed without evicting terminal identities at the tracking bound", () => {
+  for (let index = 0; index < 4096; index++) {
+    update("completed", `call-${index}`);
+  }
+  expect(capturedTools).toHaveLength(8192);
+  update("completed", "call-0");
+  update("completed", "call-overflow");
+  expect(capturedTools).toHaveLength(8192);
+  const unrelated = { runId: "unrelated", toolTracker: createAcpToolLifecycleTracker() };
+  emitTool(
+    { toolCallId: "call-unrelated", tag: "tool_call_update", status: "completed" },
+    unrelated,
+  );
+  expectCompletedTools(8192);
+  end("completed", undefined, undefined, unrelated);
+  end();
+  update("completed", "call-overflow");
+  expectCompletedTools(8194);
+});
+
+it("waits for terminal evidence before recording a tool without a call id", () => {
+  emitTool({ toolCallId: undefined });
+  expect(capturedTools).toEqual([]);
+  emitTool({ toolCallId: undefined, tag: "tool_call_update" });
+  expect(capturedTools).toEqual([]);
+  emitTool({ toolCallId: undefined, tag: "tool_call_update", status: "completed" });
+  expectCompletedTools();
+});
+
+it.each([
+  [undefined, "cancelled", "aborted"],
+  ["timeout", "timed_out", "acp_tool_incomplete"],
+] as const)(
+  "settles outstanding tools on %s / %s termination",
+  (stopReason, terminalReason, errorCategory) => {
+    const controller = new AbortController();
+    emitTool({}, { sessionKey });
+    if (stopReason === "timeout") {
+      controller.abort(Object.assign(new Error("timed out"), { name: "TimeoutError" }));
+    }
+    emit({ type: "done", status: "cancelled", stopReason });
+    end("cancelled", controller.signal, stopReason);
+    expect(capturedTools).toMatchObject([
+      toolEvent("started"),
+      toolEvent("error", { terminalReason, errorCategory }),
+    ]);
+    if (terminalReason === "cancelled") {
+      expect(captured.at(-1)?.data).toMatchObject({
+        phase: "end",
+        executionSettled: true,
+        aborted: true,
+        stopReason: "stop",
+        status: "cancelled",
+      });
+    }
+    emitTool({ status: "completed" });
+    expect(capturedTools.slice(2)).toMatchObject([toolEvent("started"), toolEvent("completed")]);
+  },
+);
+
+it("preserves manager-owned ACP timeout attribution without an aborted caller signal", () => {
+  emitTool();
+  fail(
+    new AcpRuntimeError("ACP_TURN_FAILED", "ACP turn timed out.", {
+      detailCode: ACP_TURN_TIMEOUT_DETAIL_CODE,
+    }),
+  );
+  expect(capturedTools.at(-1)).toMatchObject(toolEvent("error", { terminalReason: "timed_out" }));
+  expect(captured.at(-1)?.data).toMatchObject({
+    phase: "error",
+    aborted: true,
+    stopReason: "timeout",
+    status: "timed_out",
   });
 });
 
-afterEach(() => {
-  unsubscribe?.();
-  unsubscribe = undefined;
-  resetAgentEventsForTest();
-});
-
-describe("emitAcpLifecycleError preserves AcpRuntimeError detail (regression: openclaw-4a8)", () => {
-  it("renders the AcpRuntimeError code into the error string so existing consumers surface it", () => {
-    const acpError = new AcpRuntimeError("ACP_TURN_FAILED", "ACP turn failed before completion.");
-
-    emitAcpLifecycleError({ runId: "run-1", error: acpError });
-
-    expect(captured).toHaveLength(1);
-    const data = captured[0]?.data as Record<string, unknown> | undefined;
-    expect(data?.phase).toBe("error");
-    const text = data?.error as string;
-    expect(text).toMatch(/ACP_TURN_FAILED/);
-    expect(text).toMatch(/ACP turn failed before completion\./);
-  });
-
-  it("flattens the cause chain into the error string so the underlying RequestError is not lost", () => {
-    // ACP callers historically surface a single string; flattening preserves
-    // the useful nested RequestError without exposing structured internals.
-    const rootCause = new Error('RequestError: "Method not found": nes/close (-32601)');
-    const wrapped = new Error("Agent does not support session/close (oneshot:abc)", {
-      cause: rootCause,
-    });
-    const acpError = new AcpRuntimeError("ACP_TURN_FAILED", "Internal error", {
-      cause: wrapped,
-    });
-
-    emitAcpLifecycleError({ runId: "run-2", error: acpError });
-
-    const data = captured[0]?.data as Record<string, unknown> | undefined;
-    const text = data?.error as string;
-
-    expect(text).toMatch(/ACP_TURN_FAILED/);
-    expect(text).toMatch(/Internal error/);
-    expect(text).toMatch(/Agent does not support session\/close/);
-    expect(text).toMatch(/Method not found/);
-    expect(text).toMatch(/nes\/close/);
-    expect(text).toMatch(/-32601/);
-  });
-
-  it("falls back gracefully when given a plain Error without code or cause", () => {
-    const plain = new Error("something went wrong");
-
-    emitAcpLifecycleError({ runId: "run-3", error: plain });
-
-    const data = captured[0]?.data as Record<string, unknown> | undefined;
-    expect(data?.phase).toBe("error");
-    expect(data?.error).toBe("Error: something went wrong");
-  });
-
-  it("formats non-Error values without crashing", () => {
-    expect(formatAcpErrorChain("just a string")).toBe("just a string");
-    expect(formatAcpErrorChain(42)).toBe("42");
-    expect(formatAcpErrorChain(undefined)).toBe("undefined");
-
-    const token = "sk-abcdefghijklmnopqrstuvwxyz123456";
-    const text = formatAcpErrorChain(`upstream rejected token=${token}`);
-    expect(text).toMatch(/upstream rejected/);
-    expect(text).not.toContain(token);
-  });
-
-  it("caps cause-chain depth so a self-referential cause cannot loop", () => {
-    const e: Error & { cause?: unknown } = new Error("loop");
-    e.cause = e;
-
-    const text = formatAcpErrorChain(e);
-
-    // Should produce a finite string with the message, not hang.
-    expect(text).toMatch(/loop/);
-    expect(text.length).toBeLessThan(2000);
-  });
+it("preserves and sanitizes nested ACP failure details (openclaw-4a8)", () => {
+  const root = new Error(`RequestError: "Method not found": nes/close (-32601) token=${token}`);
+  const cause = new Error("Agent does not support session/close (oneshot:abc)", { cause: root });
+  fail(new AcpRuntimeError("ACP_TURN_FAILED", "Internal error", { cause }));
+  const text = String(captured[0]?.data.error);
+  for (const fragment of [
+    "ACP_TURN_FAILED",
+    "Internal error",
+    "Agent does not support session/close",
+    "Method not found",
+    "nes/close",
+    "-32601",
+  ]) {
+    expect(text).toContain(fragment);
+  }
+  expect(text).not.toContain(token);
 });

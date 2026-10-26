@@ -1,12 +1,13 @@
-// Memory Host SDK module implements batch upload behavior.
-import {
-  buildBatchHeaders,
-  normalizeBatchBaseUrl,
-  type BatchHttpClientConfig,
-} from "./batch-utils.js";
-import { hashText } from "./hash.js";
+import { sha256Hex } from "@openclaw/normalization-core/node-crypto";
+import { buildBatchHeaders, type BatchHttpClientConfig } from "./batch-utils.js";
+import { resolveEmbeddingEndpointUrl } from "./embeddings-remote-client.js";
+import { formatErrorMessage } from "./error-utils.js";
+import { createProviderHttpError } from "./openclaw-runtime-network.js";
 import { withRemoteHttpResponse } from "./remote-http.js";
-import { readResponseJsonWithLimit, readResponseTextSnippet } from "./response-snippet.js";
+import {
+  readMemoryHostResponseTextSnippet,
+  readResponseJsonWithLimit,
+} from "./response-snippet.js";
 
 // Uploads provider batch JSONL payloads through the shared remote HTTP guard.
 
@@ -18,30 +19,36 @@ export async function uploadBatchJsonlFile(params: {
   maxResponseBytes?: number;
   signal?: AbortSignal;
 }): Promise<string> {
-  const baseUrl = normalizeBatchBaseUrl(params.client);
   const jsonl = params.requests.map((request) => JSON.stringify(request)).join("\n");
   const form = new FormData();
   form.append("purpose", "batch");
   form.append(
     "file",
     new Blob([jsonl], { type: "application/jsonl" }),
-    `memory-embeddings.${hashText(String(Date.now()))}.jsonl`,
+    `memory-embeddings.${sha256Hex(String(Date.now()))}.jsonl`,
   );
 
   const filePayload = await withRemoteHttpResponse({
-    url: `${baseUrl}/files`,
+    url: resolveEmbeddingEndpointUrl(params.client.baseUrl ?? "", "files"),
     ssrfPolicy: params.client.ssrfPolicy,
     fetchImpl: params.client.fetchImpl,
+    resolveRequestHeaders: params.client.resolveRequestHeaders,
     signal: params.signal,
     init: {
       method: "POST",
       headers: buildBatchHeaders(params.client, { json: false }),
       body: form,
     },
-    onResponse: async (fileRes) => {
+    onResponse: async (fileRes, requestHeaders) => {
       if (!fileRes.ok) {
-        const text = await readResponseTextSnippet(fileRes, { signal: params.signal });
-        throw new Error(`${params.errorPrefix}: ${fileRes.status} ${text}`);
+        if (params.client.resolveRequestHeaders) {
+          throw await createProviderHttpError(fileRes, params.errorPrefix, {
+            requestHeaders,
+            signal: params.signal,
+          });
+        }
+        const text = await readMemoryHostResponseTextSnippet(fileRes, { signal: params.signal });
+        throw new Error(`${params.errorPrefix}: ${fileRes.status} ${formatErrorMessage(text)}`);
       }
       return (await readResponseJsonWithLimit(fileRes, {
         errorPrefix: params.errorPrefix,

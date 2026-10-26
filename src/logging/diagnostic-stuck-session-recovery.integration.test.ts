@@ -1,301 +1,226 @@
-// Stuck session recovery integration tests cover end-to-end recovery diagnostics.
-import { afterEach, describe, expect, it } from "vitest";
-import { resolveEmbeddedSessionLane } from "../agents/embedded-agent-runner/lanes.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setDiagnosticsEnabledForProcess } from "../infra/diagnostic-events.js";
 import {
-  testing as embeddedRunTesting,
-  clearActiveEmbeddedRun,
-  setActiveEmbeddedRun,
-} from "../agents/embedded-agent-runner/runs.js";
+  emitCoreModelRequestEndedDiagnosticEvent,
+  emitCoreModelRequestStartedDiagnosticEvent,
+} from "../infra/diagnostic-model-request.js";
+import { emitCoreSemanticRunProgressDiagnosticEvent } from "../infra/diagnostic-semantic-run-progress.js";
+import { withSessionTurn } from "../sessions/session-controller.admission.js";
+import { createReplyOperation } from "../sessions/session-controller.operation.js";
+import { getSessionControllerOperation } from "../sessions/session-controller.state.js";
+import { testing } from "../sessions/session-controller.test-support.js";
+import { createDeferredCore } from "../shared/deferred.js";
+import { resetDiagnosticRecoveryState } from "./diagnostic-recovery.test-support.js";
 import {
-  testing as replyRunTesting,
-  createReplyOperation,
-} from "../auto-reply/reply/reply-run-registry.js";
-import {
-  enqueueCommandInLane,
-  getQueueSize,
-  resetCommandLane,
-  resetCommandQueueStateForTest,
-} from "../process/command-queue.js";
-import {
-  testing as recoveryTesting,
-  recoverStuckDiagnosticSession,
-} from "./diagnostic-stuck-session-recovery.runtime.js";
+  beginDiagnosticBackendActivity,
+  beginDiagnosticRetryWait,
+  createDiagnosticEmbeddedRunOwner,
+  getDiagnosticSessionActivitySnapshot,
+  markDiagnosticArgumentChurnObservation,
+  markDiagnosticEmbeddedRunStarted,
+  markDiagnosticOwnedToolActivity,
+} from "./diagnostic-run-activity.js";
+import { recoverStuckDiagnosticSession } from "./diagnostic-stuck-session-recovery.runtime.js";
 
-function delay(ms: number): Promise<"blocked"> {
-  return new Promise((resolve) => {
-    setTimeout(() => resolve("blocked"), ms);
-  });
+const ref = {
+  sessionKey: "agent:main:watchdog-integration",
+  sessionId: "watchdog-session",
+  runId: "watchdog-run",
+};
+const abortMs = 6 * 60_000;
+function begin() {
+  const operation = createReplyOperation({ ...ref, resetTriggered: false });
+  operation.setPhase("running");
+  const cancel = vi.fn(() => operation.complete());
+  operation.attachBackend({ kind: "embedded", runId: ref.runId, cancel });
+  const watchdogAttempt = operation.watchdog.attachAttempt({ assertCurrent() {} });
+  const owner = createDiagnosticEmbeddedRunOwner({ ...ref, watchdogAttempt });
+  markDiagnosticEmbeddedRunStarted({ ...ref, owner });
+  return { operation, cancel, owner, watchdogAttempt };
 }
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  setDiagnosticsEnabledForProcess(false);
+});
+afterEach(() => {
+  testing.resetSessionControllerForTest();
+  resetDiagnosticRecoveryState();
+  vi.useRealTimers();
+});
 
-describe("stuck session recovery integration", () => {
-  afterEach(() => {
-    recoveryTesting.resetRecoveriesInFlight();
-    embeddedRunTesting.resetActiveEmbeddedRuns();
-    replyRunTesting.resetReplyRunRegistry();
-    resetCommandQueueStateForTest();
+describe("controller recovery through actual progress producers", () => {
+  it("reclaims repeated request/byte activity exactly once without replaying queued work", async () => {
+    const { operation, cancel, owner } = begin();
+    const backend = beginDiagnosticBackendActivity({
+      owner,
+      noOutputTimeoutMs: 150_000,
+      assertCurrent() {},
+    });
+    const delivered = vi.fn();
+    const queued = withSessionTurn(ref, async () => {
+      delivered();
+    });
+    for (let index = 0; index < 8; index++) {
+      vi.setSystemTime(index * 50_000);
+      if (index > 0) {
+        emitCoreModelRequestEndedDiagnosticEvent(
+          {
+            ...ref,
+            type: "model.call.error",
+            callId: "request-" + (index - 1),
+            provider: "mock",
+            model: "retrying",
+            durationMs: 50_000,
+            errorCategory: "retry",
+          },
+          owner.generation,
+        );
+      }
+      emitCoreModelRequestStartedDiagnosticEvent(
+        { ...ref, callId: "request-" + index, provider: "mock", model: "retrying" },
+        owner.generation,
+        150_000,
+      );
+      backend.observeOutput(false);
+    }
+    expect(delivered).not.toHaveBeenCalled();
+    vi.setSystemTime(abortMs);
+    await recoverStuckDiagnosticSession({ ...ref, operation, ageMs: abortMs });
+    expect(cancel).not.toHaveBeenCalled();
+    expect(delivered).not.toHaveBeenCalled();
+    vi.setSystemTime(500_000);
+    await recoverStuckDiagnosticSession({ ...ref, operation, ageMs: Date.now() });
+    await queued;
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(delivered).toHaveBeenCalledOnce();
+    expect(operation.result).toMatchObject({ kind: "failed", code: "run_stalled" });
+    backend.close();
   });
 
-  it("does not reset a blocked lane while a reply operation is still active", async () => {
-    const sessionKey = "agent:main:active-reply";
-    const sessionId = "active-reply-session";
-    const lane = resolveEmbeddedSessionLane(sessionKey);
-
-    void enqueueCommandInLane(lane, () => new Promise<never>(() => {}), {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
+  it("rechecks semantic results published while recovery dispatch was deferred", async () => {
+    const { operation, cancel, owner } = begin();
+    const request = { ...ref, operation, ageMs: abortMs };
+    vi.setSystemTime(abortMs);
+    emitCoreSemanticRunProgressDiagnosticEvent({ ...ref, reason: "assistant:result" }, owner);
+    await recoverStuckDiagnosticSession(request);
+    expect(cancel).not.toHaveBeenCalled();
+    expect(getDiagnosticSessionActivitySnapshot(ref).lastProgressAgeMs).toBe(0);
+    const retry = beginDiagnosticRetryWait({
+      owner,
+      deadlineAtMs: Date.now() + abortMs * 2,
+      signal: operation.abortSignal,
+      assertCurrent() {},
     });
-    const queued = enqueueCommandInLane(lane, async () => "drained", {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
-    });
-    const operation = createReplyOperation({
-      sessionKey,
-      sessionId,
-      resetTriggered: false,
-    });
-
-    expect(getQueueSize(lane)).toBe(2);
-
-    await recoverStuckDiagnosticSession({
-      sessionId,
-      sessionKey,
-      ageMs: 180_000,
-      queueDepth: 1,
-    });
-
-    await expect(Promise.race([queued, delay(100)])).resolves.toBe("blocked");
-    expect(getQueueSize(lane)).toBe(2);
-
-    operation.complete();
-    expect(resetCommandLane(lane)).toBe(1);
-    await expect(queued).resolves.toBe("drained");
+    vi.setSystemTime(abortMs * 2 + 1);
+    await recoverStuckDiagnosticSession(request);
+    expect(cancel).not.toHaveBeenCalled();
+    retry();
+    await recoverStuckDiagnosticSession(request);
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
-  it("does not reset sibling-key lane work while the same session file has an active embedded run", async () => {
-    const activeSessionKey = "agent:main:visible";
-    const fallbackSessionKey = "agent:main:fallback";
-    const activeSessionId = "active-session-file-run";
-    const fallbackSessionId = "fallback-session-file-run";
-    const sessionFile = "/tmp/openclaw-diagnostic-shared-session.jsonl";
-    const lane = resolveEmbeddedSessionLane(fallbackSessionKey);
-    const handle = {
-      queueMessage: async () => {},
-      isStreaming: () => true,
-      isCompacting: () => false,
-      abort: () => {},
-    };
-
-    setActiveEmbeddedRun(activeSessionId, handle, activeSessionKey, sessionFile);
-    void enqueueCommandInLane(lane, () => new Promise<never>(() => {}), {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
-    });
-    const queued = enqueueCommandInLane(lane, async () => "drained", {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
-    });
-
-    const outcome = await recoverStuckDiagnosticSession({
-      sessionId: fallbackSessionId,
-      sessionKey: fallbackSessionKey,
-      sessionFile,
-      ageMs: 180_000,
-      queueDepth: 1,
-    });
-
-    expect(outcome).toMatchObject({
-      status: "skipped",
-      action: "observe_only",
-      reason: "active_embedded_run",
-      activeSessionId,
-    });
-    await expect(Promise.race([queued, delay(100)])).resolves.toBe("blocked");
-    expect(getQueueSize(lane)).toBe(2);
-
-    clearActiveEmbeddedRun(activeSessionId, handle, activeSessionKey, sessionFile);
-    expect(resetCommandLane(lane)).toBe(1);
-    await expect(queued).resolves.toBe("drained");
-  });
-
-  it("aborts registered pre-run lane work and drains queued messages", async () => {
-    const sessionKey = "agent:main:active-pre-run";
-    const sessionId = "active-pre-run-session";
-    const lane = resolveEmbeddedSessionLane(sessionKey);
-    const operation = createReplyOperation({
-      sessionKey,
-      sessionId,
-      resetTriggered: false,
-    });
-    let markActiveStarted!: () => void;
-    const activeStarted = new Promise<void>((resolve) => {
-      markActiveStarted = resolve;
-    });
-
-    const active = enqueueCommandInLane(
-      lane,
-      () =>
-        new Promise<"aborted">((resolve) => {
-          markActiveStarted();
-          if (operation.abortSignal.aborted) {
-            resolve("aborted");
-            return;
-          }
-          operation.abortSignal.addEventListener("abort", () => resolve("aborted"), { once: true });
-        }),
-      { warnAfterMs: Number.MAX_SAFE_INTEGER },
-    );
-    const queued = enqueueCommandInLane(lane, async () => "drained", {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
-    });
-
-    expect(getQueueSize(lane)).toBe(2);
-    await activeStarted;
-
-    const outcome = await recoverStuckDiagnosticSession({
-      sessionId,
-      sessionKey,
-      ageMs: 720_000,
-      queueDepth: 1,
-      allowActiveAbort: true,
-    });
-
-    await expect(active).resolves.toBe("aborted");
-    await expect(queued).resolves.toBe("drained");
-    expect(outcome.status).toBe("aborted");
-    expect(getQueueSize(lane)).toBe(0);
-  });
-
-  it("releases a wedged lane after a clean abort when session work remains queued (#91700)", async () => {
-    const sessionKey = "agent:main:wedged-delivery";
-    const sessionId = "wedged-delivery-session";
-    const lane = resolveEmbeddedSessionLane(sessionKey);
-    const operation = createReplyOperation({
-      sessionKey,
-      sessionId,
-      resetTriggered: false,
-    });
-    operation.setPhase("running");
-    // Cancel settles the registry (clean abort+drain) while the lane task that
-    // hosted the run stays wedged, mirroring a hang past the run's own cleanup.
-    operation.attachBackend({
-      kind: "embedded",
-      cancel: () => queueMicrotask(() => operation.complete()),
-      isStreaming: () => false,
-    });
-    void enqueueCommandInLane(lane, () => new Promise<never>(() => {}), {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
-    });
-    expect(getQueueSize(lane)).toBe(1);
-
-    const outcome = await recoverStuckDiagnosticSession({
-      sessionId,
-      sessionKey,
-      ageMs: 720_000,
-      queueDepth: 1,
-      allowActiveAbort: true,
-    });
-
-    expect(outcome).toMatchObject({
-      status: "aborted",
-      action: "abort_embedded_run",
-      aborted: true,
-      drained: true,
-      forceCleared: false,
-      released: 1,
-    });
-    const queued = enqueueCommandInLane(lane, async () => "drained", {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
-    });
-    await expect(Promise.race([queued, delay(100)])).resolves.toBe("drained");
-  });
-
-  it("does not reset a lane that unwedged and started a queued turn during the abort (#91700)", async () => {
-    const sessionKey = "agent:main:unwedged-during-abort";
-    const sessionId = "unwedged-during-abort-session";
-    const lane = resolveEmbeddedSessionLane(sessionKey);
-    const operation = createReplyOperation({
-      sessionKey,
-      sessionId,
-      resetTriggered: false,
-    });
-    operation.setPhase("running");
-    let markHostStarted!: () => void;
-    const hostStarted = new Promise<void>((resolve) => {
-      markHostStarted = resolve;
-    });
-    // Host task frees the lane on abort; the queued turn then pumps to active
-    // and only it settles the registry, so the drain resolves with fresh work
-    // already running — the race the queueDepth reset must not clobber.
-    const host = enqueueCommandInLane(
-      lane,
-      () =>
-        new Promise<"aborted">((resolve) => {
-          markHostStarted();
-          operation.abortSignal.addEventListener("abort", () => resolve("aborted"), {
-            once: true,
-          });
-        }),
-      { warnAfterMs: Number.MAX_SAFE_INTEGER },
-    );
-    let releaseFreshTurn!: (value: "done") => void;
-    const freshTurn = enqueueCommandInLane(
-      lane,
-      () => {
-        operation.complete();
-        return new Promise<"done">((resolve) => {
-          releaseFreshTurn = resolve;
+  it.each(["quiet", "explicit", "overlapping", "mixed"] as const)(
+    "protects %s owned tools even when diagnostics are disabled",
+    async (kind) => {
+      const { operation, cancel, owner } = begin();
+      markDiagnosticOwnedToolActivity(owner, {
+        phase: "start",
+        toolName: "exec",
+        toolCallId: "old",
+        ...(kind === "explicit" || kind === "mixed" ? { deadlineAtMs: 1_200_000 } : {}),
+      });
+      if (kind === "overlapping" || kind === "mixed") {
+        vi.setSystemTime(14 * 60_000);
+        markDiagnosticOwnedToolActivity(owner, {
+          phase: "start",
+          toolName: "exec",
+          toolCallId: "new",
         });
-      },
-      { warnAfterMs: Number.MAX_SAFE_INTEGER },
-    );
-    await hostStarted;
+      }
+      vi.setSystemTime(kind === "overlapping" || kind === "mixed" ? 16 * 60_000 : abortMs);
+      await recoverStuckDiagnosticSession({ ...ref, operation, ageMs: Date.now() });
+      expect(cancel).not.toHaveBeenCalled();
+      const deadline = Math.max(
+        ...operation.watchdog.snapshot().tools.map((tool) => tool.deadlineAtMs),
+      );
+      vi.setSystemTime(deadline);
+      await recoverStuckDiagnosticSession({ ...ref, operation, ageMs: Date.now() });
+      expect(cancel).toHaveBeenCalledOnce();
+    },
+  );
 
-    const outcome = await recoverStuckDiagnosticSession({
-      sessionId,
-      sessionKey,
-      ageMs: 720_000,
-      queueDepth: 1,
-      allowActiveAbort: true,
+  it("keeps compaction/preflight on its actual deadline and allows immediate supersession", async () => {
+    const { operation, cancel, watchdogAttempt } = begin();
+    operation.setPhase("preflight_compacting");
+    const safetyDeadline = 12 * 60_000;
+    watchdogAttempt.beginWait({
+      kind: "runtime_owned",
+      deadlineAtMs: safetyDeadline,
+      isCurrent: () => true,
     });
-
-    await expect(host).resolves.toBe("aborted");
-    expect(outcome).toMatchObject({
-      status: "aborted",
-      aborted: true,
-      drained: true,
-      released: 0,
-    });
-    // The fresh turn still owns the lane slot: later work must wait for it.
-    const third = enqueueCommandInLane(lane, async () => "third", {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
-    });
-    await expect(Promise.race([third, delay(100)])).resolves.toBe("blocked");
-    releaseFreshTurn("done");
-    await expect(freshTurn).resolves.toBe("done");
-    await expect(third).resolves.toBe("third");
+    watchdogAttempt.setExecutionDeadline(safetyDeadline);
+    vi.setSystemTime(safetyDeadline - 1);
+    await recoverStuckDiagnosticSession({ ...ref, operation, ageMs: Date.now() });
+    expect(cancel).not.toHaveBeenCalled();
+    expect(operation.supersede()).toBe(true);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(operation.result).toMatchObject({ kind: "aborted", code: "aborted_for_supersession" });
   });
 
-  it("does not reset a blocked lane while unregistered lane work is still active", async () => {
-    const sessionKey = "agent:main:unregistered-work";
-    const sessionId = "unregistered-work-session";
-    const lane = resolveEmbeddedSessionLane(sessionKey);
-
-    void enqueueCommandInLane(lane, () => new Promise<never>(() => {}), {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
+  it("continuous argument churn cannot be renewed by mechanical model/tool handoffs", async () => {
+    const { operation, cancel, watchdogAttempt } = begin();
+    for (let step = 0; step <= 12; step++) {
+      vi.setSystemTime(step * 30_000);
+      watchdogAttempt.progress("semantic", "model:repeated_tool_request");
+      markDiagnosticArgumentChurnObservation({ ...ref, watchdogAttempt, active: true });
+    }
+    expect(getDiagnosticSessionActivitySnapshot(ref)).toMatchObject({
+      lastProgressAgeMs: abortMs,
+      lastProgressReason: "tool_loop:argument_churn",
     });
-    const queued = enqueueCommandInLane(lane, async () => "drained", {
-      warnAfterMs: Number.MAX_SAFE_INTEGER,
+    await recoverStuckDiagnosticSession({ ...ref, operation, ageMs: abortMs });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("a failed cleanup cannot admit a queued successor until the writer really settles", async () => {
+    const { operation } = begin();
+    const cancel = vi.fn(() => {
+      throw new Error("write owner did not retire");
     });
-
-    expect(getQueueSize(lane)).toBe(2);
-
-    await recoverStuckDiagnosticSession({
-      sessionId,
-      sessionKey,
-      ageMs: 180_000,
-      queueDepth: 1,
+    operation.attachBackend({ kind: "embedded", cancel });
+    const delivered = createDeferredCore();
+    const dispatch = vi.fn(() => delivered.resolve());
+    const queued = withSessionTurn(ref, async () => {
+      dispatch();
     });
+    vi.setSystemTime(abortMs);
+    await operation.watchdog.tick();
+    vi.setSystemTime(abortMs + 60_000);
+    await operation.watchdog.tick();
+    expect(operation.watchdog.decide().action).toBe("blocked");
+    expect(getSessionControllerOperation(ref.sessionKey)).toBe(operation);
+    expect(dispatch).not.toHaveBeenCalled();
+    operation.complete();
+    await delivered.promise;
+    await queued;
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
 
-    await expect(Promise.race([queued, delay(100)])).resolves.toBe("blocked");
-    expect(getQueueSize(lane)).toBe(2);
-
-    expect(resetCommandLane(lane)).toBe(1);
-    await expect(queued).resolves.toBe("drained");
+  it("retired backend callbacks cannot refresh a replacement or reuse a same-ID owner", () => {
+    const { operation, owner } = begin();
+    const backend = beginDiagnosticBackendActivity({
+      owner,
+      noOutputTimeoutMs: 150_000,
+      assertCurrent() {},
+    });
+    backend.close();
+    vi.setSystemTime(100_000);
+    expect(backend.observeOutput(true)).toBe(false);
+    expect(operation.watchdog.snapshot().semanticProgressAtMs).toBe(0);
+    operation.complete();
+    const next = begin();
+    expect(backend.observeOutput(true)).toBe(false);
+    expect(getSessionControllerOperation(ref.sessionKey)).toBe(next.operation);
   });
 });

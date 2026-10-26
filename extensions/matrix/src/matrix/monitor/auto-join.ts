@@ -1,15 +1,18 @@
-// Matrix plugin module implements auto join behavior.
+import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { normalizeStringifiedEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getMatrixRuntime } from "../../runtime.js";
 import type { MatrixConfig } from "../../types.js";
 import type { MatrixClient } from "../sdk.js";
-import type { RuntimeEnv } from "./runtime-api.js";
+import { withMatrixSendCurrentness } from "../sdk/send-currentness.js";
+import { isMatrixInviteAutoJoinTarget } from "../target-ids.js";
+import { getMatrixMonitorTaskSignal } from "./task-runner.js";
 
 export function registerMatrixAutoJoin(params: {
   client: MatrixClient;
   accountConfig: Pick<MatrixConfig, "autoJoin" | "autoJoinAllowlist">;
   runtime: RuntimeEnv;
-}) {
+  runDetachedTask: (label: string, task: () => Promise<void>) => Promise<void>;
+}): () => void {
   const { client, accountConfig, runtime } = params;
   const core = getMatrixRuntime();
   const logVerbose = (message: string) => {
@@ -26,18 +29,29 @@ export function registerMatrixAutoJoin(params: {
   const resolvedAliasRoomIds = new Map<string, string>();
 
   if (autoJoin === "off") {
-    return;
+    return () => {};
   }
 
-  if (autoJoin === "always") {
-    logVerbose("matrix: auto-join enabled for all invites");
-  } else {
-    logVerbose("matrix: auto-join enabled for allowlist invites");
+  if (autoJoin === "allowlist") {
+    // Room-scoped matching only understands a room ID, an alias, or "*". Surface
+    // entries that can never match (for example a Matrix user ID, which is not a
+    // room target) at the default log level, otherwise an inert allowlist
+    // silently ignores every invite. This observes the same target contract the
+    // setup wizard enforces; it reports, and never rejects, saved config.
+    const inertEntries = rawAllowlist.filter((entry) => !isMatrixInviteAutoJoinTarget(entry));
+    if (inertEntries.length > 0) {
+      core.logging
+        .getChildLogger({ module: "matrix-auto-join" })
+        .warn(
+          `matrix: autoJoinAllowlist entries cannot match an invited room and are ignored: ${inertEntries.join(", ")}`,
+        );
+    }
   }
 
   const resolveAllowedAliasRoomId = async (alias: string): Promise<string | null> => {
-    if (resolvedAliasRoomIds.has(alias)) {
-      return resolvedAliasRoomIds.get(alias) ?? null;
+    const cached = resolvedAliasRoomIds.get(alias);
+    if (cached !== undefined) {
+      return cached;
     }
     const resolved = await params.client.resolveRoom(alias);
     if (resolved) {
@@ -59,21 +73,15 @@ export function registerMatrixAutoJoin(params: {
     );
     return resolved.filter((roomId): roomId is string => Boolean(roomId));
   };
-  const runInviteTask = (roomId: string, task: () => Promise<void>) => {
-    void Promise.resolve()
-      .then(task)
-      .catch((err: unknown) => {
-        runtime.error?.(
-          `matrix: auto-join invite handler failed for room ${roomId}: ${String(err)}`,
-        );
-      });
-  };
-
   // Handle invites directly so both "always" and "allowlist" modes share the same path.
-  client.on("room.invite", (roomId: string, _inviteEvent: unknown) => {
-    runInviteTask(roomId, async () => {
+  const onInvite = (roomId: string, _inviteEvent: unknown) => {
+    void params.runDetachedTask(`auto-join invite handler room=${roomId}`, async () => {
+      const monitorSignal = getMatrixMonitorTaskSignal();
       if (autoJoin === "allowlist") {
         const allowedAliasRoomIds = await resolveAllowedAliasRoomIds();
+        if (monitorSignal?.aborted) {
+          return;
+        }
         const allowed =
           autoJoinAllowlist.has("*") ||
           allowedRoomIds.has(roomId) ||
@@ -85,12 +93,29 @@ export function registerMatrixAutoJoin(params: {
         }
       }
 
+      if (monitorSignal?.aborted) {
+        return;
+      }
+
       try {
-        await client.joinRoom(roomId);
+        await withMatrixSendCurrentness(
+          client,
+          () => {
+            monitorSignal?.throwIfAborted();
+          },
+          () => client.joinRoom(roomId),
+        );
         logVerbose(`matrix: joined room ${roomId}`);
       } catch (err) {
+        if (monitorSignal?.aborted) {
+          return;
+        }
         runtime.error?.(`matrix: failed to join room ${roomId}: ${String(err)}`);
       }
     });
-  });
+  };
+  client.on("room.invite", onInvite);
+  return () => {
+    client.off("room.invite", onInvite);
+  };
 }

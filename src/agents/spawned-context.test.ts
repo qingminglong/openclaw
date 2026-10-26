@@ -2,16 +2,16 @@
 // child runs launched from agent tools.
 import { describe, expect, it } from "vitest";
 import {
-  mapToolContextToSpawnedRunMetadata,
-  normalizeSpawnedRunMetadata,
-  resolveIngressWorkspaceOverrideForSpawnedRun,
+  mapToolContextToSpawnedRunMetadata as mapContext,
+  normalizeSpawnedRunMetadata as normalize,
+  resolveIngressWorkspaceOverrideForSessionRun as ingressWorkspace,
   resolveSpawnedWorkspaceInheritance,
 } from "./spawned-context.js";
 
 describe("normalizeSpawnedRunMetadata", () => {
   it("trims text fields and drops empties", () => {
     expect(
-      normalizeSpawnedRunMetadata({
+      normalize({
         spawnedBy: "  agent:main:subagent:1 ",
         groupId: "  group-1 ",
         groupChannel: "  slack ",
@@ -30,7 +30,7 @@ describe("normalizeSpawnedRunMetadata", () => {
 describe("mapToolContextToSpawnedRunMetadata", () => {
   it("maps agent group fields to run metadata shape", () => {
     expect(
-      mapToolContextToSpawnedRunMetadata({
+      mapContext({
         agentGroupId: "g-1",
         agentGroupChannel: "telegram",
         agentGroupSpace: "topic:123",
@@ -50,10 +50,10 @@ describe("resolveSpawnedWorkspaceInheritance", () => {
   // config, then requester context so child runs stay in the expected checkout.
   const config = {
     agents: {
-      list: [
-        { id: "main", workspace: "/tmp/workspace-main" },
-        { id: "ops", workspace: "/tmp/workspace-ops" },
-      ],
+      entries: {
+        main: { workspace: "/tmp/workspace-main" },
+        ops: { workspace: "/tmp/workspace-ops" },
+      },
     },
   };
 
@@ -93,19 +93,16 @@ describe("resolveSpawnedWorkspaceInheritance", () => {
   });
 });
 
-describe("resolveIngressWorkspaceOverrideForSpawnedRun", () => {
-  it("forwards workspace only for spawned runs", () => {
-    expect(
-      resolveIngressWorkspaceOverrideForSpawnedRun({
+describe("resolveIngressWorkspaceOverrideForSessionRun", () => {
+  it("uses inherited workspaces for spawned runs and managed cwd for dashboard worktrees", () => {
+    expect([
+      ingressWorkspace({
         spawnedBy: "agent:main:subagent:parent",
         workspaceDir: "/tmp/ws",
+        cwd: "/tmp/task",
       }),
-    ).toBe("/tmp/ws");
-    expect(
-      resolveIngressWorkspaceOverrideForSpawnedRun({
-        spawnedBy: "",
-        workspaceDir: "/tmp/ws",
-      }),
-    ).toBeUndefined();
+      ingressWorkspace({ spawnedBy: "", workspaceDir: "/tmp/ws", cwd: "/tmp/worktree" }),
+      ingressWorkspace(),
+    ]).toEqual(["/tmp/ws", "/tmp/worktree", undefined]);
   });
 });

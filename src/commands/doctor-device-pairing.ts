@@ -1,25 +1,26 @@
-/** Doctor diagnostics for pending, paired, and locally cached device auth state. */
-import path from "node:path";
 import { normalizeUniqueSingleOrTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
-import { note } from "../../packages/terminal-core/src/note.js";
 import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { quoteCliArg } from "../cli/quote-cli-arg.js";
 import { resolveStateDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { callGateway } from "../gateway/call.js";
+import type { HealthFinding } from "../flows/health-checks.js";
+import { loadDeviceAuthTokens } from "../infra/device-auth-store.js";
+import { loadDeviceIdentityIfPresentAsync } from "../infra/device-identity-async.js";
 import {
-  listApprovedPairedDeviceRoles,
-  listDevicePairing,
   summarizeDeviceTokens,
   type DeviceAuthTokenSummary,
+} from "../infra/device-pairing-tokens.js";
+import {
+  listApprovedPairedDeviceRoles,
+  listDevicePairingReadOnly,
   type DevicePairingPendingRequest,
   type PairedDevice,
 } from "../infra/device-pairing.js";
-import { JsonFileReadError, tryReadJsonSync } from "../infra/json-files.js";
-import type { DeviceAuthStore } from "../shared/device-auth.js";
 import { normalizeDeviceAuthScopes } from "../shared/device-auth.js";
 import { roleScopesAllow } from "../shared/operator-scope-compat.js";
+
+const DEVICE_PAIRING_CHECK_ID = "core/doctor/device-pairing";
 
 type GatewayListedPairedDevice = Omit<PairedDevice, "tokens" | "approvedScopes"> & {
   tokens?: DeviceAuthTokenSummary[];
@@ -38,73 +39,6 @@ type DoctorPairingSnapshot = {
   pending: DevicePairingPendingRequest[];
   paired: DoctorPairedDevice[];
 };
-
-type PendingPairingIssue =
-  | {
-      kind: "first-time";
-      pending: DevicePairingPendingRequest;
-      deviceLabel: string;
-      approveCommand: string;
-      inspectCommand: string;
-    }
-  | {
-      kind: "public-key-repair";
-      pending: DevicePairingPendingRequest;
-      deviceLabel: string;
-      approveCommand: string;
-      inspectCommand: string;
-      removeCommand: string;
-    }
-  | {
-      kind: "role-upgrade";
-      pending: DevicePairingPendingRequest;
-      deviceLabel: string;
-      approveCommand: string;
-      inspectCommand: string;
-      approvedRoles: string[];
-      requestedRoles: string[];
-    }
-  | {
-      kind: "scope-upgrade";
-      pending: DevicePairingPendingRequest;
-      deviceLabel: string;
-      approveCommand: string;
-      inspectCommand: string;
-      approvedScopes: string[];
-      requestedScopes: string[];
-    }
-  | {
-      kind: "repair";
-      pending: DevicePairingPendingRequest;
-      deviceLabel: string;
-      approveCommand: string;
-      inspectCommand: string;
-    };
-
-type StoredDeviceIdentity = {
-  version: 1;
-  deviceId: string;
-};
-
-function hasNumberVersion(value: object): value is { version: number } {
-  return "version" in value && typeof value.version === "number";
-}
-
-function isDeviceAuthStoreTokenEntry(value: unknown): value is DeviceAuthStore["tokens"][string] {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "token" in value &&
-    typeof value.token === "string" &&
-    "role" in value &&
-    typeof value.role === "string" &&
-    "scopes" in value &&
-    Array.isArray(value.scopes) &&
-    value.scopes.every((scope) => typeof scope === "string") &&
-    "updatedAtMs" in value &&
-    typeof value.updatedAtMs === "number"
-  );
-}
 
 function normalizeGatewayPairedDevice(device: GatewayListedPairedDevice): DoctorPairedDevice {
   return {
@@ -126,14 +60,17 @@ async function loadDoctorPairingSnapshot(params: {
 }): Promise<DoctorPairingSnapshot | null> {
   if (params.healthOk) {
     try {
-      const payload = await callGateway<GatewayDevicePairingPayload>({
+      const { bindAgentToolGatewayRequest } = await import("../agents/tools/in-process-gateway.js");
+      const requestGateway = bindAgentToolGatewayRequest({ hostedOnly: true });
+      const payload = await requestGateway<GatewayDevicePairingPayload>({
         method: "device.pair.list",
         timeoutMs: 5_000,
+        sharedStateMode: "read-only",
         config: params.cfg,
       });
       return {
         pending: payload.pending,
-        paired: payload.paired.map((device) => normalizeGatewayPairedDevice(device)),
+        paired: payload.paired.map(normalizeGatewayPairedDevice),
       };
     } catch {
       // Gateway health already reported separately. Fall back to local pairing
@@ -143,10 +80,10 @@ async function loadDoctorPairingSnapshot(params: {
   if (params.cfg.gateway?.mode === "remote") {
     return null;
   }
-  const local = await listDevicePairing();
+  const local = await listDevicePairingReadOnly();
   return {
     pending: local.pending,
-    paired: local.paired.map((device) => normalizeLocalPairedDevice(device)),
+    paired: local.paired.map(normalizeLocalPairedDevice),
   };
 }
 
@@ -156,16 +93,16 @@ function resolveApprovedScopes(
   return normalizeDeviceAuthScopes(device.approvedScopes ?? device.scopes);
 }
 
-function formatScopes(scopes: string[]): string {
-  return scopes.length > 0 ? scopes.join(", ") : "none";
-}
-
-function formatRoles(roles: string[]): string {
-  return roles.length > 0 ? roles.join(", ") : "none";
+function formatValues(values: string[]): string {
+  return values.length > 0 ? values.join(", ") : "none";
 }
 
 function formatCliArgs(args: string[]): string {
   return formatCliCommand(args.map(quoteCliArg).join(" "));
+}
+
+function formatRotateCommand(deviceId: string, role: string): string {
+  return formatCliArgs(["openclaw", "devices", "rotate", "--device", deviceId, "--role", role]);
 }
 
 function describeDevice(params: {
@@ -187,164 +124,115 @@ function findTokenSummary(
   return device.tokenSummaries.find((entry) => entry.role === normalizedRole && !entry.revokedAtMs);
 }
 
-function hasPendingScopeUpgrade(params: {
-  requestedRoles: string[];
-  pendingScopes: string[];
-  approvedRoles: string[];
-  approvedScopes: string[];
-}): boolean {
-  for (const role of params.requestedRoles) {
-    if (!params.approvedRoles.includes(role)) {
-      continue;
-    }
-    const requestedForRole = params.pendingScopes.filter((scope) =>
-      role === "operator" ? scope.startsWith("operator.") : !scope.startsWith("operator."),
-    );
-    if (requestedForRole.length === 0) {
-      continue;
-    }
-    if (
-      !roleScopesAllow({
-        role,
-        requestedScopes: requestedForRole,
-        allowedScopes: params.approvedScopes,
-      })
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function resolvePendingPairingIssue(
-  pending: DevicePairingPendingRequest,
-  paired: DoctorPairedDevice | undefined,
-): PendingPairingIssue {
-  const deviceLabel = describeDevice({
-    deviceId: pending.deviceId,
-    displayName: pending.displayName,
-    clientId: pending.clientId,
-  });
-  const approveCommand = formatCliArgs(["openclaw", "devices", "approve", pending.requestId]);
-  const inspectCommand = formatCliArgs(["openclaw", "devices", "list"]);
-  if (!paired) {
-    return {
-      kind: "first-time",
-      pending,
-      deviceLabel,
-      approveCommand,
-      inspectCommand,
-    };
-  }
-  if (paired.publicKey !== pending.publicKey) {
-    return {
-      kind: "public-key-repair",
-      pending,
-      deviceLabel,
-      approveCommand,
-      inspectCommand,
-      removeCommand: formatCliArgs(["openclaw", "devices", "remove", pending.deviceId]),
-    };
-  }
-  const requestedRoles = normalizeUniqueSingleOrTrimmedStringList(
-    [pending.roles, pending.role].flat(),
-  );
-  const approvedRoles = listApprovedPairedDeviceRoles(paired);
-  if (requestedRoles.some((role) => !approvedRoles.includes(role))) {
-    return {
-      kind: "role-upgrade",
-      pending,
-      deviceLabel,
-      approveCommand,
-      inspectCommand,
-      approvedRoles,
-      requestedRoles,
-    };
-  }
-  const approvedScopes = resolveApprovedScopes(paired);
-  const requestedScopes = normalizeDeviceAuthScopes(pending.scopes);
-  if (
-    hasPendingScopeUpgrade({
-      requestedRoles,
-      pendingScopes: requestedScopes,
-      approvedRoles,
-      approvedScopes,
-    })
-  ) {
-    return {
-      kind: "scope-upgrade",
-      pending,
-      deviceLabel,
-      approveCommand,
-      inspectCommand,
-      approvedScopes,
-      requestedScopes,
-    };
-  }
-  return {
-    kind: "repair",
-    pending,
-    deviceLabel,
-    approveCommand,
-    inspectCommand,
-  };
-}
-
-function formatPendingPairingIssue(issue: PendingPairingIssue): string {
-  switch (issue.kind) {
-    case "first-time":
-      return `- Pending device pairing request ${issue.pending.requestId} for ${issue.deviceLabel}. Review with ${issue.inspectCommand}, then approve with ${issue.approveCommand}.`;
-    case "public-key-repair":
-      return `- Pending device repair ${issue.pending.requestId} for ${issue.deviceLabel}: the current device identity no longer matches the approved pairing record. This commonly loops on pairing-required for an already paired device. Remove the stale record with ${issue.removeCommand}, then rerun ${issue.inspectCommand} and approve with ${issue.approveCommand}.`;
-    case "role-upgrade":
-      return `- Pending role upgrade ${issue.pending.requestId} for ${issue.deviceLabel}: approved roles [${formatRoles(issue.approvedRoles)}], requested roles [${formatRoles(issue.requestedRoles)}]. Review with ${issue.inspectCommand}, then approve with ${issue.approveCommand}.`;
-    case "scope-upgrade":
-      return `- Pending scope upgrade ${issue.pending.requestId} for ${issue.deviceLabel}: approved scopes [${formatScopes(issue.approvedScopes)}], requested scopes [${formatScopes(issue.requestedScopes)}]. Review with ${issue.inspectCommand}, then approve with ${issue.approveCommand}.`;
-    case "repair":
-      return `- Pending device repair ${issue.pending.requestId} for ${issue.deviceLabel}: the device is already paired, but a new approval is still required before the requested auth can be used. Review with ${issue.inspectCommand}, then approve with ${issue.approveCommand}.`;
-  }
-  throw new Error("Unsupported pending pairing issue");
-}
-
-function collectPendingPairingIssues(snapshot: DoctorPairingSnapshot): string[] {
+function collectPendingPairingFindings(snapshot: DoctorPairingSnapshot): HealthFinding[] {
   const pairedByDeviceId = new Map(snapshot.paired.map((device) => [device.deviceId, device]));
-  return snapshot.pending.map((pending) =>
-    formatPendingPairingIssue(
-      resolvePendingPairingIssue(pending, pairedByDeviceId.get(pending.deviceId)),
-    ),
-  );
+  return snapshot.pending.map((pending): HealthFinding => {
+    const paired = pairedByDeviceId.get(pending.deviceId);
+    const deviceLabel = describeDevice(pending);
+    const approveCommand = formatCliArgs(["openclaw", "devices", "approve", pending.requestId]);
+    const inspectCommand = formatCliArgs(["openclaw", "devices", "list"]);
+    const fixHint = `Review with ${inspectCommand}, then approve with ${approveCommand}.`;
+    const finding = {
+      checkId: DEVICE_PAIRING_CHECK_ID,
+      severity: "warning" as const,
+      category: "fix-now" as const,
+      docsUrl: "https://docs.openclaw.ai/cli/devices",
+      path: "devices.pending",
+      target: `${pending.deviceId}:${pending.requestId}`,
+      fixHint,
+    };
+    if (!paired) {
+      return {
+        ...finding,
+        category: "recommended",
+        requirement: "first-time",
+        message: `Pending device pairing request ${pending.requestId} for ${deviceLabel}. ${fixHint}`,
+      };
+    }
+    if (paired.publicKey !== pending.publicKey) {
+      const removeCommand = formatCliArgs(["openclaw", "devices", "remove", pending.deviceId]);
+      const repairHint = `Remove the stale record with ${removeCommand}, then rerun ${inspectCommand} and approve with ${approveCommand}.`;
+      return {
+        ...finding,
+        requirement: "public-key-repair",
+        message: `Pending device repair ${pending.requestId} for ${deviceLabel}: the current device identity no longer matches the approved pairing record. This commonly loops on pairing-required for an already paired device. ${repairHint}`,
+        fixHint: repairHint,
+      };
+    }
+    const requestedRoles = normalizeUniqueSingleOrTrimmedStringList(
+      [pending.roles, pending.role].flat(),
+    );
+    const approvedRoles = listApprovedPairedDeviceRoles(paired);
+    if (requestedRoles.some((role) => !approvedRoles.includes(role))) {
+      return {
+        ...finding,
+        category: "recommended",
+        requirement: "role-upgrade",
+        message: `Pending role upgrade ${pending.requestId} for ${deviceLabel}: approved roles [${formatValues(approvedRoles)}], requested roles [${formatValues(requestedRoles)}]. ${fixHint}`,
+      };
+    }
+    const approvedScopes = resolveApprovedScopes(paired);
+    const requestedScopes = normalizeDeviceAuthScopes(pending.scopes);
+    if (
+      requestedRoles.some(
+        (role) =>
+          !roleScopesAllow({
+            role,
+            requestedScopes: requestedScopes.filter((scope) =>
+              role === "operator" ? scope.startsWith("operator.") : !scope.startsWith("operator."),
+            ),
+            allowedScopes: approvedScopes,
+          }),
+      )
+    ) {
+      return {
+        ...finding,
+        category: "recommended",
+        requirement: "scope-upgrade",
+        message: `Pending scope upgrade ${pending.requestId} for ${deviceLabel}: approved scopes [${formatValues(approvedScopes)}], requested scopes [${formatValues(requestedScopes)}]. ${fixHint}`,
+      };
+    }
+    return {
+      ...finding,
+      requirement: "repair",
+      message: `Pending device repair ${pending.requestId} for ${deviceLabel}: the device is already paired, but a new approval is still required before the requested auth can be used. ${fixHint}`,
+    };
+  });
 }
 
-function collectPairedRecordIssues(snapshot: DoctorPairingSnapshot): string[] {
-  const lines: string[] = [];
+function collectPairedRecordFindings(snapshot: DoctorPairingSnapshot): HealthFinding[] {
+  const findings: HealthFinding[] = [];
   for (const device of snapshot.paired) {
-    const deviceLabel = describeDevice({
-      deviceId: device.deviceId,
-      displayName: device.displayName,
-      clientId: device.clientId,
-    });
+    const deviceLabel = describeDevice(device);
+    const finding = {
+      checkId: DEVICE_PAIRING_CHECK_ID,
+      severity: "warning" as const,
+      category: "fix-now" as const,
+      docsUrl: "https://docs.openclaw.ai/cli/devices",
+      path: "devices.paired",
+      target: device.deviceId,
+    };
     const approvedRoles = listApprovedPairedDeviceRoles(device);
     const approvedScopes = resolveApprovedScopes(device);
     if (approvedRoles.includes("operator") && approvedScopes.length === 0) {
-      lines.push(
-        `- Paired device ${deviceLabel} is missing its approved operator scope baseline. Scope upgrades can get stuck in pairing-required until the device repairs or is re-approved.`,
-      );
+      findings.push({
+        ...finding,
+        requirement: "missing-operator-scope-baseline",
+        message: `Paired device ${deviceLabel} is missing its approved operator scope baseline. Scope upgrades can get stuck in pairing-required until the device repairs or is re-approved.`,
+        fixHint: `Run ${formatCliArgs(["openclaw", "devices", "list"])} to inspect the device, reconnect it to request the intended scopes, then approve only the scopes you recognize.`,
+      });
     }
     for (const role of approvedRoles) {
       const token = findTokenSummary(device, role);
-      const rotateCommand = formatCliArgs([
-        "openclaw",
-        "devices",
-        "rotate",
-        "--device",
-        device.deviceId,
-        "--role",
-        role,
-      ]);
+      const rotateCommand = formatRotateCommand(device.deviceId, role);
       if (!token) {
-        lines.push(
-          `- Paired device ${deviceLabel} has no active ${role} device token even though the role is approved. This commonly ends in pairing-required or device-token-mismatch. Rotate a fresh token with ${rotateCommand}.`,
-        );
+        findings.push({
+          ...finding,
+          target: role ? `${device.deviceId}:${role}` : device.deviceId,
+          requirement: "missing-active-role-token",
+          message: `Paired device ${deviceLabel} has no active ${role} device token even though the role is approved. This commonly ends in pairing-required or device-token-mismatch. Rotate a fresh token with ${rotateCommand}.`,
+          fixHint: `Rotate a fresh token with ${rotateCommand}.`,
+        });
         continue;
       }
       if (
@@ -355,165 +243,153 @@ function collectPairedRecordIssues(snapshot: DoctorPairingSnapshot): string[] {
           allowedScopes: approvedScopes,
         })
       ) {
-        lines.push(
-          `- Paired device ${deviceLabel} has a ${role} token outside the approved scope baseline [${formatScopes(approvedScopes)}]. Rotate it with ${rotateCommand}.`,
-        );
+        const recoveryCommand = role === "node" ? `${rotateCommand} --no-scopes` : rotateCommand;
+        findings.push({
+          ...finding,
+          target: role ? `${device.deviceId}:${role}` : device.deviceId,
+          requirement: "token-outside-approved-scope",
+          message: `Paired device ${deviceLabel} has a ${role} token outside the approved scope baseline [${formatValues(approvedScopes)}]. Rotate it with ${recoveryCommand}.`,
+          fixHint: `Rotate it with ${recoveryCommand}.`,
+        });
       }
     }
   }
-  return lines;
+  return findings;
 }
 
-function readJsonFile(filePath: string): unknown {
-  return tryReadJsonSync(filePath);
-}
-
-function readLocalIdentity(env: NodeJS.ProcessEnv = process.env): StoredDeviceIdentity | null {
-  const filePath = path.join(resolveStateDir(env), "identity", "device.json");
-  const identity = readJsonFile(filePath);
-  if (
-    !identity ||
-    typeof identity !== "object" ||
-    !hasNumberVersion(identity) ||
-    identity.version !== 1 ||
-    !("deviceId" in identity) ||
-    typeof identity.deviceId !== "string" ||
-    !identity.deviceId.trim()
-  ) {
-    return null;
-  }
-  return {
-    version: 1,
-    deviceId: identity.deviceId,
-  };
-}
-
-function readLocalDeviceAuthStore(env: NodeJS.ProcessEnv = process.env): DeviceAuthStore | null {
-  const filePath = path.join(resolveStateDir(env), "identity", "device-auth.json");
-  const store = readJsonFile(filePath);
-  if (
-    !store ||
-    typeof store !== "object" ||
-    !hasNumberVersion(store) ||
-    store.version !== 1 ||
-    !("deviceId" in store) ||
-    typeof store.deviceId !== "string" ||
-    !store.deviceId.trim() ||
-    !("tokens" in store) ||
-    typeof store.tokens !== "object" ||
-    store.tokens === null
-  ) {
-    return null;
-  }
-  const tokens: DeviceAuthStore["tokens"] = {};
-  for (const [role, entry] of Object.entries(store.tokens)) {
-    if (!isDeviceAuthStoreTokenEntry(entry)) {
-      return null;
-    }
-    tokens[role] = entry;
-  }
-  return {
-    version: 1,
-    deviceId: store.deviceId,
-    tokens,
-  };
-}
-
-function collectLocalDeviceAuthIssues(snapshot: DoctorPairingSnapshot): string[] {
-  const identity = readLocalIdentity();
-  const store = readLocalDeviceAuthStore();
-  if (!identity || !store || store.deviceId !== identity.deviceId) {
+async function collectLocalDeviceAuthFindings(
+  snapshot: DoctorPairingSnapshot,
+): Promise<HealthFinding[]> {
+  let identity;
+  try {
+    identity = await loadDeviceIdentityIfPresentAsync({ env: process.env });
+  } catch {
     return [];
   }
+  if (!identity) {
+    return [];
+  }
+  const localTokens = await loadDeviceAuthTokens({
+    deviceId: identity.deviceId,
+    env: process.env,
+  }).catch(() => []);
   const paired = snapshot.paired.find((device) => device.deviceId === identity.deviceId);
   if (!paired) {
     return [];
   }
-  const deviceLabel = describeDevice({
-    deviceId: paired.deviceId,
-    displayName: paired.displayName,
-    clientId: paired.clientId,
-  });
-  const lines: string[] = [];
+  const deviceLabel = describeDevice(paired);
+  const findings: HealthFinding[] = [];
   const approvedRoles = new Set(listApprovedPairedDeviceRoles(paired));
-  for (const entry of Object.values(store.tokens)) {
+  for (const entry of localTokens) {
     const role = entry.role.trim();
     if (!role) {
       continue;
     }
+    const finding = {
+      checkId: DEVICE_PAIRING_CHECK_ID,
+      severity: "warning" as const,
+      category: "fix-now" as const,
+      docsUrl: "https://docs.openclaw.ai/cli/devices",
+      path: "identity.device-auth",
+      target: `${paired.deviceId}:${role}`,
+    };
     const pairedToken = findTokenSummary(paired, role);
     if (!pairedToken) {
       if (approvedRoles.has(role)) {
         continue;
       }
-      lines.push(
-        `- Local cached ${role} device auth for ${deviceLabel} no longer has a matching active gateway token, and that role is no longer approved for this device. Reconnect with shared gateway auth to refresh local auth, or remove the stale cached ${role} auth entry.`,
-      );
+      findings.push({
+        ...finding,
+        requirement: "local-role-no-longer-approved",
+        message: `Local cached ${role} device auth for ${deviceLabel} no longer has a matching active gateway token, and that role is no longer approved for this device. Reconnect with shared gateway auth to refresh local auth, or remove the stale cached ${role} auth entry.`,
+        fixHint: `Reconnect with shared gateway auth to refresh local auth, or remove the stale cached ${role} auth entry.`,
+      });
       continue;
     }
-    const rotateCommand = formatCliArgs([
-      "openclaw",
-      "devices",
-      "rotate",
-      "--device",
-      paired.deviceId,
-      "--role",
-      role,
-    ]);
+    const rotateCommand = formatRotateCommand(paired.deviceId, role);
     const gatewayIssuedAtMs = pairedToken.rotatedAtMs ?? pairedToken.createdAtMs;
     // Local device auth survives gateway restarts; compare timestamps to catch stale cached tokens.
     if (entry.updatedAtMs < gatewayIssuedAtMs) {
-      lines.push(
-        `- Local cached ${role} device token for ${deviceLabel} predates the gateway rotation. This is a stale device-token pattern and can fail with device token mismatch. Reconnect with shared gateway auth to refresh it, or rotate again with ${rotateCommand}.`,
-      );
+      findings.push({
+        ...finding,
+        requirement: "local-token-stale",
+        message: `Local cached ${role} device token for ${deviceLabel} predates the gateway rotation. This is a stale device-token pattern and can fail with device token mismatch. Reconnect with shared gateway auth to refresh it, or rotate again with ${rotateCommand}.`,
+        fixHint: `Reconnect with shared gateway auth to refresh it, or rotate again with ${rotateCommand}.`,
+      });
       continue;
     }
     const cachedScopes = normalizeDeviceAuthScopes(entry.scopes);
     const pairedScopes = normalizeDeviceAuthScopes(pairedToken.scopes);
     if (cachedScopes.join("\n") !== pairedScopes.join("\n")) {
-      lines.push(
-        `- Local cached ${role} device scopes for ${deviceLabel} differ from the gateway record. Cached scopes [${formatScopes(cachedScopes)}], gateway scopes [${formatScopes(pairedScopes)}]. Reconnect with shared gateway auth to refresh it, or rotate with ${rotateCommand}.`,
-      );
+      findings.push({
+        ...finding,
+        requirement: "local-scopes-mismatch",
+        message: `Local cached ${role} device scopes for ${deviceLabel} differ from the gateway record. Cached scopes [${formatValues(cachedScopes)}], gateway scopes [${formatValues(pairedScopes)}]. Reconnect with shared gateway auth to refresh it, or rotate with ${rotateCommand}.`,
+        fixHint: `Reconnect with shared gateway auth to refresh it, or rotate with ${rotateCommand}.`,
+      });
     }
   }
-  return lines;
+  return findings;
 }
 
-function formatPairingStoreReadIssue(error: JsonFileReadError): string {
-  const problem = error.reason === "parse" ? "contains invalid JSON" : "could not be read";
-  return `- Device pairing store ${error.filePath} ${problem}. OpenClaw refused to treat it as empty to avoid overwriting approved pairings. Fix the JSON or file permissions, or move it aside and re-pair devices.`;
+async function collectLegacyPairingStoreFindings(cfg: OpenClawConfig): Promise<HealthFinding[]> {
+  if (cfg.gateway?.mode === "remote") {
+    return [];
+  }
+  const { listLegacyPairingStoreFiles } = await import("../infra/pairing-files.js");
+  return (await listLegacyPairingStoreFiles()).map((filePath): HealthFinding => ({
+    checkId: DEVICE_PAIRING_CHECK_ID,
+    severity: "warning",
+    category: "fix-now",
+    docsUrl: "https://docs.openclaw.ai/cli/devices",
+    message: `Legacy pairing store ${filePath} has not been imported into SQLite. Stop the Gateway and run openclaw doctor --fix. Unreadable sources remain in place for repair.`,
+    path: "devices.legacy-store",
+    requirement: "pairing-store-legacy-file",
+    fixHint:
+      "Stop the Gateway and run openclaw doctor --fix to import and archive the legacy pairing stores.",
+  }));
 }
 
-/**
- * Emits device pairing repair guidance from live gateway state or local pairing files.
- *
- * Remote gateways only report through the gateway API; local gateways can fall back to on-disk
- * pairing state when the gateway is down.
- */
-export async function noteDevicePairingHealth(params: {
+export async function collectDevicePairingHealthFindings(params: {
   cfg: OpenClawConfig;
-  healthOk: boolean;
-}): Promise<void> {
-  let snapshot: DoctorPairingSnapshot | null;
-  try {
-    snapshot = await loadDoctorPairingSnapshot(params);
-  } catch (error) {
-    if (error instanceof JsonFileReadError) {
-      note(formatPairingStoreReadIssue(error), "Device pairing");
-      return;
+  healthOk?: boolean;
+  env?: NodeJS.ProcessEnv;
+}): Promise<HealthFinding[]> {
+  const legacyStoreFindings = await collectLegacyPairingStoreFindings(params.cfg);
+  const { detectLegacyDeviceAuth } = await import("../infra/state-migrations.device-auth.js");
+  // Retired device auth uses the source env; pairing/token reads keep lint's active state view.
+  // Report this debt even without a reachable remote Gateway or local identity.
+  const deviceAuth = detectLegacyDeviceAuth({ stateDir: resolveStateDir(params.env) });
+  if (deviceAuth.sourcePresent) {
+    try {
+      // A consumed import remains on disk; local owner admission proves its durable claim.
+      await loadDeviceIdentityIfPresentAsync({ env: params.env ?? process.env });
+    } catch {
+      const fixCommand = formatCliCommand("openclaw doctor --fix", params.env);
+      const fixHint = `Stop the Gateway and run ${fixCommand} to finish local credential migration or repair.`;
+      legacyStoreFindings.push({
+        checkId: DEVICE_PAIRING_CHECK_ID,
+        severity: "warning",
+        category: "fix-now",
+        docsUrl: "https://docs.openclaw.ai/cli/devices",
+        message: `Legacy device auth store ${sanitizeTerminalText(deviceAuth.sourcePath)} is still present and local credentials require migration or repair. ${fixHint}`,
+        path: "identity.device-auth",
+        requirement: "device-auth-store-legacy-file",
+        fixHint,
+      });
     }
-    throw error;
   }
+  const snapshot = await loadDoctorPairingSnapshot({
+    cfg: params.cfg,
+    healthOk: params.healthOk ?? false,
+  });
   if (!snapshot) {
-    return;
+    return legacyStoreFindings;
   }
-  const lines = [
-    ...collectPendingPairingIssues(snapshot),
-    ...collectPairedRecordIssues(snapshot),
-    ...collectLocalDeviceAuthIssues(snapshot),
+  return [
+    ...legacyStoreFindings,
+    ...collectPendingPairingFindings(snapshot),
+    ...collectPairedRecordFindings(snapshot),
+    ...(await collectLocalDeviceAuthFindings(snapshot)),
   ];
-  if (lines.length === 0) {
-    return;
-  }
-  note(lines.join("\n"), "Device pairing");
 }

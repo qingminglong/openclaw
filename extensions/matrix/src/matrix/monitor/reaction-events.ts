@@ -1,94 +1,45 @@
-// Matrix plugin module implements reaction events behavior.
+import type { ApprovalResolveResult } from "openclaw/plugin-sdk/approval-gateway-runtime";
+import { isApprovalNotFoundError } from "openclaw/plugin-sdk/error-runtime";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
+import { normalizeAccountId } from "openclaw/plugin-sdk/routing";
 import { getSessionBindingService } from "openclaw/plugin-sdk/session-binding-runtime";
 import {
   resolveMatrixApprovalReactionTargetWithPersistence,
-  unregisterMatrixApprovalReactionTarget,
+  unregisterMatrixApprovalReactionTargetsForApproval,
 } from "../../approval-reactions.js";
 import type { CoreConfig } from "../../types.js";
 import { resolveMatrixAccountConfig } from "../account-config.js";
 import { extractMatrixReactionAnnotation } from "../reaction-common.js";
+import { resolveMatrixThreadRootId } from "../relations.js";
 import type { MatrixClient } from "../sdk.js";
-import { resolveMatrixInboundRoute } from "./route.js";
-import type { PluginRuntime } from "./runtime-api.js";
-import { resolveMatrixThreadRootId, resolveMatrixThreadRouting } from "./threads.js";
+import { resolveMatrixInboundRouteAsync } from "./route.js";
+import { resolveMatrixThreadRouting } from "./threads.js";
 import type { MatrixRawEvent, RoomMessageEventContent } from "./types.js";
 
-let approvalReactionAuthPromise:
-  | Promise<typeof import("../../approval-reaction-auth.js")>
-  | undefined;
-let execApprovalResolverPromise:
-  | Promise<typeof import("../../exec-approval-resolver.js")>
-  | undefined;
+const loadApprovalReactionAuth = createLazyRuntimeModule(
+  () => import("../../approval-reaction-auth.js"),
+);
 
-function loadApprovalReactionAuth(): Promise<typeof import("../../approval-reaction-auth.js")> {
-  approvalReactionAuthPromise ??= import("../../approval-reaction-auth.js");
-  return approvalReactionAuthPromise;
-}
+const loadExecApprovalResolver = createLazyRuntimeModule(
+  () => import("openclaw/plugin-sdk/approval-gateway-runtime"),
+);
 
-function loadExecApprovalResolver(): Promise<typeof import("../../exec-approval-resolver.js")> {
-  execApprovalResolverPromise ??= import("../../exec-approval-resolver.js");
-  return execApprovalResolverPromise;
-}
+const loadMatrixSend = createLazyRuntimeModule(() => import("../send.js"));
 
-export type MatrixReactionNotificationMode = "off" | "own";
-
-export function resolveMatrixReactionNotificationMode(params: {
-  cfg: CoreConfig;
-  accountId: string;
-}): MatrixReactionNotificationMode {
-  const matrixConfig = params.cfg.channels?.matrix;
-  const accountConfig = resolveMatrixAccountConfig({
-    cfg: params.cfg,
-    accountId: params.accountId,
-  });
-  return accountConfig.reactionNotifications ?? matrixConfig?.reactionNotifications ?? "own";
-}
-
-async function maybeResolveMatrixApprovalReaction(params: {
-  cfg: CoreConfig;
-  accountId: string;
-  senderId: string;
-  target: Awaited<ReturnType<typeof resolveMatrixApprovalReactionTargetWithPersistence>>;
-  targetEventId: string;
-  roomId: string;
-  logVerboseMessage: (message: string) => void;
-}): Promise<boolean> {
-  if (!params.target) {
-    return false;
-  }
-  const approvalKind = params.target.approvalId.startsWith("plugin:") ? "plugin" : "exec";
-  const { isMatrixApprovalReactionAuthorizedSender } = await loadApprovalReactionAuth();
-  if (!isMatrixApprovalReactionAuthorizedSender({ ...params, approvalKind })) {
-    return false;
-  }
-  const { isApprovalNotFoundError, resolveMatrixApproval } = await loadExecApprovalResolver();
-  try {
-    await resolveMatrixApproval({
-      cfg: params.cfg,
-      approvalId: params.target.approvalId,
-      decision: params.target.decision,
-      senderId: params.senderId,
-    });
-    params.logVerboseMessage(
-      `matrix: approval reaction resolved id=${params.target.approvalId} sender=${params.senderId} decision=${params.target.decision}`,
-    );
-    return true;
-  } catch (err) {
-    if (isApprovalNotFoundError(err)) {
-      unregisterMatrixApprovalReactionTarget({
-        roomId: params.roomId,
-        eventId: params.targetEventId,
-      });
-      params.logVerboseMessage(
-        `matrix: approval reaction ignored for expired approval id=${params.target.approvalId} sender=${params.senderId}`,
-      );
-      return true;
-    }
-    params.logVerboseMessage(
-      `matrix: approval reaction failed id=${params.target.approvalId} sender=${params.senderId}: ${String(err)}`,
-    );
-    return true;
-  }
+function buildMatrixApprovalTerminalText(result: ApprovalResolveResult): string {
+  const approval = result.approval;
+  const terminalLabel =
+    approval.status === "allowed"
+      ? approval.decision === "allow-always"
+        ? "Allowed always"
+        : "Allowed once"
+      : approval.status === "denied"
+        ? "Denied"
+        : approval.status === "expired"
+          ? "Expired"
+          : "Cancelled";
+  return `${result.applied ? "Resolved" : "Already resolved"}: ${terminalLabel}\n\nID: ${approval.id}`;
 }
 
 export async function handleInboundMatrixReaction(params: {
@@ -112,27 +63,105 @@ export async function handleInboundMatrixReaction(params: {
     return;
   }
   const approvalTarget = await resolveMatrixApprovalReactionTargetWithPersistence({
+    accountId: params.accountId,
     roomId: params.roomId,
     eventId: reaction.eventId,
     reactionKey: reaction.key,
   });
+  const { cfg, accountId, senderId, client, roomId, logVerboseMessage } = params;
+  const targetEventId = reaction.eventId;
   if (
-    await maybeResolveMatrixApprovalReaction({
-      cfg: params.cfg,
-      accountId: params.accountId,
-      senderId: params.senderId,
-      target: approvalTarget,
-      targetEventId: reaction.eventId,
-      roomId: params.roomId,
-      logVerboseMessage: params.logVerboseMessage,
-    })
+    await (async () => {
+      if (!approvalTarget) {
+        return false;
+      }
+      const { isMatrixApprovalReactionAuthorizedSender } = await loadApprovalReactionAuth();
+      if (
+        !isMatrixApprovalReactionAuthorizedSender({
+          cfg,
+          accountId,
+          senderId,
+          approvalKind: approvalTarget.approvalKind,
+        })
+      ) {
+        return false;
+      }
+      const { resolveApprovalOverGateway } = await loadExecApprovalResolver();
+      try {
+        const result = await resolveApprovalOverGateway({
+          cfg,
+          approvalId: approvalTarget.approvalId,
+          approvalKind: approvalTarget.approvalKind,
+          decision: approvalTarget.decision,
+          channel: "matrix",
+          accountId,
+          senderId,
+        });
+        // Retire every delivered anchor; losing surfaces also need the canonical
+        // terminal presentation because their original resolved event may have raced.
+        const retiredAccountId = normalizeAccountId(accountId);
+        const registeredTargets = await unregisterMatrixApprovalReactionTargetsForApproval({
+          accountId: retiredAccountId,
+          approvalId: approvalTarget.approvalId,
+          approvalKind: approvalTarget.approvalKind,
+        });
+        const targets = new Map<string, { accountId: string; roomId: string; eventId: string }>();
+        for (const target of [
+          ...registeredTargets,
+          { accountId: retiredAccountId, roomId, eventId: targetEventId },
+        ]) {
+          targets.set(JSON.stringify([target.accountId, target.roomId, target.eventId]), target);
+        }
+        const { editMessageMatrix } = await loadMatrixSend();
+        const terminalText = buildMatrixApprovalTerminalText(result);
+        const updates = await Promise.allSettled(
+          Array.from(targets.values(), async (target) => {
+            await editMessageMatrix(target.roomId, target.eventId, terminalText, {
+              cfg,
+              accountId: target.accountId,
+              client,
+            });
+          }),
+        );
+        const failedUpdates = updates.filter((update) => update.status === "rejected").length;
+        if (failedUpdates > 0) {
+          logVerboseMessage(
+            `matrix: failed to terminalize ${failedUpdates} approval prompt(s) id=${approvalTarget.approvalId}`,
+          );
+        }
+        const canonicalDecision = "decision" in result.approval ? result.approval.decision : "none";
+        logVerboseMessage(
+          `matrix: approval reaction resolved id=${approvalTarget.approvalId} sender=${senderId} applied=${result.applied} status=${result.approval.status} decision=${canonicalDecision}`,
+        );
+        return true;
+      } catch (err) {
+        if (isApprovalNotFoundError(err)) {
+          await unregisterMatrixApprovalReactionTargetsForApproval({
+            accountId,
+            approvalId: approvalTarget.approvalId,
+            approvalKind: approvalTarget.approvalKind,
+          });
+          logVerboseMessage(
+            `matrix: approval reaction ignored for expired approval id=${approvalTarget.approvalId} sender=${senderId}`,
+          );
+          return true;
+        }
+        logVerboseMessage(
+          `matrix: approval reaction failed id=${approvalTarget.approvalId} sender=${senderId}: ${String(err)}`,
+        );
+        throw err;
+      }
+    })()
   ) {
     return;
   }
-  const notificationMode = resolveMatrixReactionNotificationMode({
+  const matrixConfig = params.cfg.channels?.matrix;
+  const notificationAccountConfig = resolveMatrixAccountConfig({
     cfg: params.cfg,
     accountId: params.accountId,
   });
+  const notificationMode =
+    notificationAccountConfig.reactionNotifications ?? matrixConfig?.reactionNotifications ?? "own";
   if (notificationMode === "off") {
     return;
   }
@@ -158,12 +187,7 @@ export async function handleInboundMatrixReaction(params: {
     targetEvent && targetEvent.content && typeof targetEvent.content === "object"
       ? (targetEvent.content as RoomMessageEventContent)
       : undefined;
-  const threadRootId = targetContent
-    ? resolveMatrixThreadRootId({
-        event: targetEvent as MatrixRawEvent,
-        content: targetContent,
-      })
-    : undefined;
+  const threadRootId = targetContent ? resolveMatrixThreadRootId(targetContent) : undefined;
   const accountConfig = resolveMatrixAccountConfig({
     cfg: params.cfg,
     accountId: params.accountId,
@@ -175,7 +199,7 @@ export async function handleInboundMatrixReaction(params: {
     messageId: reaction.eventId,
     threadRootId,
   });
-  const { route, runtimeBindingId } = resolveMatrixInboundRoute({
+  const { route, runtimeBindingId } = await resolveMatrixInboundRouteAsync({
     cfg: params.cfg,
     accountId: params.accountId,
     roomId: params.roomId,
@@ -183,15 +207,18 @@ export async function handleInboundMatrixReaction(params: {
     isDirectMessage: params.isDirectMessage,
     dmSessionScope: accountConfig.dm?.sessionScope ?? "per-user",
     threadId: thread.threadId,
-    eventTs: params.event.origin_server_ts,
     resolveAgentRoute: params.core.channel.routing.resolveAgentRoute,
   });
   if (runtimeBindingId) {
-    getSessionBindingService().touch(runtimeBindingId, params.event.origin_server_ts);
+    await getSessionBindingService().touchAsync(runtimeBindingId, params.event.origin_server_ts, {
+      channel: "matrix",
+      accountId: params.accountId,
+    });
   }
   const text = `Matrix reaction added: ${reaction.key} by ${params.senderLabel} on msg ${reaction.eventId}`;
   params.core.system.enqueueSystemEvent(text, {
     sessionKey: route.sessionKey,
+    agentId: route.agentId,
     contextKey: `matrix:reaction:add:${params.roomId}:${reaction.eventId}:${params.senderId}:${reaction.key}`,
   });
   params.logVerboseMessage(

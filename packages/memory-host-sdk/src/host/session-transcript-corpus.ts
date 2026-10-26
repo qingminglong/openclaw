@@ -1,79 +1,44 @@
-// Accessor-backed transcript corpus discovery for memory/QMD session indexing.
-import fsSync from "node:fs";
+// Accessor-backed transcript corpus discovery for memory session indexing.
+import type { BigIntStats, Dirent } from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeAgentId } from "./config-utils.js";
+import { isFileMissingError, normalizeComparablePath } from "./fs-utils.js";
 import {
-  canonicalizeMainSessionAlias,
+  extractAgentIdFromSessionsDir,
+  cloneEnvWithPlatformSemantics,
   getRuntimeConfig,
-  isCronRunSessionKey,
   isSessionArchiveArtifactName,
   isUsageCountedSessionTranscriptFileName,
-  listSessionEntries,
-  parseUsageCountedSessionIdFromFileName,
-  resolveSessionAgentId,
-  resolveSessionFilePath,
+  readSessionTranscriptCorpusInWorker,
+  resolveSessionTranscriptsDirForAgent,
   resolveStorePath,
-  type SessionEntry,
 } from "./openclaw-runtime-session.js";
+import type {
+  SessionTranscriptCorpusEntry,
+  SessionTranscriptCorpusOptions,
+  SessionTranscriptCorpusScope,
+  SessionTranscriptCorpusArtifact,
+} from "./session-transcript-corpus.types.js";
 
-const DREAMING_NARRATIVE_RUN_PREFIX = "dreaming-narrative-";
+export type {
+  SessionTranscriptCorpusEntry,
+  SessionTranscriptCorpusOptions,
+} from "./session-transcript-corpus.types.js";
 
-export type SessionTranscriptCorpusArtifactKind =
-  | "active-session"
-  | "archive-artifact"
-  | "orphan-file-artifact";
-
-export type SessionTranscriptCorpusEntry = {
-  agentId: string;
-  sessionFile: string;
-  sessionId: string;
-  artifactKind: SessionTranscriptCorpusArtifactKind;
-  sessionKey?: string;
-  /** True when this transcript belongs to an internal dreaming narrative run. */
-  generatedByDreamingNarrative?: boolean;
-  /** True when this transcript belongs to an isolated cron run session. */
-  generatedByCronRun?: boolean;
-};
-
-type SessionEntrySummary = {
-  sessionKey: string;
-  entry: SessionEntry;
-};
-
-function isDreamingNarrativeSessionStoreKey(sessionKey: string): boolean {
-  const trimmed = sessionKey.trim();
-  if (!trimmed) {
-    return false;
-  }
-  const firstSeparator = trimmed.indexOf(":");
-  if (firstSeparator < 0) {
-    return trimmed.startsWith(DREAMING_NARRATIVE_RUN_PREFIX);
-  }
-  const secondSeparator = trimmed.indexOf(":", firstSeparator + 1);
-  const sessionSegment = secondSeparator < 0 ? trimmed : trimmed.slice(secondSeparator + 1);
-  return sessionSegment.startsWith(DREAMING_NARRATIVE_RUN_PREFIX);
+function fileContentRevisionFromStat(stat: BigIntStats): string | undefined {
+  return stat.isFile()
+    ? `file:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+    : undefined;
 }
 
-function isDreamingNarrativeSessionKeyLike(value: unknown): boolean {
-  return typeof value === "string" && isDreamingNarrativeSessionStoreKey(value);
-}
-
-function hasCronRunSessionKey(value: unknown): boolean {
-  return typeof value === "string" && isCronRunSessionKey(value);
-}
-
-function normalizeComparablePath(pathname: string): string {
-  const resolved = path.resolve(pathname);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
-
-function normalizeRealComparablePath(pathname: string): string {
+async function normalizeRealComparablePathAsync(pathname: string): Promise<string> {
   try {
-    return normalizeComparablePath(fsSync.realpathSync(pathname));
+    return normalizeComparablePath(await fs.realpath(pathname));
   } catch {
     try {
       return normalizeComparablePath(
-        path.join(fsSync.realpathSync(path.dirname(pathname)), path.basename(pathname)),
+        path.join(await fs.realpath(path.dirname(pathname)), path.basename(pathname)),
       );
     } catch {
       return normalizeComparablePath(pathname);
@@ -81,209 +46,25 @@ function normalizeRealComparablePath(pathname: string): string {
   }
 }
 
-function rememberArtifactDir(dirs: Map<string, string>, dir: string): void {
-  dirs.set(normalizeRealComparablePath(dir), dir);
+function sessionTranscriptArtifactPaths(sessionsDir: string, entries: Dirent[]): string[] {
+  return entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name)
+    .filter((name) => isUsageCountedSessionTranscriptFileName(name))
+    .filter((name) => isSessionArchiveArtifactName(name))
+    .map((name) => path.join(sessionsDir, name));
 }
 
-function extractAgentIdFromSessionPath(absPath: string): string | null {
-  const parts = path.normalize(path.resolve(absPath)).split(path.sep).filter(Boolean);
-  const sessionsIndex = parts.lastIndexOf("sessions");
-  if (sessionsIndex < 2 || parts[sessionsIndex - 2] !== "agents") {
-    return null;
-  }
-  return parts[sessionsIndex - 1] || null;
-}
-
-function extractAgentIdFromSessionsDir(sessionsDir: string): string | null {
-  const parts = path.normalize(path.resolve(sessionsDir)).split(path.sep).filter(Boolean);
-  const sessionsIndex = parts.length - 1;
-  if (
-    parts[sessionsIndex] !== "sessions" ||
-    sessionsIndex < 2 ||
-    parts[sessionsIndex - 2] !== "agents"
-  ) {
-    return null;
-  }
-  return parts[sessionsIndex - 1] || null;
-}
-
-function resolveSessionStoreTranscriptCorpusPath(
+function resolveSessionTranscriptCorpusScope(
   agentId: string,
-  sessionsDir: string,
-  entry: { sessionFile?: unknown; sessionId?: unknown } | undefined,
-): string | null {
-  const sessionFile =
-    typeof entry?.sessionFile === "string" && entry.sessionFile.trim().length > 0
-      ? entry.sessionFile.trim()
-      : undefined;
-  const sessionId =
-    typeof entry?.sessionId === "string" && entry.sessionId.trim().length > 0
-      ? entry.sessionId.trim()
-      : sessionFile
-        ? parseUsageCountedSessionIdFromFileName(path.basename(sessionFile))
-        : null;
-  if (!sessionId) {
-    return null;
-  }
-  try {
-    if (!sessionFile) {
-      return resolveSessionFilePath(sessionId, undefined, { agentId, sessionsDir });
-    }
-    const resolved = resolveSessionFilePath(
-      sessionId,
-      { sessionFile },
-      {
-        agentId,
-        sessionsDir,
-      },
-    );
-    if (!path.isAbsolute(sessionFile)) {
-      const candidate = path.resolve(sessionsDir, sessionFile);
-      if (
-        normalizeComparablePath(path.dirname(candidate)) !== normalizeComparablePath(sessionsDir)
-      ) {
-        return null;
-      }
-      return normalizeRealComparablePath(resolved) === normalizeRealComparablePath(candidate)
-        ? candidate
-        : null;
-    }
-    const pathAgentId = extractAgentIdFromSessionPath(sessionFile);
-    if (pathAgentId && normalizeAgentId(pathAgentId) !== normalizeAgentId(agentId)) {
-      return null;
-    }
-    return normalizeRealComparablePath(resolved) === normalizeRealComparablePath(sessionFile)
-      ? sessionFile
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function classifySessionEntry(
-  sessionKey: string,
-  entry: SessionEntry,
-): {
-  generatedByDreamingNarrative: boolean;
-  generatedByCronRun: boolean;
-} {
-  return {
-    generatedByDreamingNarrative:
-      isDreamingNarrativeSessionStoreKey(sessionKey) ||
-      isDreamingNarrativeSessionKeyLike(entry.spawnedBy),
-    generatedByCronRun: isCronRunSessionKey(sessionKey) || hasCronRunSessionKey(entry.spawnedBy),
-  };
-}
-
-function isRegularSessionTranscriptFile(absPath: string): boolean {
-  try {
-    return fsSync.lstatSync(absPath).isFile();
-  } catch {
-    return false;
-  }
-}
-
-function toSessionStoreCorpusEntry(
-  agentId: string,
-  sessionsDir: string,
-  summary: SessionEntrySummary,
-): SessionTranscriptCorpusEntry | null {
-  const sessionFile = resolveSessionStoreTranscriptCorpusPath(agentId, sessionsDir, summary.entry);
-  if (!sessionFile || !isUsageCountedSessionTranscriptFileName(path.basename(sessionFile))) {
-    return null;
-  }
-  const sessionId =
-    typeof summary.entry.sessionId === "string" && summary.entry.sessionId.trim()
-      ? summary.entry.sessionId.trim()
-      : parseUsageCountedSessionIdFromFileName(path.basename(sessionFile));
-  if (!sessionId) {
-    return null;
-  }
-  const sessionKey = summary.sessionKey.trim();
-  const classification = classifySessionEntry(summary.sessionKey, summary.entry);
-  return {
-    agentId,
-    artifactKind: "active-session",
-    sessionFile,
-    sessionId,
-    ...(sessionKey ? { sessionKey } : {}),
-    ...(classification.generatedByDreamingNarrative ? { generatedByDreamingNarrative: true } : {}),
-    ...(classification.generatedByCronRun ? { generatedByCronRun: true } : {}),
-  };
-}
-
-function listSessionTranscriptArtifactFiles(sessionsDir: string): string[] {
-  try {
-    return fsSync
-      .readdirSync(sessionsDir, { withFileTypes: true })
-      .filter((entry) => entry.isFile())
-      .map((entry) => entry.name)
-      .filter((name) => isUsageCountedSessionTranscriptFileName(name))
-      .map((name) => path.join(sessionsDir, name));
-  } catch {
-    return [];
-  }
-}
-
-function classifyTranscriptArtifact(
-  artifactPath: string,
-  activeEntriesByPath: ReadonlyMap<string, SessionTranscriptCorpusEntry>,
-): {
-  generatedByDreamingNarrative: boolean;
-  generatedByCronRun: boolean;
-} {
-  const directEntry = activeEntriesByPath.get(normalizeRealComparablePath(artifactPath));
-  if (directEntry) {
-    return {
-      generatedByDreamingNarrative: directEntry.generatedByDreamingNarrative === true,
-      generatedByCronRun: directEntry.generatedByCronRun === true,
-    };
-  }
-  const sessionsDir = path.dirname(artifactPath);
-  const primarySessionId = parseUsageCountedSessionIdFromFileName(path.basename(artifactPath));
-  const primaryEntry =
-    primarySessionId && isSessionArchiveArtifactName(path.basename(artifactPath))
-      ? activeEntriesByPath.get(
-          normalizeRealComparablePath(path.join(sessionsDir, `${primarySessionId}.jsonl`)),
-        )
-      : undefined;
-  return {
-    generatedByDreamingNarrative: primaryEntry?.generatedByDreamingNarrative === true,
-    generatedByCronRun: primaryEntry?.generatedByCronRun === true,
-  };
-}
-
-function toArtifactCorpusEntry(
-  agentId: string,
-  artifactPath: string,
-  activeEntriesByPath: ReadonlyMap<string, SessionTranscriptCorpusEntry>,
-): SessionTranscriptCorpusEntry | null {
-  const sessionId = parseUsageCountedSessionIdFromFileName(path.basename(artifactPath));
-  if (!sessionId) {
-    return null;
-  }
-  const artifactKind = isSessionArchiveArtifactName(path.basename(artifactPath))
-    ? "archive-artifact"
-    : "orphan-file-artifact";
-  const classification = classifyTranscriptArtifact(artifactPath, activeEntriesByPath);
-  return {
-    agentId,
-    artifactKind,
-    sessionFile: artifactPath,
-    sessionId,
-    ...(classification.generatedByDreamingNarrative ? { generatedByDreamingNarrative: true } : {}),
-    ...(classification.generatedByCronRun ? { generatedByCronRun: true } : {}),
-  };
-}
-
-export function listSessionTranscriptCorpusEntriesForAgentSync(
-  agentId: string,
-): SessionTranscriptCorpusEntry[] {
+  cfg: SessionTranscriptCorpusScope["cfg"],
+): SessionTranscriptCorpusScope {
   const normalizedAgentId = normalizeAgentId(agentId);
-  const cfg = getRuntimeConfig();
+  const env = cloneEnvWithPlatformSemantics(process.env);
   const configuredStore = cfg.session?.store;
   const storePath = resolveStorePath(configuredStore, {
     agentId: normalizedAgentId,
+    env,
   });
   const sessionsDir = path.dirname(storePath);
   const fixedStoreOwnerAgentId = extractAgentIdFromSessionsDir(sessionsDir);
@@ -295,83 +76,61 @@ export function listSessionTranscriptCorpusEntriesForAgentSync(
     configuredStore.trim().length > 0 &&
     !configuredStore.includes("{agentId}") &&
     !isAgentOwnedFixedStore;
-  const activeEntriesByPath = new Map<string, SessionTranscriptCorpusEntry>();
-  const activeEntryOwnersByPath = new Map<string, string>();
-  const artifactDirsByPath = new Map<string, string>();
-  rememberArtifactDir(artifactDirsByPath, sessionsDir);
-  for (const summary of listSessionEntries({
-    agentId: normalizedAgentId,
-    hydrateSkillPromptRefs: false,
+  return {
+    cfg,
+    env,
+    normalizedAgentId,
     storePath,
-  })) {
-    const sessionKey = isSharedFixedStore
-      ? summary.sessionKey
-      : canonicalizeMainSessionAlias({
-          cfg,
-          agentId: normalizedAgentId,
-          sessionKey: summary.sessionKey,
-        });
-    const ownerAgentId = resolveSessionAgentId({
-      config: cfg,
-      sessionKey,
-      ...(isSharedFixedStore ? {} : { fallbackAgentId: normalizedAgentId }),
-    });
-    const entry = toSessionStoreCorpusEntry(ownerAgentId, sessionsDir, summary);
-    if (!entry) {
-      continue;
+    isSharedFixedStore,
+    artifactDirs: [sessionsDir, resolveSessionTranscriptsDirForAgent(normalizedAgentId, env)],
+  };
+}
+
+async function readSessionTranscriptCorpusArtifacts(
+  scope: SessionTranscriptCorpusScope,
+  options: SessionTranscriptCorpusOptions,
+): Promise<SessionTranscriptCorpusArtifact[]> {
+  const artifactDirs = new Map<string, string>();
+  for (const dir of scope.artifactDirs) {
+    artifactDirs.set(await normalizeRealComparablePathAsync(dir), dir);
+  }
+  const artifacts: SessionTranscriptCorpusArtifact[] = [];
+  const seen = new Set<string>();
+  // Keep filesystem preparation sequential; none of it may block Gateway callbacks.
+  for (const dir of artifactDirs.values()) {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      if (isFileMissingError(error) && error.code === "ENOENT") {
+        continue;
+      }
+      throw error;
     }
-    const normalizedEntryPath = normalizeRealComparablePath(entry.sessionFile);
-    activeEntryOwnersByPath.set(normalizedEntryPath, ownerAgentId);
-    rememberArtifactDir(artifactDirsByPath, path.dirname(entry.sessionFile));
-    if (ownerAgentId === normalizedAgentId) {
-      activeEntriesByPath.set(normalizedEntryPath, entry);
+    for (const artifactPath of sessionTranscriptArtifactPaths(dir, entries)) {
+      const comparablePath = await normalizeRealComparablePathAsync(artifactPath);
+      if (seen.has(comparablePath)) {
+        continue;
+      }
+      seen.add(comparablePath);
+      let contentRevision: string | undefined;
+      if (options.includeContentRevision !== false) {
+        try {
+          contentRevision = fileContentRevisionFromStat(
+            await fs.stat(artifactPath, { bigint: true }),
+          );
+        } catch {
+          contentRevision = undefined;
+        }
+      }
+      artifacts.push({ path: artifactPath, contentRevision });
     }
   }
-  const includeUnownedArtifacts = !isSharedFixedStore;
-  const corpusEntries = [...activeEntriesByPath.values()].filter((entry) =>
-    isRegularSessionTranscriptFile(entry.sessionFile),
-  );
-  const scannedArtifactPaths = new Set<string>();
-  for (const artifactDir of artifactDirsByPath.values()) {
-    for (const artifactPath of listSessionTranscriptArtifactFiles(artifactDir)) {
-      const normalizedArtifactPath = normalizeRealComparablePath(artifactPath);
-      if (scannedArtifactPaths.has(normalizedArtifactPath)) {
-        continue;
-      }
-      scannedArtifactPaths.add(normalizedArtifactPath);
-      if (activeEntriesByPath.has(normalizedArtifactPath)) {
-        continue;
-      }
-      const artifactOwner = activeEntryOwnersByPath.get(normalizedArtifactPath);
-      if (artifactOwner) {
-        continue;
-      }
-      const primarySessionId = parseUsageCountedSessionIdFromFileName(path.basename(artifactPath));
-      const primaryOwner =
-        primarySessionId && isSessionArchiveArtifactName(path.basename(artifactPath))
-          ? activeEntryOwnersByPath.get(
-              normalizeRealComparablePath(
-                path.join(path.dirname(artifactPath), `${primarySessionId}.jsonl`),
-              ),
-            )
-          : undefined;
-      if (primaryOwner && primaryOwner !== normalizedAgentId) {
-        continue;
-      }
-      if (!primaryOwner && !includeUnownedArtifacts) {
-        continue;
-      }
-      const entry = toArtifactCorpusEntry(normalizedAgentId, artifactPath, activeEntriesByPath);
-      if (entry) {
-        corpusEntries.push(entry);
-      }
-    }
-  }
-  return corpusEntries;
+  return artifacts;
 }
 
 /**
- * Lists transcript corpus entries for QMD/memory indexing.
+ * Lists transcript corpus entries for memory indexing.
  *
  * Active sessions come from the session accessor seam; retained reset/delete
  * transcript artifacts remain explicit file artifacts until core owns archive
@@ -379,6 +138,10 @@ export function listSessionTranscriptCorpusEntriesForAgentSync(
  */
 export async function listSessionTranscriptCorpusEntriesForAgent(
   agentId: string,
+  options: SessionTranscriptCorpusOptions = {},
 ): Promise<SessionTranscriptCorpusEntry[]> {
-  return listSessionTranscriptCorpusEntriesForAgentSync(agentId);
+  const { config, ...capturedOptions } = options;
+  const scope = resolveSessionTranscriptCorpusScope(agentId, config ?? getRuntimeConfig());
+  const prepareArtifacts = () => readSessionTranscriptCorpusArtifacts(scope, capturedOptions);
+  return readSessionTranscriptCorpusInWorker(scope, capturedOptions, prepareArtifacts);
 }

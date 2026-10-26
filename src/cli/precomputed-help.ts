@@ -1,61 +1,39 @@
-import { consumeRootOptionToken } from "../infra/cli-root-options.js";
+import { getCommandPathWithRootOptions, isSimpleCommandHelpInvocation } from "./argv.js";
+import { PRECOMPUTED_SUBCOMMAND_HELP_NAMES } from "./precomputed-help-commands.js";
 
-export type PrecomputedSubcommandHelpName =
-  | "doctor"
-  | "gateway"
-  | "models"
-  | "plugins"
-  | "sessions"
-  | "tasks";
+const PRECOMPUTED_COMMAND_HELP_NAMES = new Set([
+  "browser",
+  "secrets",
+  "nodes",
+  ...PRECOMPUTED_SUBCOMMAND_HELP_NAMES,
+] as const);
 
-const PRECOMPUTED_SUBCOMMAND_HELP_COMMANDS = new Set<PrecomputedSubcommandHelpName>([
-  "doctor",
-  "gateway",
-  "models",
-  "plugins",
-  "sessions",
-  "tasks",
-]);
-const HELP_FLAGS = new Set(["-h", "--help"]);
-const VERSION_FLAGS = new Set(["-V", "--version"]);
-
-function isPrecomputedSubcommandHelpName(value: string): value is PrecomputedSubcommandHelpName {
-  return PRECOMPUTED_SUBCOMMAND_HELP_COMMANDS.has(value as PrecomputedSubcommandHelpName);
-}
-
-export function resolvePrecomputedSubcommandHelpCommand(
-  argv: string[],
-): PrecomputedSubcommandHelpName | null {
-  const args = argv.slice(2);
-  let commandName: PrecomputedSubcommandHelpName | null = null;
-  let sawHelp = false;
-
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    if (!arg || arg === "--") {
-      return null;
-    }
-    if (VERSION_FLAGS.has(arg)) {
-      return null;
-    }
-    if (!commandName) {
-      const consumed = consumeRootOptionToken(args, index);
-      if (consumed > 0) {
-        index += consumed - 1;
-        continue;
-      }
-      if (arg.startsWith("-") || !isPrecomputedSubcommandHelpName(arg)) {
-        return null;
-      }
-      commandName = arg;
-      continue;
-    }
-    if (HELP_FLAGS.has(arg)) {
-      sawHelp = true;
-      continue;
-    }
-    return null;
+export async function tryOutputPrecomputedCommandHelp(argv: string[]): Promise<boolean> {
+  const env = process.env;
+  if (env.OPENCLAW_DISABLE_CLI_STARTUP_HELP_FAST_PATH === "1") {
+    return false;
   }
 
-  return commandName && sawHelp ? commandName : null;
+  if (!isSimpleCommandHelpInvocation(argv, PRECOMPUTED_COMMAND_HELP_NAMES)) {
+    return false;
+  }
+  const [candidateName, extra] = getCommandPathWithRootOptions(argv, 2);
+  const commandName =
+    extra === undefined
+      ? ([...PRECOMPUTED_COMMAND_HELP_NAMES].find((name) => name === candidateName) ?? null)
+      : null;
+  if (!commandName) {
+    return false;
+  }
+
+  if (commandName === "nodes") {
+    const { loadRootHelpRenderOptionsForConfigSensitivePlugins } =
+      await import("./root-help-live-config.js");
+    if (await loadRootHelpRenderOptionsForConfigSensitivePlugins(env)) {
+      return false;
+    }
+  }
+
+  const { outputPrecomputedCommandHelpText } = await import("./root-help-metadata.js");
+  return outputPrecomputedCommandHelpText(commandName);
 }

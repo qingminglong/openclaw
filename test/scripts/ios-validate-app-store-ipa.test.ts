@@ -1,140 +1,73 @@
 // iOS IPA validation tests cover the App Store upload gate without real signing assets.
-import { execFileSync } from "node:child_process";
-import {
-  chmodSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import os from "node:os";
+import { spawnSync } from "node:child_process";
+import { chmodSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import JSZip from "jszip";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const SCRIPT = path.join(process.cwd(), "scripts", "ios-validate-app-store-ipa.sh");
 const BASH_BIN = process.platform === "win32" ? "bash" : "/bin/bash";
+const BUILD_COMMIT = "0123456789abcdef0123456789abcdef01234567";
+const BUILD_TIMESTAMP = "2026-07-10T12:34:56.000Z";
 
-const tempDirs: string[] = [];
-
-function bashArgs(scriptPath: string): string[] {
-  return process.platform === "win32" ? [scriptPath] : ["--noprofile", "--norc", scriptPath];
-}
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const toolDirs = useAutoCleanupTempDirTracker(afterAll);
+let toolsDir: string;
 
 function writeExecutable(filePath: string, body: string): void {
   writeFileSync(filePath, body, "utf8");
   chmodSync(filePath, 0o755);
 }
 
-function plistString(key: string, value: string): string {
-  return `<key>${key}</key><string>${value}</string>`;
+function plist(body: Record<string, string>): string {
+  return `<plist version="1.0"><dict>${Object.entries(body)
+    .map(([key, value]) => `<key>${key}</key><string>${value}</string>`)
+    .join("")}</dict></plist>`;
 }
 
-function plistArray(key: string, values: readonly string[]): string {
-  return `<key>${key}</key><array>${values.map((value) => `<string>${value}</string>`).join("")}</array>`;
-}
-
-function plistDict(key: string, body: string): string {
-  return `<key>${key}</key><dict>${body}</dict>`;
-}
-
-function plist(body: string): string {
-  return [
-    `<?xml version="1.0" encoding="UTF-8"?>`,
-    `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
-    `<plist version="1.0"><dict>${body}</dict></plist>`,
-  ].join("\n");
-}
-
-function writeFakePlistBuddy(filePath: string): void {
-  writeExecutable(
-    filePath,
-    `#!/usr/bin/env node
+const fakeTools = {
+  plistbuddy: `#!/usr/bin/env node
 const { readFileSync } = require("node:fs");
 const commandIndex = process.argv.indexOf("-c");
 if (commandIndex < 0) process.exit(2);
-const command = process.argv[commandIndex + 1] || "";
-const file = process.argv[commandIndex + 2];
-const keyPath = command.replace(/^Print:/, "").split(":").filter(Boolean);
-const xml = readFileSync(file, "utf8");
-const tokens = [...xml.matchAll(/<key>([^<]*)<\\/key>|<string>([^<]*)<\\/string>|<array>|<\\/array>|<dict>|<\\/dict>/g)];
-let i = 0;
-function parseValue() {
-  const token = tokens[i++];
-  if (!token) return undefined;
-  const text = token[0];
-  if (token[2] !== undefined) return token[2];
-  if (text === "<dict>") return parseDict();
-  if (text === "<array>") {
-    const values = [];
-    while (i < tokens.length && tokens[i][0] !== "</array>") {
-      const value = parseValue();
-      if (value !== undefined) values.push(value);
-    }
-    i++;
-    return values;
-  }
-  return undefined;
-}
-function parseDict() {
-  const obj = {};
-  while (i < tokens.length && tokens[i][0] !== "</dict>") {
-    const key = tokens[i++][1];
-    if (key === undefined) continue;
-    obj[key] = parseValue();
-  }
-  i++;
-  return obj;
-}
-while (i < tokens.length && tokens[i][0] !== "<dict>") i++;
-const root = parseValue();
-let current = root;
-for (const key of keyPath) {
-  if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) {
-    process.exit(1);
-  }
-  current = current[key];
-}
-if (Array.isArray(current)) {
-  console.log("Array {");
-  for (const value of current) console.log("    " + value);
-  console.log("}");
-} else if (current && typeof current === "object") {
-  console.log("Dict {");
-  console.log("}");
-} else if (typeof current === "string") {
-  console.log(current);
-} else {
-  process.exit(1);
-}
+const key = process.argv[commandIndex + 1].replace(/^Print:/, "");
+const xml = readFileSync(process.argv[commandIndex + 2], "utf8");
+const values = Object.fromEntries([...xml.matchAll(/<key>([^<]*)<\\/key>\\s*<string>([^<]*)<\\/string>/g)]
+  .map((match) => [match[1], match[2]]));
+if (!Object.hasOwn(values, key)) process.exit(1);
+console.log(values[key]);
 `,
-  );
+  signing: "#!/usr/bin/env node\nthrow new Error('unexpected signing inspection');\n",
+  plutil: `#!/usr/bin/env node
+const { readFileSync } = require("node:fs");
+if (process.argv[2] === "-convert" && process.argv[3] === "xml1") {
+  process.stdout.write(readFileSync(process.argv[process.argv.length - 1], "utf8"));
+  process.exit(0);
 }
-
-function writeFakeUnzip(filePath: string): void {
-  writeExecutable(
-    filePath,
-    `#!/usr/bin/env node
+const extractIndex = process.argv.indexOf("-extract");
+const expectIndex = process.argv.indexOf("-expect");
+if (extractIndex < 0 || expectIndex < 0 || process.argv[expectIndex + 1] !== "string") process.exit(2);
+const key = process.argv[extractIndex + 1];
+const file = process.argv[process.argv.length - 1];
+const xml = readFileSync(file, "utf8");
+// Escapes are doubled for the template-literal -> emitted-file hop: the emitted script
+// must contain \\] in the class and \\$& in the replacement, or keys with regex
+// metacharacters interpolate unescaped into the RegExp below and stop emulating plutil.
+const escapedKey = key.replace(/[.*+?^\${}()|[\\]\\\\]/g, "\\\\$&");
+const match = xml.match(new RegExp("<key>" + escapedKey + "</key>\\\\s*<string>([^<]*)</string>"));
+if (!match) process.exit(1);
+process.stdout.write(match[1]);
+`,
+  unzip: `#!/usr/bin/env node
 const { mkdirSync, readFileSync, writeFileSync } = require("node:fs");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 const requireFromRepo = createRequire(path.join(process.cwd(), "package.json"));
 const JSZip = requireFromRepo("jszip");
 
-const args = process.argv.slice(2);
-let ipaPath = "";
-let outputDir = "";
-for (let i = 0; i < args.length; i++) {
-  const arg = args[i];
-  if (arg === "-d") {
-    outputDir = args[++i] || "";
-  } else if (!arg.startsWith("-")) {
-    ipaPath = arg;
-  }
-}
-if (!ipaPath || !outputDir) process.exit(2);
+const [quiet, ipaPath, destination, outputDir] = process.argv.slice(2);
+if (quiet !== "-q" || destination !== "-d" || !ipaPath || !outputDir) process.exit(2);
 
 (async () => {
   const zip = await JSZip.loadAsync(readFileSync(ipaPath));
@@ -149,189 +82,135 @@ if (!ipaPath || !outputDir) process.exit(2);
   }
 })().catch(() => process.exit(1));
 `,
-  );
-}
+};
 
-async function writeIpaFixture(root: string): Promise<string> {
+async function writeUnsignedFixture(
+  root: string,
+  options: {
+    buildCommit?: string;
+    healthUpdateUsage?: string | null;
+    displayName?: string;
+    localizedDisplayName?: string;
+  } = {},
+) {
   const zip = new JSZip();
+  const appFile = (name: string, body: string) =>
+    zip.file(`Payload/OpenClaw.app/${name}`, body, { date: new Date(0) });
+  const healthUsage = "OpenClaw reads Health data for Health Summaries.";
+  const infoBody = {
+    CFBundleIdentifier: "ai.openclawfoundation.app",
+    CFBundleDisplayName: options.displayName ?? "OpenClaw",
+    OpenClawGitCommit: options.buildCommit ?? BUILD_COMMIT,
+    OpenClawBuildTimestamp: BUILD_TIMESTAMP,
+    OpenClawPushMode: "appStore",
+    OpenClawPushRelayBaseURL: "",
+    NSHealthShareUsageDescription: healthUsage,
+    ...(options.healthUpdateUsage === null
+      ? {}
+      : {
+          NSHealthUpdateUsageDescription: options.healthUpdateUsage ?? healthUsage,
+        }),
+  };
+  appFile("Info.plist", plist(infoBody));
+  appFile(
+    "de.lproj/InfoPlist.strings",
+    plist(
+      options.localizedDisplayName === undefined
+        ? { NSCameraUsageDescription: "OpenClaw verwendet die Kamera." }
+        : { CFBundleDisplayName: options.localizedDisplayName },
+    ),
+  );
+  appFile("embedded.mobileprovision", "fixture profile");
 
-  function addTree(dirPath: string, zipPath: string): void {
-    for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
-      const sourcePath = path.join(dirPath, entry.name);
-      const entryZipPath = `${zipPath}/${entry.name}`;
-      if (entry.isDirectory()) {
-        addTree(sourcePath, entryZipPath);
-      } else if (entry.isFile()) {
-        zip.file(entryZipPath, readFileSync(sourcePath), { date: new Date(0) });
-      }
-    }
-  }
-
-  addTree(path.join(root, "Payload"), "Payload");
   const ipaPath = path.join(root, "OpenClaw.ipa");
-  const buffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-  writeFileSync(ipaPath, buffer);
+  writeFileSync(ipaPath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));
   return ipaPath;
 }
 
-async function writeValidFixture(
-  root: string,
-  options: { pushMode?: string; legacyKey?: boolean } = {},
-): Promise<{
-  ipaPath: string;
-  plistBuddy: string;
-  codesign: string;
-  security: string;
-  unzip: string;
-}> {
-  const binDir = path.join(root, "bin");
-  const payloadDir = path.join(root, "Payload");
-  const appDir = path.join(payloadDir, "OpenClaw.app");
-  const fixturesDir = path.join(root, "fixtures");
-  mkdirSync(appDir, { recursive: true });
-  mkdirSync(binDir, { recursive: true });
-  mkdirSync(fixturesDir, { recursive: true });
-
-  const infoBody = [
-    plistString("CFBundleIdentifier", "ai.openclawfoundation.app"),
-    plistString("OpenClawPushMode", options.pushMode ?? "appStore"),
-    plistString("OpenClawPushRelayBaseURL", ""),
-    options.legacyKey ? plistString("OpenClawPushRelayProfile", "production") : "",
-  ].join("");
-  writeFileSync(path.join(appDir, "Info.plist"), plist(infoBody), "utf8");
-  writeFileSync(path.join(appDir, "embedded.mobileprovision"), "fixture profile", "utf8");
-
-  const entitlementsPath = path.join(fixturesDir, "entitlements.plist");
-  writeFileSync(
-    entitlementsPath,
-    plist(
-      [
-        plistString("application-identifier", "FWJYW4S8P8.ai.openclawfoundation.app"),
-        plistString("com.apple.developer.team-identifier", "FWJYW4S8P8"),
-        plistString("aps-environment", "production"),
-        plistString("com.apple.developer.devicecheck.appattest-environment", "production"),
-        plistArray("com.apple.security.application-groups", [
-          "group.ai.openclawfoundation.app.shared",
-        ]),
-      ].join(""),
-    ),
-    "utf8",
-  );
-
-  const profilePath = path.join(fixturesDir, "profile.plist");
-  writeFileSync(
-    profilePath,
-    plist(
-      [
-        plistString("Name", "OpenClaw App Store ai.openclawfoundation.app"),
-        plistArray("TeamIdentifier", ["FWJYW4S8P8"]),
-        plistDict(
-          "Entitlements",
-          [
-            plistString("application-identifier", "FWJYW4S8P8.ai.openclawfoundation.app"),
-            plistString("aps-environment", "production"),
-            plistArray("com.apple.developer.devicecheck.appattest-environment", ["production"]),
-            plistArray("com.apple.security.application-groups", [
-              "group.ai.openclawfoundation.app.shared",
-            ]),
-          ].join(""),
-        ),
-      ].join(""),
-    ),
-    "utf8",
-  );
-
-  const plistBuddy = path.join(binDir, "plistbuddy");
-  writeFakePlistBuddy(plistBuddy);
-  const unzip = path.join(binDir, "unzip");
-  writeFakeUnzip(unzip);
-  const codesign = path.join(binDir, "codesign");
-  writeExecutable(
-    codesign,
-    `#!/usr/bin/env bash
-set -euo pipefail
-cat "${entitlementsPath}"
-`,
-  );
-  const security = path.join(binDir, "security");
-  writeExecutable(
-    security,
-    `#!/usr/bin/env bash
-set -euo pipefail
-cat "${profilePath}"
-`,
-  );
-
-  const ipaPath = await writeIpaFixture(root);
-  return { ipaPath, plistBuddy, codesign, security, unzip };
-}
-
-function runValidator(fixture: {
-  ipaPath: string;
-  plistBuddy: string;
-  codesign: string;
-  security: string;
-  unzip: string;
-}): { ok: boolean; stdout: string; stderr: string } {
-  try {
-    const stdout = execFileSync(BASH_BIN, [...bashArgs(SCRIPT), "--ipa", fixture.ipaPath], {
+function runValidator(
+  fixture: Awaited<ReturnType<typeof writeUnsignedFixture>>,
+  expected: { commit?: string; timestamp?: string } = {},
+): { ok: boolean; stdout: string; stderr: string } {
+  const result = spawnSync(
+    BASH_BIN,
+    [
+      ...(process.platform === "win32" ? [SCRIPT] : ["--noprofile", "--norc", SCRIPT]),
+      "--ipa",
+      fixture,
+      "--expected-commit",
+      expected.commit ?? BUILD_COMMIT,
+      "--expected-build-timestamp",
+      expected.timestamp ?? BUILD_TIMESTAMP,
+    ],
+    {
       cwd: process.cwd(),
       env: {
         ...process.env,
-        IOS_VALIDATE_PLIST_BUDDY_BIN: fixture.plistBuddy,
-        IOS_VALIDATE_CODESIGN_BIN: fixture.codesign,
-        IOS_VALIDATE_SECURITY_BIN: fixture.security,
-        IOS_VALIDATE_UNZIP_BIN: fixture.unzip,
+        IOS_VALIDATE_PLIST_BUDDY_BIN: path.join(toolsDir, "plistbuddy"),
+        IOS_VALIDATE_PLUTIL_BIN: path.join(toolsDir, "plutil"),
+        IOS_VALIDATE_CODESIGN_BIN: path.join(toolsDir, "signing"),
+        IOS_VALIDATE_SECURITY_BIN: path.join(toolsDir, "signing"),
+        IOS_VALIDATE_UNZIP_BIN: path.join(toolsDir, "unzip"),
       },
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { ok: true, stdout, stderr: "" };
-  } catch (error) {
-    const e = error as { stdout?: unknown; stderr?: unknown };
-    const stdout = Buffer.isBuffer(e.stdout) ? e.stdout.toString("utf8") : String(e.stdout ?? "");
-    const stderr = Buffer.isBuffer(e.stderr) ? e.stderr.toString("utf8") : String(e.stderr ?? "");
-    return { ok: false, stdout, stderr };
-  }
+    },
+  );
+  return { ok: result.status === 0, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+const makeRoot = () => tempDirs.make("openclaw-ios-ipa-");
+
+async function expectRejected(
+  options: Parameters<typeof writeUnsignedFixture>[1],
+  message: string,
+  expected?: Parameters<typeof runValidator>[1],
+) {
+  const result = runValidator(await writeUnsignedFixture(makeRoot(), options), expected);
+  expect(result).toMatchObject({ ok: false, stderr: expect.stringContaining(message) });
 }
 
 describe("scripts/ios-validate-app-store-ipa.sh", () => {
-  afterEach(() => {
-    for (const dir of tempDirs.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
+  beforeAll(() => {
+    // These metadata failures must occur before any signing inspection.
+    toolsDir = toolDirs.make("openclaw-ios-ipa-tools-");
+    for (const [name, body] of Object.entries(fakeTools)) {
+      writeExecutable(path.join(toolsDir, name), body);
     }
   });
 
-  it("accepts an App Store IPA with appStore mode and production entitlements", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-ios-ipa-"));
-    tempDirs.push(root);
-    const fixture = await writeValidFixture(root);
-
-    const result = runValidator(fixture);
-
-    expect(result.ok).toBe(true);
-    expect(result.stdout).toContain("Validated iOS App Store IPA");
+  it("fake plutil escapes regex-metacharacter keys before matching", () => {
+    const plutil = path.join(toolsDir, "plutil");
+    const plistPath = path.join(makeRoot(), "meta.plist");
+    writeFileSync(
+      plistPath,
+      "<plist><dict>\n<key>Weird[Key]*</key>\n<string>metavalue</string>\n</dict></plist>",
+      "utf8",
+    );
+    const extract = (key: string) =>
+      spawnSync(process.execPath, [plutil, "-extract", key, "-expect", "string", plistPath], {
+        encoding: "utf8",
+      });
+    const escaped = extract("Weird[Key]*");
+    expect(escaped).toMatchObject({ status: 0, stdout: "metavalue" });
+    // An unescaped interpolation would let this key match as a regex; it must miss instead.
+    const missing = extract("Weird.Key.*");
+    expect(missing.status).toBe(1);
   });
 
-  it("rejects an IPA that was exported with a non-App-Store push mode", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-ios-ipa-"));
-    tempDirs.push(root);
-    const fixture = await writeValidFixture(root, { pushMode: "localProduction" });
-
-    const result = runValidator(fixture);
-
-    expect(result.ok).toBe(false);
-    expect(result.stderr).toContain("push mode mismatch");
+  it.each([
+    [{ healthUpdateUsage: null }, "Health update usage description must be a non-empty string"],
+    [{ displayName: "OpenClaw Debug" }, "display name mismatch"],
+    [
+      { localizedDisplayName: "$(OPENCLAW_APP_DISPLAY_NAME)" },
+      "unresolved build setting in localized plist",
+    ],
+  ] as const)("rejects invalid metadata %j", async (options, message) => {
+    await expectRejected(options, message);
   });
 
-  it("rejects legacy independently selectable production push keys", async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-ios-ipa-"));
-    tempDirs.push(root);
-    const fixture = await writeValidFixture(root, { legacyKey: true });
-
-    const result = runValidator(fixture);
-
-    expect(result.ok).toBe(false);
-    expect(result.stderr).toContain("legacy relay profile");
+  it("rejects malformed or mismatched embedded build provenance", async () => {
+    await expectRejected({ buildCommit: "deadbeef" }, "full lowercase commit SHA");
+    await expectRejected({}, "embedded Git commit mismatch", { commit: "a".repeat(40) });
   });
 });

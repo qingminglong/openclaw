@@ -1,9 +1,9 @@
-// Discord plugin module implements reply safety behavior.
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import {
   sanitizeAssistantVisibleText,
   sanitizeAssistantVisibleTextWithProfile,
+  findCodeRegions,
 } from "openclaw/plugin-sdk/text-chunking";
 import { stripPlainTextToolCallBlocks } from "openclaw/plugin-sdk/tool-payload";
 
@@ -27,15 +27,6 @@ function hasInteractiveOrPresentationBlocks(value: unknown): boolean {
   return Array.isArray(record.blocks) && record.blocks.length > 0;
 }
 
-function hasNonTextReplyPayloadContent(payload: ReplyPayload): boolean {
-  return (
-    payload.audioAsVoice === true ||
-    hasNonEmptyRecord(payload.channelData) ||
-    hasInteractiveOrPresentationBlocks(payload.interactive) ||
-    hasInteractiveOrPresentationBlocks(payload.presentation)
-  );
-}
-
 function collapseExcessBlankLines(text: string): string {
   return text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
 }
@@ -57,10 +48,14 @@ function stripDiscordInternalChannelLines(text: string): string {
   return kept.join("\n");
 }
 
-export function sanitizeDiscordFrontChannelText(text: string): string {
-  const withoutToolCallBlocks = stripPlainTextToolCallBlocks(text);
+function sanitizeDiscordFrontChannelText(text: string): string {
+  const withoutToolCallBlocks = stripPlainTextToolCallBlocks(text, {
+    resolveProtectedRanges: findCodeRegions,
+  });
   const withoutAssistantScaffolding = sanitizeAssistantVisibleText(withoutToolCallBlocks);
-  const withoutResidualToolCallBlocks = stripPlainTextToolCallBlocks(withoutAssistantScaffolding);
+  const withoutResidualToolCallBlocks = stripPlainTextToolCallBlocks(withoutAssistantScaffolding, {
+    resolveProtectedRanges: findCodeRegions,
+  });
   const withoutChannelLines = stripDiscordInternalChannelLines(withoutResidualToolCallBlocks);
   return collapseExcessBlankLines(withoutChannelLines).trim();
 }
@@ -81,11 +76,17 @@ export function sanitizeDiscordFrontChannelReplyPayloads(
           : sanitizeDiscordFrontChannelText(payload.text)
         : payload.text;
     const nextPayload =
-      safeText === payload.text
-        ? payload
-        : ({ ...payload, text: safeText || undefined } as ReplyPayload);
+      safeText === payload.text ? payload : { ...payload, text: safeText || undefined };
     const nextParts = resolveSendableOutboundReplyParts(nextPayload);
-    if (!nextParts.hasContent && !hasNonTextReplyPayloadContent(nextPayload)) {
+    if (
+      !nextParts.hasContent &&
+      !(
+        nextPayload.audioAsVoice === true ||
+        hasNonEmptyRecord(nextPayload.channelData) ||
+        hasInteractiveOrPresentationBlocks(nextPayload.interactive) ||
+        hasInteractiveOrPresentationBlocks(nextPayload.presentation)
+      )
+    ) {
       continue;
     }
     safePayloads.push(nextPayload);

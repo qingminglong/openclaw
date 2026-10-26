@@ -1,5 +1,6 @@
-// Qa Channel plugin module implements channel base behavior.
-import { getChatChannelMeta } from "openclaw/plugin-sdk/channel-plugin-common";
+import type { ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
+import { defineChannelSetupContract } from "openclaw/plugin-sdk/channel-setup";
+import { patchScopedAccountConfig } from "openclaw/plugin-sdk/setup";
 import {
   listQaChannelAccountIds,
   resolveDefaultQaChannelAccountId,
@@ -7,15 +8,13 @@ import {
   type ResolvedQaChannelAccount,
 } from "./accounts.js";
 import { qaChannelPluginConfigSchema } from "./config-schema.js";
-import type { ChannelPlugin } from "./runtime-api.js";
-import { applyQaSetup } from "./setup.js";
 import type { CoreConfig } from "./types.js";
 
 export const QA_CHANNEL_ID = "qa-channel" as const;
 
-export const qaChannelSetupMeta = { ...getChatChannelMeta(QA_CHANNEL_ID) };
+// qa-channel is synthetic and never in the bundled chat-meta catalog; it owns
+// its metadata instead of spreading a lookup that could only ever be undefined.
 export const qaChannelRuntimeMeta = {
-  ...qaChannelSetupMeta,
   id: QA_CHANNEL_ID,
   label: "QA Channel",
   selectionLabel: "QA Channel",
@@ -25,28 +24,52 @@ export const qaChannelRuntimeMeta = {
 
 type QaChannelPluginBase = Pick<
   ChannelPlugin<ResolvedQaChannelAccount>,
-  "id" | "meta" | "capabilities" | "reload" | "configSchema" | "setup" | "config"
+  "id" | "meta" | "capabilities" | "reload" | "configSchema" | "setupContract" | "config"
 >;
 
-export function createQaChannelPluginBase(
-  meta: ChannelPlugin<ResolvedQaChannelAccount>["meta"] = qaChannelSetupMeta,
-): QaChannelPluginBase {
+export function createQaChannelPluginBase(): QaChannelPluginBase {
   return {
     id: QA_CHANNEL_ID,
-    meta,
+    meta: qaChannelRuntimeMeta,
     capabilities: {
       chatTypes: ["direct", "group"],
     },
     reload: { configPrefixes: ["channels.qa-channel"] },
     configSchema: qaChannelPluginConfigSchema,
-    setup: {
-      applyAccountConfig: ({ cfg, accountId, input }) =>
-        applyQaSetup({
-          cfg,
-          accountId,
-          input: input as Record<string, unknown>,
-        }),
-    },
+    setupContract: defineChannelSetupContract({
+      fields: {
+        baseUrl: {
+          kind: "string",
+          cli: { flags: "--base-url <url>", description: "QA channel base URL" },
+        },
+        botUserId: {
+          kind: "string",
+          cli: { flags: "--bot-user-id <id>", description: "QA channel bot user id" },
+        },
+        botDisplayName: {
+          kind: "string",
+          cli: { flags: "--bot-display-name <name>", description: "QA channel bot display name" },
+        },
+      },
+      adapter: {
+        applyAccountConfig: ({ cfg, accountId, input }) => {
+          const patch: Record<string, unknown> = {};
+          for (const key of ["baseUrl", "botUserId", "botDisplayName"] as const) {
+            if (typeof input[key] === "string") {
+              patch[key] = input[key];
+            }
+          }
+          return patchScopedAccountConfig({
+            cfg,
+            channelKey: "qa-channel",
+            accountId,
+            patch,
+            ensureChannelEnabled: false,
+            ensureAccountEnabled: false,
+          });
+        },
+      },
+    }),
     config: {
       listAccountIds: (cfg) => listQaChannelAccountIds(cfg as CoreConfig),
       resolveAccount: (cfg, accountId) =>

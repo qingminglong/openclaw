@@ -1,159 +1,176 @@
-/** Tests bootstrap context truncation accounting and user-facing warning metadata. */
 import { describe, expect, it } from "vitest";
 import {
-  appendBootstrapPromptWarning,
   analyzeBootstrapBudget,
+  buildBootstrapBudgetState,
   buildBootstrapInjectionStats,
-  buildBootstrapPromptWarning,
   buildBootstrapPromptWarningNotice,
   buildBootstrapTruncationReportMeta,
   resolveBootstrapWarningSignaturesSeen,
 } from "./bootstrap-budget.js";
-import { buildAgentSystemPrompt } from "./system-prompt.js";
+import type { BootstrapInjectionStat } from "./bootstrap-budget.types.js";
 import type { WorkspaceBootstrapFile } from "./workspace.js";
 
-describe("buildBootstrapInjectionStats", () => {
-  it("maps raw and injected sizes and marks truncation", () => {
+function stat(name: string, rawChars: number, injectedChars: number): BootstrapInjectionStat {
+  return {
+    name,
+    path: `/tmp/${name}`,
+    missing: false,
+    rawChars,
+    injectedChars,
+    truncated: injectedChars < rawChars,
+  };
+}
+
+function bootstrapFile(
+  name: WorkspaceBootstrapFile["name"],
+  content: string,
+  path = `/tmp/${name}`,
+): WorkspaceBootstrapFile {
+  return { name, path, content, missing: false };
+}
+
+function analyze(
+  files: BootstrapInjectionStat[],
+  bootstrapMaxChars = 20_000,
+  bootstrapTotalMaxChars = 60_000,
+) {
+  return analyzeBootstrapBudget({ files, bootstrapMaxChars, bootstrapTotalMaxChars });
+}
+
+type TruncationReport = NonNullable<
+  Parameters<typeof resolveBootstrapWarningSignaturesSeen>[0]
+>["bootstrapTruncation"];
+
+const NOTICE = [
+  "[Bootstrap truncation warning]",
+  "Some workspace bootstrap files were truncated before Project Context injection.",
+  "Treat Project Context as partial and read the relevant files directly if details seem missing.",
+].join("\n");
+
+describe("bootstrap budget", () => {
+  it("composes configured limits, ordered injection stats, and warning state", () => {
+    const bootstrapFiles: WorkspaceBootstrapFile[] = [
+      bootstrapFile("AGENTS.md", "a".repeat(8)),
+      bootstrapFile("SOUL.md", "b".repeat(8)),
+    ];
+
+    const state = buildBootstrapBudgetState({
+      config: {
+        agents: { defaults: { bootstrapMaxChars: 10, bootstrapTotalMaxChars: 12 } },
+      },
+      files: buildBootstrapInjectionStats({
+        bootstrapFiles,
+        injectedFiles: [
+          { path: "/tmp/AGENTS.md", content: "a".repeat(8) },
+          { path: "/tmp/SOUL.md", content: "b".repeat(4) },
+        ],
+      }),
+    });
+
+    expect(state).toMatchObject({
+      bootstrapMaxChars: 10,
+      bootstrapTotalMaxChars: 12,
+      bootstrapAnalysis: { totalNearLimit: true },
+      bootstrapPromptWarning: { warningShown: true },
+    });
+    expect(state.bootstrapAnalysis.truncatedFiles[0]?.causes).toEqual(["total-limit"]);
+  });
+
+  it("gives a budget-dropped file zero injected chars when a sibling shares its basename", () => {
     const bootstrapFiles: WorkspaceBootstrapFile[] = [
       {
-        name: "AGENTS.md",
-        path: "/tmp/AGENTS.md",
-        content: "a".repeat(100),
-        missing: false,
+        ...bootstrapFile("AGENTS.md", "a".repeat(1_000), "/tmp/workspace/AGENTS.md"),
+        origin: { kind: "agent-workspace", rootPath: "/tmp/workspace" },
       },
       {
-        name: "SOUL.md",
-        path: "/tmp/SOUL.md",
-        content: "b".repeat(50),
-        missing: false,
+        ...bootstrapFile("AGENTS.md", "b".repeat(500), "/tmp/workspace/packages/core/AGENTS.md"),
+        origin: { kind: "execution-project", rootPath: "/tmp/workspace/packages/core" },
       },
     ];
-    const injectedFiles = [
-      { path: "/tmp/AGENTS.md", content: "a".repeat(100) },
-      { path: "/tmp/SOUL.md", content: "b".repeat(20) },
-    ];
+
     const stats = buildBootstrapInjectionStats({
       bootstrapFiles,
-      injectedFiles,
+      injectedFiles: [{ path: "/tmp/workspace/AGENTS.md", content: "a".repeat(1_000) }],
     });
-    expect(stats).toHaveLength(2);
-    expect(stats[0]?.name).toBe("AGENTS.md");
-    expect(stats[0]?.rawChars).toBe(100);
-    expect(stats[0]?.injectedChars).toBe(100);
-    expect(stats[0]?.truncated).toBe(false);
-    expect(stats[1]?.name).toBe("SOUL.md");
-    expect(stats[1]?.rawChars).toBe(50);
-    expect(stats[1]?.injectedChars).toBe(20);
-    expect(stats[1]?.truncated).toBe(true);
-  });
-});
+    const analysis = analyze(stats, 20_000, 1_000);
 
-describe("analyzeBootstrapBudget", () => {
-  it("reports per-file and total-limit causes", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/AGENTS.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 120,
-          truncated: true,
-        },
-        {
-          name: "SOUL.md",
-          path: "/tmp/SOUL.md",
-          missing: false,
-          rawChars: 90,
-          injectedChars: 80,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
+    expect(analysis.totals.injectedChars).toBe(1_000);
+    expect(stats.map((file) => file.origin)).toEqual(bootstrapFiles.map((file) => file.origin));
+    expect(analysis.truncatedFiles).toMatchObject([
+      {
+        path: "/tmp/workspace/packages/core/AGENTS.md",
+        rawChars: 500,
+        injectedChars: 0,
+        truncated: true,
+        causes: ["total-limit"],
+      },
+    ]);
+  });
+
+  it("derives names for path-only files supplied by bootstrap hooks", () => {
+    const pathOnlyFile = {
+      path: "/tmp/SELF_IMPROVEMENT_REMINDER.md",
+      content: "remember",
+      missing: false,
+    } as unknown as WorkspaceBootstrapFile;
+    const stats = buildBootstrapInjectionStats({
+      bootstrapFiles: [pathOnlyFile],
+      injectedFiles: [{ path: pathOnlyFile.path, content: "remember" }],
     });
-    expect(analysis.hasTruncation).toBe(true);
-    expect(analysis.totalNearLimit).toBe(true);
-    expect(analysis.truncatedFiles).toHaveLength(2);
-    const agents = analysis.truncatedFiles.find((file) => file.name === "AGENTS.md");
-    const soul = analysis.truncatedFiles.find((file) => file.name === "SOUL.md");
-    expect(agents?.causes).toContain("per-file-limit");
-    expect(agents?.causes).toContain("total-limit");
+    expect(stats).toMatchObject([
+      {
+        name: "SELF_IMPROVEMENT_REMINDER.md",
+        path: "/tmp/SELF_IMPROVEMENT_REMINDER.md",
+        injectedChars: 8,
+        truncated: false,
+      },
+    ]);
+  });
+
+  it("reports causes while excluding missing-file markers from file totals", () => {
+    const analysis = analyze(
+      [
+        stat("AGENTS.md", 150, 120),
+        { ...stat("IDENTITY.md", 0, 40), missing: true },
+        stat("SOUL.md", 50, 40),
+      ],
+      120,
+      200,
+    );
+    expect(analysis).toMatchObject({
+      hasTruncation: true,
+      totalNearLimit: false,
+      totals: { rawChars: 200, injectedChars: 160 },
+      truncatedFiles: [
+        { causes: ["per-file-limit"] },
+        { causes: expect.arrayContaining(["total-limit"]) },
+      ],
+    });
+  });
+
+  it("distinguishes lower per-file and exhausted total limits for USER.md", () => {
+    const lowerPerFile = analyze([stat("USER.md", 3_000, 2_000)], 2_000);
+    expect(lowerPerFile.truncatedFiles[0]).toMatchObject({
+      effectiveFileLimit: 2_000,
+      causes: ["per-file-limit"],
+    });
+
+    const exhaustedTotal = analyze(
+      [stat("AGENTS.md", 2_000, 2_000), stat("USER.md", 5_000, 0)],
+      20_000,
+      2_040,
+    );
+    expect(exhaustedTotal.truncatedFiles[0]?.causes).toContain("total-limit");
+
+    const laterExhaustion = analyze(
+      [stat("USER.md", 5_000, 4_000), stat("SOUL.md", 100, 0)],
+      20_000,
+      4_040,
+    );
+    const user = laterExhaustion.truncatedFiles.find((file) => file.name === "USER.md");
+    const soul = laterExhaustion.truncatedFiles.find((file) => file.name === "SOUL.md");
+    expect(user?.causes).toStrictEqual(["per-file-limit"]);
     expect(soul?.causes).toContain("total-limit");
-  });
-
-  it("does not force a total-limit cause when totals are within limits", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/AGENTS.md",
-          missing: false,
-          rawChars: 90,
-          injectedChars: 40,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    expect(analysis.truncatedFiles[0]?.causes).toStrictEqual([]);
-  });
-});
-
-describe("bootstrap prompt warnings", () => {
-  it("handles malformed truncation entries without names", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "TEMP.md",
-          path: "/tmp/unknown",
-          missing: false,
-          rawChars: 10,
-          injectedChars: 1,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 5,
-      bootstrapTotalMaxChars: 5,
-    });
-    (analysis.truncatedFiles[0] as { name?: string }).name = undefined;
-
-    const lines = buildBootstrapPromptWarning({
-      analysis,
-      mode: "always",
-    }).lines;
-    expect(lines.join("\n")).toContain("10 raw -> 1 injected");
-  });
-
-  it("appends warning details to the turn prompt instead of mutating the system prompt", () => {
-    const prompt = appendBootstrapPromptWarning("Please continue.", [
-      "AGENTS.md: 200 raw -> 0 injected",
-    ]);
-    expect(prompt.startsWith("Please continue.")).toBe(true);
-    expect(prompt).toContain("[Bootstrap truncation warning]");
-    expect(prompt).toContain("Treat Project Context as partial");
-    expect(prompt).toContain("- AGENTS.md: 200 raw -> 0 injected");
-    expect(prompt.endsWith("- AGENTS.md: 200 raw -> 0 injected")).toBe(true);
-  });
-
-  it("preserves raw prompt whitespace when appending warning details", () => {
-    const prompt = appendBootstrapPromptWarning("  indented\nkeep tail  ", [
-      "AGENTS.md: 200 raw -> 0 injected",
-    ]);
-
-    expect(prompt).toContain("  indented\nkeep tail  ");
-    expect(prompt.indexOf("  indented\nkeep tail  ")).toBe(0);
-  });
-
-  it("preserves exact heartbeat prompts without warning suffixes", () => {
-    const heartbeatPrompt = "Read HEARTBEAT.md. Reply HEARTBEAT_OK.";
-
-    expect(
-      appendBootstrapPromptWarning(heartbeatPrompt, ["AGENTS.md: 200 raw -> 0 injected"], {
-        preserveExactPrompt: heartbeatPrompt,
-      }),
-    ).toBe(heartbeatPrompt);
   });
 
   it("builds a concise agent notice without raw truncation diagnostics", () => {
@@ -162,395 +179,66 @@ describe("bootstrap prompt warnings", () => {
       "If unintentional, raise agents.defaults.bootstrapMaxChars.",
     ]);
 
-    expect(notice).toContain("[Bootstrap truncation warning]");
-    expect(notice).toContain("Treat Project Context as partial");
-    expect(notice).not.toContain("raw ->");
-    expect(notice).not.toContain("bootstrapMaxChars");
+    expect(notice).toBe(NOTICE);
   });
 
-  it("resolves seen signatures from report history or legacy single signature", () => {
+  it.each<[TruncationReport, string[]]>([
+    [
+      { warningSignaturesSeen: ["a", " ", "b", "a"], promptWarningSignature: "ignored" },
+      ["a", "b"],
+    ],
+    [{ promptWarningSignature: "legacy" }, ["legacy"]],
+    [undefined, []],
+    [{ warningMode: "off", promptWarningSignature: "off" }, []],
+    [
+      { warningMode: "off", warningSignaturesSeen: ["once"], promptWarningSignature: "off" },
+      ["once"],
+    ],
+  ])("restores warning signatures from %j", (report, expected) => {
     expect(
-      resolveBootstrapWarningSignaturesSeen({
-        bootstrapTruncation: {
-          warningSignaturesSeen: ["sig-a", " ", "sig-b", "sig-a"],
-          promptWarningSignature: "legacy-ignored",
-        },
-      }),
-    ).toEqual(["sig-a", "sig-b"]);
-
-    expect(
-      resolveBootstrapWarningSignaturesSeen({
-        bootstrapTruncation: {
-          promptWarningSignature: "legacy-only",
-        },
-      }),
-    ).toEqual(["legacy-only"]);
-
-    expect(resolveBootstrapWarningSignaturesSeen(undefined)).toStrictEqual([]);
+      resolveBootstrapWarningSignaturesSeen(
+        report === undefined ? undefined : { bootstrapTruncation: report },
+      ),
+    ).toEqual(expected);
   });
 
-  it("ignores single-signature fallback when warning mode is off", () => {
-    expect(
-      resolveBootstrapWarningSignaturesSeen({
-        bootstrapTruncation: {
-          warningMode: "off",
-          promptWarningSignature: "off-mode-signature",
-        },
-      }),
-    ).toStrictEqual([]);
-
-    expect(
-      resolveBootstrapWarningSignaturesSeen({
-        bootstrapTruncation: {
-          warningMode: "off",
-          warningSignaturesSeen: ["prior-once-signature"],
-          promptWarningSignature: "off-mode-signature",
-        },
-      }),
-    ).toEqual(["prior-once-signature"]);
-  });
-
-  it("dedupes warnings in once mode by signature", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/AGENTS.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    const first = buildBootstrapPromptWarning({
-      analysis,
-      mode: "once",
-    });
-    expect(first.warningShown).toBe(true);
-    expect(first.signature).toBeTypeOf("string");
-    expect(first.signature).not.toBe("");
-    // Signatures carry only stable truncation inputs so once-mode warnings dedupe
-    // without tying prompt cache bytes to volatile warning prose.
-    const signature = JSON.parse(first.signature ?? "{}") as {
-      bootstrapMaxChars?: unknown;
-      bootstrapTotalMaxChars?: unknown;
-      files?: Array<{
-        path?: unknown;
-        rawChars?: unknown;
-        injectedChars?: unknown;
-        causes?: unknown;
-      }>;
-    };
-    expect(signature.bootstrapMaxChars).toBe(120);
-    expect(signature.bootstrapTotalMaxChars).toBe(200);
-    expect(signature.files).toStrictEqual([
-      {
-        causes: ["per-file-limit"],
-        injectedChars: 100,
-        path: "/tmp/AGENTS.md",
-        rawChars: 150,
-      },
-    ]);
-    expect(first.lines.join("\n")).toContain("AGENTS.md");
-
-    const second = buildBootstrapPromptWarning({
-      analysis,
-      mode: "once",
-      seenSignatures: first.warningSignaturesSeen,
-    });
-    expect(second.warningShown).toBe(false);
-    expect(second.lines).toStrictEqual([]);
-  });
-
-  it("dedupes once mode across non-consecutive repeated signatures", () => {
-    const analysisA = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "A.md",
-          path: "/tmp/A.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    const analysisB = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "B.md",
-          path: "/tmp/B.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    const firstA = buildBootstrapPromptWarning({
-      analysis: analysisA,
-      mode: "once",
-    });
-    expect(firstA.warningShown).toBe(true);
-    const firstB = buildBootstrapPromptWarning({
-      analysis: analysisB,
-      mode: "once",
-      seenSignatures: firstA.warningSignaturesSeen,
-    });
-    expect(firstB.warningShown).toBe(true);
-    const secondA = buildBootstrapPromptWarning({
-      analysis: analysisA,
-      mode: "once",
-      seenSignatures: firstB.warningSignaturesSeen,
-    });
-    expect(secondA.warningShown).toBe(false);
-  });
-
-  it("includes overflow line when more files are truncated than shown", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "A.md",
-          path: "/tmp/A.md",
-          missing: false,
-          rawChars: 10,
-          injectedChars: 1,
-          truncated: true,
-        },
-        {
-          name: "B.md",
-          path: "/tmp/B.md",
-          missing: false,
-          rawChars: 10,
-          injectedChars: 1,
-          truncated: true,
-        },
-        {
-          name: "C.md",
-          path: "/tmp/C.md",
-          missing: false,
-          rawChars: 10,
-          injectedChars: 1,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 20,
-      bootstrapTotalMaxChars: 10,
-    });
-    const lines = buildBootstrapPromptWarning({
-      analysis,
-      mode: "always",
-      maxFiles: 2,
-    }).lines;
-    expect(lines).toContain("+1 more truncated file(s).");
-  });
-
-  it("warns explicitly when AGENTS.md bootstrap policy is truncated", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/AGENTS.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    const lines = buildBootstrapPromptWarning({
-      analysis,
-      mode: "always",
-    }).lines;
-
-    expect(lines).toContain(
-      "AGENTS.md was truncated; read the full AGENTS.md before relying on scoped policy.",
-    );
-  });
-
-  it("disambiguates duplicate file names in warning lines", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/a/AGENTS.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-        {
-          name: "AGENTS.md",
-          path: "/tmp/b/AGENTS.md",
-          missing: false,
-          rawChars: 140,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 300,
-    });
-    const lines = buildBootstrapPromptWarning({
-      analysis,
-      mode: "always",
-    }).lines;
-    expect(lines.join("\n")).toContain("AGENTS.md (/tmp/a/AGENTS.md)");
-    expect(lines.join("\n")).toContain("AGENTS.md (/tmp/b/AGENTS.md)");
-  });
-
-  it("respects off/always warning modes", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/AGENTS.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    const seen = buildBootstrapPromptWarning({
-      analysis,
-      mode: "once",
-    });
-    const off = buildBootstrapPromptWarning({
-      analysis,
-      mode: "off",
+  it("warns on repeated truncation while bounding distinct signature history", () => {
+    const files = [stat("AGENTS.md", 150, 100)];
+    const seen = buildBootstrapBudgetState({ files }).bootstrapPromptWarning;
+    const repeated = buildBootstrapBudgetState({
+      files,
       seenSignatures: seen.warningSignaturesSeen,
       previousSignature: seen.signature,
-    });
-    expect(off.warningShown).toBe(false);
-    expect(off.lines).toStrictEqual([]);
+    }).bootstrapPromptWarning;
+    expect(repeated).toMatchObject({ warningShown: true, lines: [NOTICE] });
+    expect(repeated.warningSignaturesSeen).toEqual([seen.signature]);
 
-    const always = buildBootstrapPromptWarning({
-      analysis,
-      mode: "always",
-      seenSignatures: seen.warningSignaturesSeen,
-      previousSignature: seen.signature,
-    });
-    expect(always.warningShown).toBe(true);
-    expect(always.lines).toStrictEqual([
-      "AGENTS.md: 150 raw -> 100 injected (~33% removed; max/file).",
-      "AGENTS.md was truncated; read the full AGENTS.md before relying on scoped policy.",
-      "If unintentional, raise agents.defaults.bootstrapMaxChars and/or agents.defaults.bootstrapTotalMaxChars.",
-    ]);
-  });
-
-  it("uses file path in signature to avoid collisions for duplicate names", () => {
-    const left = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/a/AGENTS.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    const right = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/b/AGENTS.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    const leftWarning = buildBootstrapPromptWarning({ analysis: left, mode: "once" });
-    const rightWarning = buildBootstrapPromptWarning({ analysis: right, mode: "once" });
-    expect(leftWarning.signature).not.toBe(rightWarning.signature);
+    const history = Array.from({ length: 32 }, (_, index) => `previous-${index}`);
+    const bounded = buildBootstrapBudgetState({
+      files,
+      seenSignatures: [" ", ...history, "previous-0"],
+      previousSignature: "latest",
+    }).bootstrapPromptWarning;
+    expect(bounded.warningSignaturesSeen).toEqual([...history.slice(2), "latest", seen.signature]);
   });
 
   it("builds truncation report metadata from analysis + warning decision", () => {
-    const analysis = analyzeBootstrapBudget({
-      files: [
-        {
-          name: "AGENTS.md",
-          path: "/tmp/AGENTS.md",
-          missing: false,
-          rawChars: 150,
-          injectedChars: 100,
-          truncated: true,
-        },
-      ],
-      bootstrapMaxChars: 120,
-      bootstrapTotalMaxChars: 200,
-    });
-    const warning = buildBootstrapPromptWarning({
-      analysis,
-      mode: "once",
-    });
+    const { bootstrapAnalysis: analysis, bootstrapPromptWarning: warning } =
+      buildBootstrapBudgetState({
+        config: { agents: { defaults: { bootstrapMaxChars: 120, bootstrapTotalMaxChars: 200 } } },
+        files: [stat("AGENTS.md", 150, 100)],
+      });
     const meta = buildBootstrapTruncationReportMeta({
       analysis,
-      warningMode: "once",
       warning,
     });
-    expect(meta.warningMode).toBe("once");
-    expect(meta.warningShown).toBe(true);
-    expect(meta.truncatedFiles).toBe(1);
-    expect(meta.nearLimitFiles).toBe(1);
-    expect(meta.promptWarningSignature).toBe(warning.signature);
-    expect(meta.warningSignaturesSeen).toEqual([warning.signature]);
-  });
-
-  it("improves cache-relevant system prompt stability versus legacy warning injection", () => {
-    const contextFiles = [{ path: "AGENTS.md", content: "Follow AGENTS guidance." }];
-    const warningLines = ["AGENTS.md: 200 raw -> 0 injected"];
-    const stableSystemPrompt = buildAgentSystemPrompt({
-      workspaceDir: "/tmp/openclaw",
-      contextFiles,
+    expect(meta).toMatchObject({
+      warningMode: "always",
+      warningShown: true,
+      truncatedFiles: 1,
+      nearLimitFiles: 1,
+      promptWarningSignature: warning.signature,
+      warningSignaturesSeen: [warning.signature],
     });
-    // Legacy injection mutated the system prompt; current warning placement keeps
-    // the system prompt stable for provider prompt caches.
-    const optimizedTurns = [stableSystemPrompt, stableSystemPrompt, stableSystemPrompt];
-    const injectLegacyWarning = (prompt: string, lines: string[]) => {
-      const warningBlock = [
-        "⚠ Bootstrap truncation warning:",
-        ...lines.map((line) => `- ${line}`),
-        "",
-      ].join("\n");
-      return prompt.replace("## AGENTS.md", `${warningBlock}## AGENTS.md`);
-    };
-    const legacyTurns = [
-      injectLegacyWarning(optimizedTurns[0] ?? "", warningLines),
-      optimizedTurns[1] ?? "",
-      injectLegacyWarning(optimizedTurns[2] ?? "", warningLines),
-    ];
-    const cacheHitRate = (turns: string[]) => {
-      let hits = 0;
-      for (let index = 1; index < turns.length; index++) {
-        if (turns[index] === turns[index - 1]) {
-          hits++;
-        }
-      }
-      return hits / Math.max(1, turns.length - 1);
-    };
-
-    expect(cacheHitRate(legacyTurns)).toBe(0);
-    expect(cacheHitRate(optimizedTurns)).toBe(1);
-    expect(optimizedTurns[0]).not.toContain("⚠ Bootstrap truncation warning:");
   });
 });

@@ -1,15 +1,16 @@
-// Program smoke tests cover core CLI command registration and startup behavior.
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { buildProgram } from "./program.js";
+import "../test-utils/prepare-compiled-subprocesses.js";
+import { beforeEach, expect, it, vi } from "vitest";
 import {
+  programGatewayCallMock as gateway,
   configureCommand,
-  ensureConfigReady,
-  runCrestodian,
-  runTui,
+  ensureConfigReadyMock,
   runtime,
-  setupCommand,
-  setupWizardCommand,
+  setupCommandMock,
+  setupWizardCommandMock,
+  systemAgentRunMock as agent,
+  tuiRunMock as tui,
 } from "./program.test-mocks.js";
+import { buildProgram } from "./program/build-program.js";
 
 vi.mock("./config-cli.js", () => ({
   registerConfigCli: (program: {
@@ -21,80 +22,94 @@ vi.mock("./config-cli.js", () => ({
   runConfigUnset: vi.fn(),
 }));
 
-describe("cli program (smoke)", () => {
-  let program = createProgram();
+let program: ReturnType<typeof buildProgram>;
+const run = (...argv: string[]) => program.parseAsync(argv, { from: "user" });
+function expectTui(options: object) {
+  expect(tui).toHaveBeenNthCalledWith(1, expect.objectContaining(options));
+}
+beforeEach(() => {
+  program = buildProgram();
+  vi.clearAllMocks();
+  tui.mockResolvedValue(undefined);
+  agent.mockResolvedValue(undefined);
+  ensureConfigReadyMock.mockResolvedValue(undefined);
+});
 
-  function createProgram() {
-    return buildProgram();
-  }
+it("runs tui with explicit timeout override", async () => {
+  await run("tui", "--timeout-ms", "45000");
+  expectTui({ timeoutMs: 45000, historyLimit: 200 });
+  expect(tui.mock.calls[0]?.[0]).not.toHaveProperty("agentId");
+});
 
-  async function runProgram(argv: string[]) {
-    await program.parseAsync(argv, { from: "user" });
-  }
+it.each([
+  {
+    target: "movies-a1166b81",
+    response: { ok: true, key: "agent:main:thread:resolved" },
+    request: { method: "sessions.resolve", params: { shortId: "a1166b81", slugHint: "movies" } },
+    options: { local: false, session: "agent:main:thread:resolved" },
+  },
+  {
+    target: "https://gateway.example/dashboard/ops",
+    response: { defaultId: "main", mainKey: "main", scope: "global", agents: [] },
+    request: { method: "agents.list", params: {} },
+    options: { local: false, session: "global", agentId: "ops" },
+  },
+])(
+  "resolves the tui target $target before launch",
+  async ({ target, response, request, options }) => {
+    gateway.mockResolvedValue(response);
+    await run("tui", target);
+    expect(gateway).toHaveBeenCalledWith(expect.objectContaining(request));
+    expectTui(options);
+  },
+);
 
-  function firstMockArg(mock: { mock: { calls: ReadonlyArray<ReadonlyArray<unknown>> } }): unknown {
-    const call = mock.mock.calls[0];
-    if (!call) {
-      throw new Error("expected mock to have at least one call");
-    }
-    return call[0];
-  }
+it("preserves the resolved global owner when launching tui from an agent key", async () => {
+  gateway.mockResolvedValue({ ok: true, key: "global", agentId: "ops" });
+  await run("tui", "agent:ops:main");
+  expectTui({ session: "global", agentId: "ops" });
+});
 
-  beforeEach(() => {
-    program = createProgram();
-    vi.clearAllMocks();
-    runTui.mockResolvedValue(undefined);
-    runCrestodian.mockResolvedValue(undefined);
-    ensureConfigReady.mockResolvedValue(undefined);
-  });
+it.each([
+  {
+    args: [
+      "https://gateway.example/dashboard/main/movies-a1166b81",
+      "--url",
+      "wss://other.example",
+    ],
+    error: expect.stringContaining("pass one target"),
+  },
+  { args: ["--history-limit", "10x"], error: "--history-limit must be a positive integer." },
+  { args: ["--history-limit", "1001"], error: "--history-limit must be at most 1000." },
+])("rejects invalid tui arguments $args", async ({ args, error }) => {
+  await expect(run("tui", ...args)).rejects.toThrow("exit");
+  expect(runtime.error).toHaveBeenCalledWith(error);
+  expect(tui).not.toHaveBeenCalled();
+});
 
-  it("registers message + status commands", () => {
-    const names = program.commands.map((command) => command.name());
-    expect(names).toContain("message");
-    expect(names).toContain("status");
-  });
+it("runs setup one-shot requests", async () => {
+  await run("setup", "--message", "status");
+  expect(agent).toHaveBeenNthCalledWith(
+    1,
+    expect.objectContaining({ message: "status", yes: false, json: false }),
+    runtime,
+  );
+});
 
-  it("runs tui with explicit timeout override", async () => {
-    await runProgram(["tui", "--timeout-ms", "45000"]);
-    const options = firstMockArg(runTui) as {
-      timeoutMs?: number;
-      forceProcessExitOnReturn?: boolean;
-    };
-    expect(options?.timeoutMs).toBe(45000);
-    expect(options?.forceProcessExitOnReturn).toBe(true);
-  });
+it("warns and ignores invalid tui timeout override", async () => {
+  await run("tui", "--timeout-ms", "nope");
+  expect(runtime.error).toHaveBeenCalledWith('warning: invalid --timeout-ms "nope"; ignoring');
+  expectTui({ timeoutMs: undefined });
+});
 
-  it("runs crestodian one-shot requests", async () => {
-    await runProgram(["crestodian", "--message", "status"]);
-    const options = firstMockArg(runCrestodian) as {
-      message?: string;
-      yes?: boolean;
-      json?: boolean;
-    };
-    expect(options?.message).toBe("status");
-    expect(options?.yes).toBe(false);
-    expect(options?.json).toBe(false);
-  });
+it("preserves oversized history limits for local chat", async () => {
+  await run("chat", "--history-limit", "1001");
+  expectTui({ local: true, historyLimit: 1001 });
+  expect(runtime.error).not.toHaveBeenCalled();
+});
 
-  it("warns and ignores invalid tui timeout override", async () => {
-    await runProgram(["tui", "--timeout-ms", "nope"]);
-    expect(runtime.error).toHaveBeenCalledWith('warning: invalid --timeout-ms "nope"; ignoring');
-    const options = firstMockArg(runTui) as { timeoutMs?: number };
-    expect(options?.timeoutMs).toBeUndefined();
-  });
-
-  it("rejects partial tui history limits", async () => {
-    await expect(runProgram(["tui", "--history-limit", "10x"])).rejects.toThrow("exit");
-    expect(runtime.error).toHaveBeenCalledWith(
-      "Error: --history-limit must be a positive integer.",
-    );
-    expect(runTui).not.toHaveBeenCalled();
-  });
-
-  it("runs setup wizard when wizard flags are present", async () => {
-    await runProgram(["setup", "--remote-url", "ws://example"]);
-
-    expect(setupCommand).not.toHaveBeenCalled();
-    expect(setupWizardCommand).toHaveBeenCalledTimes(1);
-  });
+it("runs setup wizard when wizard flags are present", async () => {
+  await run("setup", "--remote-url", "ws://example");
+  expect(setupCommandMock).not.toHaveBeenCalled();
+  expect(setupWizardCommandMock).toHaveBeenCalledTimes(1);
 });

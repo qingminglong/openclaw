@@ -5,7 +5,6 @@ import { sanitizeForConsole } from "./console-sanitize.js";
 import {
   buildApiErrorObservationFields,
   buildTextObservationFields,
-  shouldSuppressRawErrorConsoleSuffix,
 } from "./embedded-agent-error-observation.js";
 
 const OBSERVATION_BEARER_TOKEN = "sk-redact-test-token";
@@ -39,7 +38,6 @@ describe("buildApiErrorObservationFields", () => {
     );
 
     expect(observed.rawErrorPreview).not.toContain(OBSERVATION_BEARER_TOKEN);
-    expect(observed.rawErrorPreview).toContain(OBSERVATION_BEARER_TOKEN.slice(0, 6));
     expect(observed.rawErrorHash).toMatch(/^sha256:/);
   });
 
@@ -51,6 +49,26 @@ describe("buildApiErrorObservationFields", () => {
     expect(observed.rawErrorPreview).not.toContain(OBSERVATION_COOKIE_VALUE);
     expect(observed.rawErrorPreview).toContain("x-api-key: ***");
     expect(observed.rawErrorPreview).toContain("Cookie: session=");
+  });
+
+  it("masks a bare pass: credential in the provider message preview", () => {
+    const observed = buildApiErrorObservationFields(
+      JSON.stringify({
+        error: { type: "invalid_request", message: "pass: opaque-pass-secret-1234567890 rejected" },
+      }),
+    );
+    expect(observed.providerErrorMessagePreview).toBe("pass: opaque…7890 rejected");
+  });
+
+  it("redacts structured provider codes and types as well as message previews", () => {
+    const observed = buildApiErrorObservationFields(
+      JSON.stringify({
+        error: { type: `x-api-key: ${OBSERVATION_BEARER_TOKEN}`, message: "Request failed" },
+      }),
+      { code: `x-api-key: ${OBSERVATION_BEARER_TOKEN}` },
+    );
+    expect(observed.providerErrorCode).toBe("x-api-key: ***");
+    expect(observed.providerErrorType).toBe("x-api-key: ***");
   });
 
   it("does not let cookie redaction consume unrelated fields on the same line", () => {
@@ -104,13 +122,13 @@ describe("buildApiErrorObservationFields", () => {
   });
 
   it("truncates oversized raw and provider previews", () => {
-    const longMessage = "X".repeat(260);
+    const longMessage = `${"X".repeat(199)}🚀tail`;
     const observed = buildApiErrorObservationFields(
       `{"type":"error","error":{"type":"server_error","message":"${longMessage}"},"request_id":"req_long"}`,
     );
 
     expect(observed.rawErrorPreview).toBeTypeOf("string");
-    expect(observed.providerErrorMessagePreview).toBeTypeOf("string");
+    expect(observed.providerErrorMessagePreview).toBe(`${"X".repeat(199)}…`);
     expect(observed.rawErrorPreview?.length).toBeLessThanOrEqual(401);
     expect(observed.providerErrorMessagePreview?.length).toBeLessThanOrEqual(201);
     expect(observed.providerErrorMessagePreview?.endsWith("…")).toBe(true);
@@ -119,12 +137,27 @@ describe("buildApiErrorObservationFields", () => {
   it("caps oversized raw inputs before hashing and fingerprinting", () => {
     // Hashing a bounded prefix keeps diagnostic work predictable for huge
     // provider payloads.
-    const oversized = "X".repeat(70_000);
-    const bounded = "X".repeat(64_000);
+    const oversized = `${"X".repeat(63_999)}🚀tail`;
+    const bounded = "X".repeat(63_999);
 
     const observed = buildApiErrorObservationFields(oversized);
     const boundedObserved = buildApiErrorObservationFields(bounded);
     expect(observed.rawErrorHash).toBe(boundedObserved.rawErrorHash);
+    expect(observed.rawErrorFingerprint).toBe(boundedObserved.rawErrorFingerprint);
+  });
+
+  it("keeps fingerprint message bounds on a UTF-16 boundary", () => {
+    const prefix = "X".repeat(7_999);
+    const observed = buildApiErrorObservationFields(
+      JSON.stringify({
+        type: "error",
+        error: { type: "server_error", message: `${prefix}🚀tail` },
+      }),
+    );
+    const boundedObserved = buildApiErrorObservationFields(
+      JSON.stringify({ type: "error", error: { type: "server_error", message: prefix } }),
+    );
+
     expect(observed.rawErrorFingerprint).toBe(boundedObserved.rawErrorFingerprint);
   });
 
@@ -191,14 +224,6 @@ describe("buildApiErrorObservationFields", () => {
 
     expect(observed.httpCode).toBe("401");
     expect(observed.providerRuntimeFailureKind).toBe("unclassified");
-  });
-
-  it("centralizes raw console suffix suppression for auth failures", () => {
-    expect(shouldSuppressRawErrorConsoleSuffix("auth_html")).toBe(true);
-    expect(shouldSuppressRawErrorConsoleSuffix("auth_scope")).toBe(true);
-    expect(shouldSuppressRawErrorConsoleSuffix("auth_refresh")).toBe(true);
-    expect(shouldSuppressRawErrorConsoleSuffix("timeout")).toBe(false);
-    expect(shouldSuppressRawErrorConsoleSuffix(undefined)).toBe(false);
   });
 });
 

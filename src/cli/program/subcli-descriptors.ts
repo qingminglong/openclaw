@@ -1,226 +1,234 @@
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import type { Command } from "commander";
+import { resolveOpenClawPackageRootSync } from "../../infra/openclaw-root.js";
 // Sub-CLI descriptor catalog used for root help placeholders and lazy registration.
-import { defineCommandDescriptorCatalog } from "./command-descriptor-utils.js";
-import type { NamedCommandDescriptor } from "./command-group-descriptors.js";
-import { isPrivateQaCliEnabled } from "./private-qa-cli.js";
+import { isCronMachineOutput } from "../cron-cli/output-mode.js";
+import { isDevicesMachineOutput } from "../devices-output-mode.js";
+import { isGatewayMachineOutput } from "../gateway-cli/output-mode.js";
+import { isModelsPlainMachineOutput, isModelsStatusJsonOutput } from "../models-output-mode.js";
+import { isNodesMachineOutput } from "../nodes-cli/output-mode.js";
+import { isProxyMachineOutput } from "../proxy-output-mode.js";
+import { isSkillsMachineOutput } from "../skills-output-mode.js";
+import { isSystemMachineOutput } from "../system-output-mode.js";
+import type { RegisteredCommandDescriptor } from "./command-group-descriptors.js";
+import { isPrivateQaCliEnabled } from "./private-qa-policy.js";
+import { getSubCliCommandMetadata, type SubCliCommandName } from "./subcli-command-metadata.js";
 
-/** Descriptor shape for root-level sub-CLI commands. */
-export type SubCliDescriptor = NamedCommandDescriptor;
+export type SubCliRegistrationContext = {
+  purpose?: "runtime" | "completion";
+};
 
-const subCliCommandCatalog = defineCommandDescriptorCatalog([
-  { name: "acp", description: "Run and manage ACP-backed coding agents", hasSubcommands: true },
-  {
-    name: "gateway",
-    description: "Run, inspect, and query the OpenClaw Gateway",
-    hasSubcommands: true,
-  },
-  {
-    name: "daemon",
-    description: "Manage the Gateway service (legacy alias)",
-    hasSubcommands: true,
-  },
-  { name: "logs", description: "Tail Gateway logs locally or via RPC", hasSubcommands: false },
-  {
-    name: "system",
-    description: "System events, heartbeat, and presence",
-    hasSubcommands: true,
-  },
-  {
-    name: "models",
-    description: "List, scan, and set model providers",
-    hasSubcommands: true,
-  },
-  {
-    name: "infer",
-    description: "Run provider-backed model, media, search, and embedding commands",
-    hasSubcommands: true,
-  },
-  {
-    name: "capability",
-    description: "Run provider capability commands (fallback alias: infer)",
-    hasSubcommands: true,
-  },
-  {
-    name: "approvals",
-    description: "Manage exec approvals (gateway or node host)",
-    hasSubcommands: true,
-    parentDefaultHelp: true,
-  },
-  {
-    name: "exec-policy",
-    description: "Show or synchronize requested exec policy with host approvals",
-    hasSubcommands: true,
-  },
-  {
-    name: "nodes",
-    description: "Pair nodes and run node-host commands through the Gateway",
-    hasSubcommands: true,
-  },
-  {
-    name: "devices",
-    description: "Device pairing + token management",
-    hasSubcommands: true,
-    parentDefaultHelp: true,
-  },
-  {
-    name: "node",
-    description: "Run and manage the headless node host service",
-    hasSubcommands: true,
-  },
-  {
-    name: "sandbox",
-    description: "Manage sandbox containers for agent isolation",
-    hasSubcommands: true,
-  },
-  {
-    name: "tui",
-    description: "Open a terminal UI connected to the Gateway",
-    hasSubcommands: false,
-  },
-  {
-    name: "terminal",
-    description: "Open a local terminal UI (alias for tui --local)",
-    hasSubcommands: false,
-  },
-  {
-    name: "chat",
-    description: "Open a local terminal UI (alias for tui --local)",
-    hasSubcommands: false,
-  },
-  {
-    name: "cron",
-    description: "Schedule and inspect Gateway background jobs",
-    hasSubcommands: true,
-    parentDefaultHelp: true,
-  },
-  {
-    name: "dns",
-    description: "DNS helpers for wide-area discovery (Tailscale + CoreDNS)",
-    hasSubcommands: true,
-  },
-  {
-    name: "docs",
-    description: "Search the live OpenClaw docs",
-    hasSubcommands: false,
-  },
-  {
-    name: "qa",
-    description: "Run QA scenarios and launch the private QA debugger UI",
-    hasSubcommands: true,
-  },
-  {
-    name: "proxy",
-    description: "Run the OpenClaw debug proxy and inspect captured traffic",
-    hasSubcommands: true,
-  },
-  {
-    name: "hooks",
-    description: "Manage internal agent hooks",
-    hasSubcommands: true,
-  },
-  {
-    name: "webhooks",
-    description: "Webhook helpers and integrations",
-    hasSubcommands: true,
-  },
-  {
-    name: "qr",
-    description: "Generate mobile pairing QR/setup code",
-    hasSubcommands: false,
-  },
-  {
-    name: "clawbot",
-    description: "Legacy clawbot command aliases",
-    hasSubcommands: true,
-  },
-  {
-    name: "pairing",
-    description: "Secure DM pairing (approve inbound requests)",
-    hasSubcommands: true,
-  },
-  {
-    name: "plugins",
-    description: "Install, enable, disable, and inspect plugins",
-    hasSubcommands: true,
-    parentDefaultHelp: true,
-  },
-  {
-    name: "channels",
-    description: "Add, remove, login, and inspect messaging channels",
-    hasSubcommands: true,
-    parentDefaultHelp: true,
-  },
-  {
-    name: "directory",
-    description: "Lookup contact and group IDs (self, peers, groups) for supported chat channels",
-    hasSubcommands: true,
-  },
-  {
-    name: "security",
-    description: "Security tools and local config audits",
-    hasSubcommands: true,
-  },
-  {
-    name: "secrets",
-    description: "Audit, apply, and reload SecretRef-backed credentials",
-    hasSubcommands: true,
-  },
-  {
-    name: "skills",
-    description: "List, inspect, and install agent skills",
-    hasSubcommands: true,
-  },
-  {
-    name: "update",
-    description: "Update OpenClaw and inspect update channel status",
-    hasSubcommands: true,
-  },
-  {
-    name: "completion",
-    description: "Generate shell completion script",
-    hasSubcommands: false,
-  },
-] as const satisfies ReadonlyArray<SubCliDescriptor>);
+type SubCliCommand = RegisteredCommandDescriptor<
+  [argv: string[], context: SubCliRegistrationContext]
+>;
+type SubCliRegistration = SubCliCommand["register"];
 
-function filterPrivateQaItems<T>(
-  items: ReadonlyArray<T>,
-  getName: (item: T) => string,
-): ReadonlyArray<T> {
-  if (isPrivateQaCliEnabled()) {
-    return items;
+const PRIVATE_QA_DIST_RELATIVE_PATH = path.join("dist", "plugin-sdk", "qa-lab.js");
+const SOURCE_CHECKOUT_MARKER_RELATIVE_PATHS = [".git", "pnpm-workspace.yaml"] as const;
+
+function resolvePrivateQaSourceModuleSpecifier(): string | null {
+  if (!isPrivateQaCliEnabled()) {
+    return null;
   }
-  return items.filter((item) => getName(item) !== "qa");
-}
-
-/** Visible sub-CLI descriptors after private QA gating. */
-export const SUB_CLI_DESCRIPTORS = filterPrivateQaItems(
-  subCliCommandCatalog.descriptors,
-  (descriptor) => descriptor.name,
-);
-
-/** Return visible sub-CLI descriptors in help/registration order. */
-export function getSubCliEntries(): ReadonlyArray<SubCliDescriptor> {
-  return filterPrivateQaItems(
-    subCliCommandCatalog.getDescriptors(),
-    (descriptor) => descriptor.name,
+  const packageRoot = resolveOpenClawPackageRootSync({
+    argv1: process.argv[1],
+    cwd: process.cwd(),
+    moduleUrl: import.meta.url,
+  });
+  if (!packageRoot) {
+    return null;
+  }
+  const sourceModulePath = path.join(packageRoot, PRIVATE_QA_DIST_RELATIVE_PATH);
+  const hasSourceCheckoutMarker = SOURCE_CHECKOUT_MARKER_RELATIVE_PATHS.some((relativePath) =>
+    fs.existsSync(path.join(packageRoot, relativePath)),
   );
+  if (
+    !hasSourceCheckoutMarker ||
+    !fs.existsSync(path.join(packageRoot, "src")) ||
+    !fs.existsSync(sourceModulePath)
+  ) {
+    return null;
+  }
+  return pathToFileURL(sourceModulePath).href;
 }
 
-/** Return visible sub-CLI names that own child subcommands. */
-export function getSubCliCommandsWithSubcommands(): string[] {
-  return [
-    ...filterPrivateQaItems(
-      subCliCommandCatalog.getCommandsWithSubcommands(),
-      (command) => command,
-    ),
-  ];
+/** Load the private QA module from a source checkout or throw a user-facing availability error. */
+function loadPrivateQaCliModule(): Promise<Record<string, unknown>> {
+  const specifier = resolvePrivateQaSourceModuleSpecifier();
+  if (!specifier) {
+    throw new Error("Private QA CLI is only available from an OpenClaw source checkout.");
+  }
+  return import(specifier);
 }
 
-/** Return visible sub-CLI names whose parent command should show help by default. */
-export function getSubCliParentDefaultHelpCommands(): string[] {
-  return [
-    ...filterPrivateQaItems(
-      subCliCommandCatalog.getParentDefaultHelpCommands(),
-      (command) => command,
-    ),
-  ];
+async function registerPluginCommandsIfNeeded(program: Command, argv: string[]) {
+  const { resolveCliArgvInvocation } = await import("../argv-invocation.js");
+  const { resolveCliCommandPathPolicy } = await import("../command-path-policy.js");
+  const invocation = resolveCliArgvInvocation(argv);
+  const shouldRegisterPluginCommands =
+    !invocation.hasHelpOrVersion &&
+    resolveCliCommandPathPolicy(invocation.commandPath).loadPlugins !== "never";
+  if (shouldRegisterPluginCommands) {
+    const { registerPluginCliCommandsFromValidatedConfig } = await import("../../plugins/cli.js");
+    await registerPluginCliCommandsFromValidatedConfig(program);
+  }
+}
+
+const registerCapability: SubCliRegistration = async (program, argv) =>
+  (await import("../capability-cli.js")).registerCapabilityCli(program, argv);
+
+const registerApprovals: SubCliRegistration = async (program) =>
+  (await import("../exec-approvals-cli.js")).registerExecApprovalsCli(program);
+
+const registerTui: SubCliRegistration = async (program) =>
+  (await import("../tui-cli.js")).registerTuiCli(program);
+
+const registerCron: SubCliRegistration = async (program) =>
+  (await import("../cron-cli.js")).registerCronCli(program);
+
+// Implementations are exhaustive over the metadata catalog; parsing never imports this map.
+const registrations = {
+  acp: { register: async (program) => (await import("../acp-cli.js")).registerAcpCli(program) },
+  gateway: {
+    register: async (program) => (await import("../gateway-cli.js")).registerGatewayCli(program),
+    machineOutput: ({ argv }) => isGatewayMachineOutput(argv),
+  },
+  daemon: {
+    register: async (program) => (await import("../daemon-cli.js")).registerDaemonCli(program),
+  },
+  logs: { register: async (program) => (await import("../logs-cli.js")).registerLogsCli(program) },
+  system: {
+    register: async (program) => (await import("../system-cli.js")).registerSystemCli(program),
+    machineOutput: ({ argv }) => isSystemMachineOutput(argv),
+  },
+  models: {
+    register: async (program) => (await import("../models-cli.js")).registerModelsCli(program),
+    machineOutput: ({ argv }) => isModelsStatusJsonOutput(argv) || isModelsPlainMachineOutput(argv),
+  },
+  promos: {
+    register: async (program) => (await import("../promos-cli.js")).registerPromosCli(program),
+  },
+  telemetry: {
+    register: async (program) =>
+      (await import("../telemetry-cli.js")).registerTelemetryCli(program),
+  },
+  infer: { register: registerCapability },
+  capability: { register: registerCapability },
+  approvals: { register: registerApprovals },
+  "exec-approvals": { register: registerApprovals },
+  "exec-policy": {
+    register: async (program) =>
+      (await import("../exec-policy-cli.js")).registerExecPolicyCli(program),
+  },
+  nodes: {
+    register: async (program, argv) =>
+      (await import("../nodes-cli.js")).registerNodesCli(program, argv),
+    machineOutput: ({ argv }) => isNodesMachineOutput(argv),
+  },
+  devices: {
+    register: async (program) => (await import("../devices-cli.js")).registerDevicesCli(program),
+    machineOutput: ({ argv }) => isDevicesMachineOutput(argv),
+  },
+  users: {
+    register: async (program) => (await import("../users-cli.js")).registerUsersCli(program),
+  },
+  node: { register: async (program) => (await import("../node-cli.js")).registerNodeCli(program) },
+  connect: {
+    register: async (program) => (await import("../connect-cli.js")).registerConnectCli(program),
+  },
+  worker: {
+    register: async (program) => (await import("../worker-cli.js")).registerWorkerCli(program),
+  },
+  sandbox: {
+    register: async (program) => (await import("../sandbox-cli.js")).registerSandboxCli(program),
+  },
+  worktrees: {
+    register: async (program) =>
+      (await import("../worktrees-cli.js")).registerWorktreesCli(program),
+  },
+  attach: {
+    register: async (program) => (await import("../attach-cli.js")).registerAttachCli(program),
+  },
+  tui: { register: registerTui },
+  resume: {
+    register: async (program) => (await import("../resume-cli.js")).registerResumeCli(program),
+  },
+  terminal: { register: registerTui },
+  chat: { register: registerTui },
+  cron: { register: registerCron, machineOutput: ({ argv }) => isCronMachineOutput(argv) },
+  automations: { register: registerCron, machineOutput: ({ argv }) => isCronMachineOutput(argv) },
+  dns: { register: async (program) => (await import("../dns-cli.js")).registerDnsCli(program) },
+  docs: { register: async (program) => (await import("../docs-cli.js")).registerDocsCli(program) },
+  qa: {
+    register: async (program) => {
+      // This registrar comes from a source-checkout artifact, not a statically known module.
+      const { registerQaLabCli } = await loadPrivateQaCliModule();
+      if (typeof registerQaLabCli !== "function") {
+        throw new Error("Missing program command registrar: registerQaLabCli");
+      }
+      await registerQaLabCli(program);
+    },
+  },
+  proxy: {
+    register: async (program) => (await import("../proxy-cli.js")).registerProxyCli(program),
+    machineOutput: ({ argv }) => isProxyMachineOutput(argv),
+  },
+  hooks: {
+    register: async (program) => (await import("../hooks-cli.js")).registerHooksCli(program),
+  },
+  webhooks: {
+    register: async (program) => (await import("../webhooks-cli.js")).registerWebhooksCli(program),
+  },
+  qr: { register: async (program) => (await import("../qr-cli.js")).registerQrCli(program) },
+  clawbot: {
+    register: async (program) => (await import("../clawbot-cli.js")).registerClawbotCli(program),
+  },
+  pairing: {
+    register: async (program, argv) => {
+      // Pairing reads channel capabilities while registering, so initialize plugins first.
+      await registerPluginCommandsIfNeeded(program, argv);
+      (await import("../pairing-cli.js")).registerPairingCli(program);
+    },
+  },
+  plugins: {
+    register: async (program, argv) => {
+      (await import("../plugins-cli.js")).registerPluginsCli(program);
+      await registerPluginCommandsIfNeeded(program, argv);
+    },
+  },
+  channels: {
+    register: async (program, argv, context) =>
+      (await import("../channels-cli.js")).registerChannelsCli(program, argv, {
+        includeSetupOptions: context.purpose === "completion",
+      }),
+  },
+  directory: {
+    register: async (program) =>
+      (await import("../directory-cli.js")).registerDirectoryCli(program),
+  },
+  security: {
+    register: async (program) => (await import("../security-cli.js")).registerSecurityCli(program),
+  },
+  secrets: {
+    register: async (program) => (await import("../secrets-cli.js")).registerSecretsCli(program),
+  },
+  skills: {
+    register: async (program) => (await import("../skills-cli.js")).registerSkillsCli(program),
+    machineOutput: ({ argv }) => isSkillsMachineOutput(argv),
+  },
+  update: {
+    register: async (program) => (await import("../update-cli.js")).registerUpdateCli(program),
+  },
+  completion: {
+    register: async (program) =>
+      (await import("../completion-cli.js")).registerCompletionCli(program),
+  },
+} satisfies Record<SubCliCommandName, Pick<SubCliCommand, "register" | "machineOutput">>;
+
+export function getSubCliEntriesCore(): readonly SubCliCommand[] {
+  return getSubCliCommandMetadata().map((metadata) =>
+    Object.assign({}, metadata, registrations[metadata.name]),
+  );
 }

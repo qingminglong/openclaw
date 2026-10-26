@@ -1,5 +1,6 @@
 // Public config facade for IO, mutation, runtime snapshots, paths, and shared config types.
 export {
+  captureRuntimeConfigAsyncReader,
   clearConfigCache,
   ConfigRuntimeRefreshError,
   clearRuntimeConfigSnapshot,
@@ -9,6 +10,7 @@ export {
   getRuntimeConfigSnapshotMetadata,
   getRuntimeConfigSnapshot,
   getRuntimeConfigSourceSnapshot,
+  readRuntimeConfig,
   projectConfigOntoRuntimeSourceSnapshot,
   loadConfig,
   readBestEffortConfig,
@@ -27,14 +29,18 @@ export {
   resolveConfigSnapshotHash,
   resolveRuntimeConfigCacheKey,
   selectApplicableRuntimeConfig,
+  selectLiveRuntimeConfig,
   setRuntimeConfigSnapshotRefreshHandler,
   setRuntimeConfigSnapshot,
   writeConfigFile,
 } from "./io.js";
 export {
+  getRuntimeConfigAppliedHash,
   hashRuntimeConfigValue,
   resolveConfigWriteAfterWrite,
   resolveConfigWriteFollowUp,
+  setAppliedRuntimeConfigSnapshot,
+  setRuntimeConfigAppliedHash,
 } from "./runtime-snapshot.js";
 export type {
   ConfigWriteAfterWrite,
@@ -55,6 +61,7 @@ export {
   replaceConfigFile,
   transformConfigFile,
   transformConfigFileWithRetry,
+  withConfigMutationExclusive,
 } from "./mutate.js";
 export type {
   ConfigMutationCommit,
@@ -70,8 +77,9 @@ export type {
 } from "./mutate.js";
 export {
   assertConfigWriteAllowedInCurrentMode,
+  ConfigReadOnlyError,
   NixModeConfigMutationError,
-} from "./nix-mode-write-guard.js";
+} from "./config-write-guard.js";
 export * from "./paths.js";
 export * from "./recovery-policy.js";
 export * from "./runtime-overrides.js";

@@ -1,22 +1,26 @@
-/**
- * Accumulates and normalizes per-call token usage across embedded runs.
- */
+import { hasBillableUsage, hasRecordedUsageCost, USAGE_COST_COMPONENTS } from "../usage.js";
 import type { NormalizedUsage } from "../usage.js";
+import type { EmbeddedAgentMeta } from "./types.js";
 
 export type UsageAccumulator = {
   input: number;
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  cacheReadReported?: true;
+  cacheWriteReported?: true;
+  cacheWrite1h?: number;
+  cacheWrite5m?: number;
   reasoningTokens: number;
   total: number;
-  /** Exact usage snapshot from the most recent API call. */
-  lastInput: number;
-  lastOutput: number;
-  lastCacheRead: number;
-  lastCacheWrite: number;
-  lastReasoningTokens: number;
-  lastTotal: number;
+  usageReport?: NormalizedUsage["usageReport"];
+  /** Undefined means unobserved; any missing call price makes the complete sum unavailable. */
+  cost: NormalizedUsage["cost"] | "unavailable";
+  costStatus?: NormalizedUsage["costStatus"];
+  /** Counts every attempt, including retries. */
+  assistantTurns: number;
+  /** Omitted until an attempt reports a tool-search/code-mode catalog. */
+  bridgeCalls?: EmbeddedAgentMeta["bridgeCalls"];
 };
 
 export const createUsageAccumulator = (): UsageAccumulator => ({
@@ -26,89 +30,117 @@ export const createUsageAccumulator = (): UsageAccumulator => ({
   cacheWrite: 0,
   reasoningTokens: 0,
   total: 0,
-  lastInput: 0,
-  lastOutput: 0,
-  lastCacheRead: 0,
-  lastCacheWrite: 0,
-  lastReasoningTokens: 0,
-  lastTotal: 0,
+  cost: undefined,
+  assistantTurns: 0,
 });
 
-type MaybeUsage = NormalizedUsage | undefined;
-
-const hasUsageValues = (usage: MaybeUsage): usage is NormalizedUsage => {
-  if (!usage) {
-    return false;
+export const mergeUsageIntoAccumulator = (
+  target: UsageAccumulator,
+  usage: NormalizedUsage | undefined,
+) => {
+  if (usage?.costStatus) {
+    target.costStatus = usage.costStatus;
+    if (usage.costStatus === "unavailable") {
+      target.cost = "unavailable";
+    }
   }
-  return [
-    usage.input,
-    usage.output,
-    usage.cacheRead,
-    usage.cacheWrite,
-    usage.reasoningTokens,
-    usage.total,
-  ].some((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
-};
-
-export const mergeUsageIntoAccumulator = (target: UsageAccumulator, usage: MaybeUsage) => {
-  if (!hasUsageValues(usage)) {
+  if (usage?.usageReport?.state === "unavailable") {
+    target.usageReport = usage.usageReport;
+    target.cost = "unavailable";
     return;
   }
+  if (!hasBillableUsage(usage)) {
+    return;
+  }
+  target.usageReport ??= usage.usageReport;
   const callTotal =
     usage.total ??
     (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-  target.input += usage.input ?? 0;
-  target.output += usage.output ?? 0;
-  target.cacheRead += usage.cacheRead ?? 0;
-  target.cacheWrite += usage.cacheWrite ?? 0;
+  for (const key of ["cacheRead", "cacheWrite"] as const) {
+    if (usage[key] !== undefined) {
+      target[`${key}Reported`] = true;
+    }
+  }
+  for (const key of USAGE_COST_COMPONENTS) {
+    target[key] += usage[key] ?? 0;
+  }
+  for (const key of ["cacheWrite1h", "cacheWrite5m"] as const) {
+    if (usage[key] !== undefined) {
+      target[key] = (target[key] ?? 0) + usage[key];
+    }
+  }
   target.reasoningTokens += usage.reasoningTokens ?? 0;
   target.total += callTotal;
-  target.lastInput = usage.input ?? 0;
-  target.lastOutput = usage.output ?? 0;
-  target.lastCacheRead = usage.cacheRead ?? 0;
-  target.lastCacheWrite = usage.cacheWrite ?? 0;
-  target.lastReasoningTokens = usage.reasoningTokens ?? 0;
-  target.lastTotal = callTotal;
+  if (target.cost === "unavailable" || !usage.cost) {
+    target.cost = "unavailable";
+    return;
+  }
+  const cost: NonNullable<NormalizedUsage["cost"]> = {
+    total: (target.cost?.total ?? 0) + usage.cost.total,
+  };
+  if (
+    usage.cost.totalOrigin === "provider-billed" &&
+    (!target.cost || target.cost.totalOrigin === "provider-billed")
+  ) {
+    cost.totalOrigin = "provider-billed";
+  }
+  if (
+    cost.total === 0 &&
+    hasRecordedUsageCost(usage.cost) &&
+    (!target.cost || hasRecordedUsageCost(target.cost))
+  ) {
+    for (const key of USAGE_COST_COMPONENTS) {
+      const component = (target.cost?.[key] ?? 0) + (usage.cost[key] ?? 0);
+      if (component !== 0) {
+        cost[key] = component;
+      }
+    }
+  }
+  target.cost = cost;
+};
+
+/** Retains bridge counts before attempt cleanup clears its tool-search catalog. */
+export const mergeAttemptRunStatsIntoAccumulator = (
+  target: UsageAccumulator,
+  attempt: Pick<EmbeddedAgentMeta, "assistantTurns" | "bridgeCalls">,
+) => {
+  target.assistantTurns += attempt.assistantTurns ?? 0;
+  if (!attempt.bridgeCalls) {
+    return;
+  }
+  const bridgeCalls = target.bridgeCalls ?? { search: 0, describe: 0, call: 0 };
+  bridgeCalls.search += attempt.bridgeCalls.search;
+  bridgeCalls.describe += attempt.bridgeCalls.describe;
+  bridgeCalls.call += attempt.bridgeCalls.call;
+  target.bridgeCalls = bridgeCalls;
 };
 
 export const toNormalizedUsage = (usage: UsageAccumulator): NormalizedUsage | undefined => {
+  if (usage.usageReport?.state === "unavailable") {
+    return { usageReport: { state: "unavailable" }, contextUsage: { state: "unavailable" } };
+  }
   const hasUsage =
-    usage.input > 0 ||
-    usage.output > 0 ||
-    usage.cacheRead > 0 ||
-    usage.cacheWrite > 0 ||
+    USAGE_COST_COMPONENTS.some((key) => usage[key] > 0) ||
     usage.reasoningTokens > 0 ||
     usage.total > 0;
-  if (!hasUsage) {
+  const cost = usage.cost === "unavailable" ? undefined : usage.cost;
+  if (!usage.usageReport && !hasUsage && !cost) {
     return undefined;
   }
+  const derivedTotal = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
   return {
-    input: usage.input || undefined,
-    output: usage.output || undefined,
-    cacheRead: usage.cacheRead || undefined,
-    cacheWrite: usage.cacheWrite || undefined,
+    ...(usage.usageReport ? { usageReport: usage.usageReport } : {}),
+    input: usage.usageReport ? usage.input : usage.input || undefined,
+    output: usage.usageReport ? usage.output : usage.output || undefined,
+    cacheRead: usage.cacheReadReported ? usage.cacheRead : usage.cacheRead || undefined,
+    cacheWrite: usage.cacheWriteReported ? usage.cacheWrite : usage.cacheWrite || undefined,
+    ...(usage.cacheWrite1h !== undefined ? { cacheWrite1h: usage.cacheWrite1h } : {}),
+    ...(usage.cacheWrite5m !== undefined ? { cacheWrite5m: usage.cacheWrite5m } : {}),
     ...(usage.reasoningTokens > 0 ? { reasoningTokens: usage.reasoningTokens } : {}),
-    total: usage.total || undefined,
-  };
-};
-
-export const toLastCallUsage = (usage: UsageAccumulator): NormalizedUsage | undefined => {
-  const hasUsage =
-    usage.lastInput > 0 ||
-    usage.lastOutput > 0 ||
-    usage.lastCacheRead > 0 ||
-    usage.lastCacheWrite > 0 ||
-    usage.lastReasoningTokens > 0 ||
-    usage.lastTotal > 0;
-  if (!hasUsage) {
-    return undefined;
-  }
-  return {
-    input: usage.lastInput || undefined,
-    output: usage.lastOutput || undefined,
-    cacheRead: usage.lastCacheRead || undefined,
-    cacheWrite: usage.lastCacheWrite || undefined,
-    ...(usage.lastReasoningTokens > 0 ? { reasoningTokens: usage.lastReasoningTokens } : {}),
-    total: usage.lastTotal || undefined,
+    total: usage.usageReport ? usage.total : usage.total || derivedTotal || undefined,
+    ...(cost ? { cost: { ...cost } } : {}),
+    ...(usage.costStatus
+      ? { costStatus: usage.cost === "unavailable" ? "unavailable" : "complete" }
+      : {}),
   };
 };

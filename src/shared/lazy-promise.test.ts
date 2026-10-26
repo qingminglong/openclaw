@@ -1,60 +1,79 @@
-// Lazy promise tests cover single-flight loading and error reuse behavior.
 import { describe, expect, it, vi } from "vitest";
-import { createLazyImportLoader, createLazyPromiseLoader } from "./lazy-promise.js";
+import { createDeferred } from "../../test/helpers/promise.js";
+import { createLazyPromise, createLazyPromiseLoader, getOrCreatePromise } from "./lazy-promise.js";
 
-describe("createLazyPromiseLoader", () => {
-  it("dedupes concurrent loads and reuses the resolved value", async () => {
-    let calls = 0;
-    const loader = createLazyPromiseLoader(async () => `loaded-${++calls}`);
+function cachedLoad(options: Parameters<typeof getOrCreatePromise<string, string>>[3]) {
+  const cache = new Map<string, Promise<string>>();
+  const load = (key: string, create: () => Promise<string>) =>
+    getOrCreatePromise(cache, key, create, options);
+  return { cache, load };
+}
 
-    await expect(Promise.all([loader.load(), loader.load()])).resolves.toEqual([
-      "loaded-1",
-      "loaded-1",
-    ]);
-    await expect(loader.load()).resolves.toBe("loaded-1");
-    expect(calls).toBe(1);
+const recoveringLoad = () =>
+  vi
+    .fn<() => Promise<string>>()
+    .mockRejectedValueOnce(new Error("transient"))
+    .mockResolvedValue("recovered");
+
+describe("lazy promises", () => {
+  it("evicts only rejected loads when rejection caching is disabled", async () => {
+    const { load } = cachedLoad({ cacheRejections: false });
+    const create = recoveringLoad();
+
+    await expect(load("a", create)).rejects.toThrow("transient");
+    await expect(load("a", create)).resolves.toBe("recovered");
+    await expect(load("a", create)).resolves.toBe("recovered");
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
-  it("evicts rejected loads by default so retries can recover", async () => {
-    let calls = 0;
-    const loader = createLazyPromiseLoader(async () => {
-      calls += 1;
-      if (calls === 1) {
-        throw new Error("transient");
+  it.each([true, false])(
+    "preserves replacements after stale settlement (resolve=%s)",
+    async (resolve) => {
+      const { cache, load } = cachedLoad(
+        resolve ? { evictOnSettled: true } : { cacheRejections: false },
+      );
+      const deferred = createDeferred<string>();
+      const first = load("a", () => deferred.promise);
+      const replacement = Promise.resolve("replacement");
+      cache.set("a", replacement);
+      if (resolve) {
+        deferred.resolve("first");
+        await expect(first).resolves.toBe("first");
+        await expect(load("b", async () => "settled")).resolves.toBe("settled");
+        expect(cache.has("b")).toBe(false);
+      } else {
+        deferred.reject(new Error("stale"));
+        await expect(first).rejects.toThrow("stale");
       }
-      return "recovered";
-    });
+      expect(cache.get("a")).toBe(replacement);
+    },
+  );
+  it("returns a reusable single-flight loader", async () => {
+    let calls = 0;
+    const load = createLazyPromise(async () => `loaded-${++calls}`);
+
+    await expect(Promise.all([load(), load()])).resolves.toEqual(["loaded-1", "loaded-1"]);
+    await expect(load()).resolves.toBe("loaded-1");
+    expect(calls).toBe(1);
+  });
+  it("evicts rejected loads by default so retries can recover", async () => {
+    const create = recoveringLoad();
+    const loader = createLazyPromiseLoader(create);
 
     await expect(loader.load()).rejects.toThrow("transient");
     await expect(loader.load()).resolves.toBe("recovered");
-    expect(calls).toBe(2);
-  });
-
-  it("can keep rejected loads when requested", async () => {
-    const load = vi.fn(async () => {
-      throw new Error("sticky");
-    });
-    const loader = createLazyPromiseLoader(load, { cacheRejections: true });
-
-    await expect(loader.load()).rejects.toThrow("sticky");
-    await expect(loader.load()).rejects.toThrow("sticky");
-    expect(load).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
   it("clears cached values", async () => {
     let calls = 0;
     const loader = createLazyPromiseLoader(() => `loaded-${++calls}`);
 
+    expect(loader.peek()).toBeUndefined();
     await expect(loader.load()).resolves.toBe("loaded-1");
+    await expect(loader.peek()).resolves.toBe("loaded-1");
     loader.clear();
+    expect(loader.peek()).toBeUndefined();
     await expect(loader.load()).resolves.toBe("loaded-2");
-  });
-});
-
-describe("createLazyImportLoader", () => {
-  it("wraps import-shaped loaders", async () => {
-    const loader = createLazyImportLoader(async () => ({ value: "module" }));
-
-    await expect(loader.load()).resolves.toEqual({ value: "module" });
   });
 });

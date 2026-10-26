@@ -1,6 +1,7 @@
-// Minimax provider module implements model/runtime integration.
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import {
   createWebSearchProviderContractFields,
+  WEB_SEARCH_QUERY_COUNT_PROPERTIES,
   type WebSearchProviderPlugin,
 } from "openclaw/plugin-sdk/provider-web-search-config-contract";
 
@@ -12,25 +13,14 @@ const MINIMAX_TOKEN_PLAN_ENV_VARS = [
 ] as const;
 const MINIMAX_WEB_SEARCH_ENV_VARS = [...MINIMAX_TOKEN_PLAN_ENV_VARS, "MINIMAX_API_KEY"] as const;
 
-type MiniMaxWebSearchRuntime = typeof import("./minimax-web-search-provider.runtime.js");
-
-let miniMaxWebSearchRuntimePromise: Promise<MiniMaxWebSearchRuntime> | undefined;
-
-function loadMiniMaxWebSearchRuntime(): Promise<MiniMaxWebSearchRuntime> {
-  miniMaxWebSearchRuntimePromise ??= import("./minimax-web-search-provider.runtime.js");
-  return miniMaxWebSearchRuntimePromise;
-}
+const loadMiniMaxWebSearchRuntime = createLazyRuntimeModule(
+  () => import("./minimax-web-search-provider.runtime.js"),
+);
 
 const MiniMaxSearchSchema = {
   type: "object",
   properties: {
-    query: { type: "string", description: "Search query string." },
-    count: {
-      type: "integer",
-      description: "Number of results to return (1-10).",
-      minimum: 1,
-      maximum: 10,
-    },
+    ...WEB_SEARCH_QUERY_COUNT_PROPERTIES,
   },
 } satisfies Record<string, unknown>;
 
@@ -56,9 +46,10 @@ export function createMiniMaxWebSearchProvider(): WebSearchProviderPlugin {
       description:
         "Search the web using MiniMax Search API. Returns titles, URLs, snippets, and related search suggestions.",
       parameters: MiniMaxSearchSchema,
-      execute: async (args) => {
+      execute: async (args, context) => {
+        context?.signal?.throwIfAborted();
         const { executeMiniMaxWebSearchProviderTool } = await loadMiniMaxWebSearchRuntime();
-        return await executeMiniMaxWebSearchProviderTool(ctx, args);
+        return await executeMiniMaxWebSearchProviderTool(ctx, args, context?.signal);
       },
     }),
   };

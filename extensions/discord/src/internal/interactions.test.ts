@@ -1,4 +1,3 @@
-// Discord tests cover interactions plugin behavior.
 import {
   ComponentType,
   type GuildMemberFlags,
@@ -6,140 +5,199 @@ import {
   InteractionType,
   MessageFlags,
 } from "discord-api-types/v10";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { describe, expect, it, vi } from "vitest";
-import { Container, TextDisplay } from "./components.js";
 import {
-  BaseInteraction,
+  AutocompleteInteraction,
   ModalInteraction,
   createInteraction,
   type RawInteraction,
 } from "./interactions.js";
-import { Message } from "./structures.js";
 import {
   attachRestMock,
-  createInternalComponentInteractionPayload,
   createInternalInteractionPayload,
   createInternalModalInteractionPayload,
   createInternalTestClient,
 } from "./test-builders.test-support.js";
 
+const identity = { id: "interaction1", token: "token1" };
+const callbackRoute = "/interactions/interaction1/token1/callback";
+const originalRoute = "/webhooks/app1/token1/messages/%40original";
+const v2Payload = {
+  components: [{ type: 17, components: [{ type: 10, content: "done" }] }],
+  flags: MessageFlags.IsComponentsV2,
+};
+
+function messageCallback(content: string) {
+  return { body: { type: InteractionResponseType.ChannelMessageWithSource, data: { content } } };
+}
+
+function interactionFixture(
+  overrides: Parameters<typeof attachRestMock>[1] = {},
+  raw = createInternalInteractionPayload(identity),
+) {
+  const client = createInternalTestClient();
+  const rest = attachRestMock(client, overrides);
+  return {
+    interaction: createInteraction(client, raw),
+    client,
+    ...rest,
+  };
+}
+
+function pendingCallback() {
+  const firstResponse = createDeferred<void>();
+  const post = vi
+    .fn()
+    .mockImplementationOnce(() => firstResponse.promise)
+    .mockResolvedValue(undefined);
+  return { firstResponse, post };
+}
+
 describe("BaseInteraction", () => {
-  it("edits the original interaction response after defer", async () => {
-    const post = vi.fn(async () => undefined);
-    const patch = vi.fn(async () => undefined);
-    const client = createInternalTestClient();
-    attachRestMock(client, { patch, post });
-    const interaction = new BaseInteraction(
-      client,
-      createInternalInteractionPayload({ id: "interaction1", token: "token1" }),
+  it.each([
+    { first: "rejected", operation: "reply" },
+    { first: "accepted", operation: "followUp" },
+  ] as const)("serializes $operation after the first callback is $first", async (testCase) => {
+    const { firstResponse, post } = pendingCallback();
+    const { interaction } = interactionFixture({ post });
+
+    const first = interaction.reply("first");
+    await vi.waitFor(() => expect(post).toHaveBeenCalledOnce());
+    const second = interaction[testCase.operation]("second");
+    const callsBeforeAcceptance = post.mock.calls.length;
+    expect(interaction).toMatchObject({ responseState: "unacknowledged", acknowledged: false });
+    const settled = Promise.allSettled([first, second]);
+    if (testCase.first === "accepted") {
+      firstResponse.resolve();
+    } else {
+      firstResponse.reject(new Error("Discord rejected the first callback"));
+    }
+
+    const [firstResult, secondResult] = await settled;
+    expect(callsBeforeAcceptance).toBe(1);
+    expect(firstResult.status).toBe(testCase.first === "accepted" ? "fulfilled" : "rejected");
+    expect(secondResult.status).toBe("fulfilled");
+    expect(post).toHaveBeenNthCalledWith(1, callbackRoute, messageCallback("first"));
+    if (testCase.first === "accepted") {
+      expect(post).toHaveBeenNthCalledWith(
+        2,
+        "/webhooks/app1/token1",
+        { body: { content: "second" } },
+        undefined,
+      );
+    } else {
+      expect(post).toHaveBeenNthCalledWith(2, callbackRoute, messageCallback("second"));
+    }
+    expect(interaction.responseState).toBe("replied");
+  });
+
+  it("rejects a second initial callback without calling Discord", async () => {
+    const { interaction, post } = interactionFixture(
+      {},
+      createInternalInteractionPayload({
+        ...identity,
+        type: InteractionType.ApplicationCommandAutocomplete,
+      }),
     );
+    if (!(interaction instanceof AutocompleteInteraction)) {
+      throw new Error("expected autocomplete interaction");
+    }
+    const respond = () => interaction.respond([{ name: "First", value: "first" }]);
+    expect(await Promise.allSettled([respond(), respond()])).toMatchObject([
+      { status: "fulfilled" },
+      { status: "rejected", reason: { message: expect.stringMatching(/already.*acknowledg/i) } },
+    ]);
+    expect(post).toHaveBeenCalledOnce();
+    expect(interaction.acknowledged).toBe(true);
+  });
+
+  it("waits for the initial response before fetching the original reply", async () => {
+    const firstResponse = createDeferred<void>();
+    const post = vi.fn(() => firstResponse.promise);
+    const get = vi.fn(async () => ({ id: "message1" }));
+    const { interaction } = interactionFixture({ get, post });
+
+    const initial = interaction.reply("first");
+    await vi.waitFor(() => expect(post).toHaveBeenCalledOnce());
+    const fetched = interaction.fetchReply();
+    const fetchesBeforeAcceptance = get.mock.calls.length;
+    firstResponse.resolve();
+
+    await expect(Promise.all([initial, fetched])).resolves.toEqual([undefined, { id: "message1" }]);
+    expect(fetchesBeforeAcceptance).toBe(0);
+    expect(get).toHaveBeenCalledWith(originalRoute);
+  });
+
+  it("keeps response transactions independent for different interactions", async () => {
+    const { firstResponse, post } = pendingCallback();
+    const { client, interaction: firstInteraction } = interactionFixture({ post });
+    const secondInteraction = createInteraction(
+      client,
+      createInternalInteractionPayload({ id: "interaction2", token: "token2" }),
+    );
+
+    const first = firstInteraction.reply("first");
+    await vi.waitFor(() => expect(post).toHaveBeenCalledOnce());
+    await secondInteraction.reply("second");
+    expect(firstInteraction.responseState).toBe("unacknowledged");
+    expect(secondInteraction.responseState).toBe("replied");
+    firstResponse.resolve();
+    await first;
+
+    expect(post).toHaveBeenNthCalledWith(
+      2,
+      "/interactions/interaction2/token2/callback",
+      messageCallback("second"),
+    );
+  });
+
+  it("edits the original interaction response after defer", async () => {
+    const { interaction, post, patch } = interactionFixture();
 
     await interaction.defer({ ephemeral: true });
     await interaction.reply({ content: "done", ephemeral: true });
 
-    expect(post).toHaveBeenNthCalledWith(1, "/interactions/interaction1/token1/callback", {
+    expect(post).toHaveBeenNthCalledWith(1, callbackRoute, {
       body: {
         type: InteractionResponseType.DeferredChannelMessageWithSource,
         data: { flags: 64 },
       },
     });
-    expect(patch).toHaveBeenCalledWith("/webhooks/app1/token1/messages/%40original", {
-      body: { content: "done", flags: 64 },
-    });
+    expect(patch).toHaveBeenCalledWith(originalRoute, { body: { content: "done", flags: 64 } });
   });
 
-  it("uses with_components for Components V2 follow-ups", async () => {
-    const post = vi.fn(async () => undefined);
-    const client = createInternalTestClient();
-    attachRestMock(client, { post });
-    const interaction = new BaseInteraction(
-      client,
-      createInternalInteractionPayload({ id: "interaction1", token: "token1" }),
-    );
-
-    await interaction.reply("first");
-    await interaction.reply({
-      components: [new Container([new TextDisplay("done")])],
-    });
-
-    expect(post).toHaveBeenNthCalledWith(
-      2,
-      "/webhooks/app1/token1",
-      {
-        body: {
-          components: [
-            {
-              type: 17,
-              components: [{ type: 10, content: "done" }],
-            },
-          ],
-          flags: MessageFlags.IsComponentsV2,
-        },
-      },
-      { with_components: true },
-    );
-  });
-
-  it("uses with_components when editing deferred Components V2 replies", async () => {
-    const post = vi.fn(async () => undefined);
-    const patch = vi.fn(async () => undefined);
-    const client = createInternalTestClient();
-    attachRestMock(client, { patch, post });
-    const interaction = new BaseInteraction(
-      client,
-      createInternalInteractionPayload({ id: "interaction1", token: "token1" }),
-    );
+  it("deletes the original interaction response after defer", async () => {
+    const { interaction, delete: del } = interactionFixture();
 
     await interaction.defer();
-    await interaction.reply({
-      components: [new Container([new TextDisplay("done")])],
-    });
+    expect(interaction.responseState).toBe("deferred");
+    await interaction.deleteReply();
 
-    expect(patch).toHaveBeenCalledWith(
-      "/webhooks/app1/token1/messages/%40original",
-      {
-        body: {
-          components: [
-            {
-              type: 17,
-              components: [{ type: 10, content: "done" }],
-            },
-          ],
-          flags: MessageFlags.IsComponentsV2,
-        },
-      },
-      { with_components: true },
-    );
+    expect(del).toHaveBeenCalledWith(originalRoute);
+    expect(interaction.responseState).toBe("replied");
   });
 
-  it("edits the original component message after acknowledge", async () => {
-    const post = vi.fn(async () => undefined);
-    const patch = vi.fn(async () => undefined);
-    const client = createInternalTestClient();
-    attachRestMock(client, { patch, post });
-    const interaction = createInteraction(
-      client,
-      createInternalComponentInteractionPayload({
-        id: "interaction1",
-        token: "token1",
-        data: {
-          component_type: ComponentType.Button,
-          custom_id: "button1",
-        },
-      }),
-    );
-
-    await interaction.acknowledge();
-    await interaction.reply({ content: "updated", components: [] });
-
-    expect(post).toHaveBeenCalledTimes(1);
-    expect(post).toHaveBeenCalledWith("/interactions/interaction1/token1/callback", {
-      body: { type: InteractionResponseType.DeferredMessageUpdate },
-    });
-    expect(patch).toHaveBeenCalledWith("/webhooks/app1/token1/messages/%40original", {
-      body: { content: "updated", components: [] },
-    });
-  });
+  it.each(["follow-up", "deferred edit"] as const)(
+    "uses with_components for Components V2 %s",
+    async (mode) => {
+      const { interaction, post, patch } = interactionFixture();
+      if (mode === "follow-up") {
+        await interaction.reply("first");
+      } else {
+        await interaction.defer();
+      }
+      await interaction.reply({
+        components: [{ isV2: true, serialize: () => v2Payload.components[0] }],
+      });
+      const args = [{ body: v2Payload }, { with_components: true }];
+      if (mode === "follow-up") {
+        expect(post).toHaveBeenNthCalledWith(2, "/webhooks/app1/token1", ...args);
+      } else {
+        expect(patch).toHaveBeenCalledWith(originalRoute, ...args);
+      }
+    },
+  );
 
   it("rejects malformed interaction payloads at the boundary", () => {
     expect(() =>
@@ -151,12 +209,10 @@ describe("BaseInteraction", () => {
   });
 
   it("preserves guild member user identity fields", () => {
-    const interaction = createInteraction(
-      createInternalTestClient(),
+    const { interaction } = interactionFixture(
+      {},
       createInternalInteractionPayload({
-        id: "interaction1",
-        token: "token1",
-        type: InteractionType.ApplicationCommand,
+        ...identity,
         guild_id: "guild1",
         member: {
           roles: [],
@@ -176,107 +232,23 @@ describe("BaseInteraction", () => {
       }),
     );
 
-    expect(interaction.user?.id).toBe("user1");
-    expect(interaction.user?.username).toBe("alice");
-    expect(interaction.user?.globalName).toBe("Alice Cooper");
-    expect(interaction.user?.discriminator).toBe("1234");
-  });
-
-  it("waits for a one-off component reply without invoking registered handlers", async () => {
-    const get = vi.fn(async () => ({
-      id: "message1",
-      channel_id: "channel1",
-      author: {
-        id: "bot1",
-        username: "bot",
-        discriminator: "0000",
-        global_name: null,
-        avatar: null,
-      },
-      content: "pick",
-      timestamp: "2026-05-01T00:00:00.000Z",
-    }));
-    const post = vi.fn(async () => undefined);
-    const client = createInternalTestClient();
-    attachRestMock(client, { get, post });
-    const interaction = new BaseInteraction(
-      client,
-      createInternalInteractionPayload({ id: "interaction1", token: "token1" }),
-    );
-
-    const wait = interaction.replyAndWaitForComponent({ content: "pick" }, 1_000);
-    await vi.waitFor(() =>
-      expect(get).toHaveBeenCalledWith("/webhooks/app1/token1/messages/%40original"),
-    );
-
-    await client.handleInteraction(
-      createInternalComponentInteractionPayload({
-        id: "component-interaction1",
-        token: "component-token1",
-        data: { custom_id: "button1" },
-        message: {
-          id: "message1",
-          channel_id: "channel1",
-          author: {
-            id: "bot1",
-            username: "bot",
-            discriminator: "0000",
-            global_name: null,
-            avatar: null,
-          },
-          content: "pick",
-          timestamp: "2026-05-01T00:00:00.000Z",
-          edited_timestamp: null,
-          tts: false,
-          mention_everyone: false,
-          mentions: [],
-          mention_roles: [],
-          attachments: [],
-          embeds: [],
-          pinned: false,
-          type: 0,
-        },
-      }),
-    );
-
-    const result = await wait;
-    if (!result.success) {
-      throw new Error("expected component wait to succeed");
-    }
-    expect(result.customId).toBe("button1");
-    expect(result.message).toBeInstanceOf(Message);
-    expect(result.message?.id).toBe("message1");
-    expect(result.message?.channelId).toBe("channel1");
-    expect(result.values).toBeUndefined();
-    expect(post).toHaveBeenNthCalledWith(
-      2,
-      "/interactions/component-interaction1/component-token1/callback",
-      {
-        body: { type: InteractionResponseType.DeferredMessageUpdate },
-      },
-    );
+    expect(interaction.user).toMatchObject({
+      id: "user1",
+      username: "alice",
+      globalName: "Alice Cooper",
+      discriminator: "1234",
+    });
   });
 });
 
 describe("ModalInteraction", () => {
   it("reads submitted fields from Components V2 label wrappers", () => {
-    const interaction = createInteraction(
-      createInternalTestClient(),
+    const field = { type: ComponentType.TextInput, custom_id: "title", value: "Hello" };
+    const { interaction } = interactionFixture(
+      {},
       createInternalModalInteractionPayload({
-        id: "interaction1",
-        token: "token1",
-        data: {
-          components: [
-            {
-              type: ComponentType.Label,
-              component: {
-                type: ComponentType.TextInput,
-                custom_id: "title",
-                value: "Hello",
-              },
-            },
-          ],
-        },
+        ...identity,
+        data: { components: [{ type: ComponentType.Label, component: field }] },
       }),
     );
 
@@ -284,46 +256,19 @@ describe("ModalInteraction", () => {
     expect((interaction as ModalInteraction).fields.getText("title")).toBe("Hello");
   });
 
-  it("acknowledges modal submits as message updates", async () => {
-    const post = vi.fn(async () => undefined);
-    const client = createInternalTestClient();
-    attachRestMock(client, { post });
-    const interaction = createInteraction(
-      client,
-      createInternalModalInteractionPayload({
-        id: "interaction1",
-        token: "token1",
-      }),
-    );
-
-    await (interaction as ModalInteraction).acknowledge();
-
-    expect(post).toHaveBeenCalledWith("/interactions/interaction1/token1/callback", {
-      body: { type: InteractionResponseType.DeferredMessageUpdate },
-    });
-  });
-
   it("edits the original modal source message after acknowledge", async () => {
-    const post = vi.fn(async () => undefined);
-    const patch = vi.fn(async () => undefined);
-    const client = createInternalTestClient();
-    attachRestMock(client, { patch, post });
-    const interaction = createInteraction(
-      client,
-      createInternalModalInteractionPayload({
-        id: "interaction1",
-        token: "token1",
-      }),
+    const { interaction, post, patch } = interactionFixture(
+      {},
+      createInternalModalInteractionPayload(identity),
     );
 
     await (interaction as ModalInteraction).acknowledge();
     await interaction.reply({ content: "cleared", components: [] });
 
-    expect(post).toHaveBeenCalledTimes(1);
-    expect(post).toHaveBeenCalledWith("/interactions/interaction1/token1/callback", {
+    expect(post).toHaveBeenCalledExactlyOnceWith(callbackRoute, {
       body: { type: InteractionResponseType.DeferredMessageUpdate },
     });
-    expect(patch).toHaveBeenCalledWith("/webhooks/app1/token1/messages/%40original", {
+    expect(patch).toHaveBeenCalledWith(originalRoute, {
       body: { content: "cleared", components: [] },
     });
   });

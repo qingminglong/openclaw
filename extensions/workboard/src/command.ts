@@ -1,22 +1,18 @@
-// Workboard plugin module implements command behavior.
+import { WORKBOARD_STATUSES, type WorkboardCard } from "@openclaw/workboard-contract";
 import type { OpenClawPluginApi } from "../api.js";
 import { resolveWorkboardCardByIdOrPrefix } from "./card-lookup.js";
-import { dispatchAndStartWorkboardCards, type WorkboardSubagentRuntime } from "./dispatcher.js";
+import type { ResolveAgentWorkspaceRuntime } from "./dispatcher-workspace.js";
+import { dispatchAndStartWorkboardCards } from "./dispatcher.js";
 import type { WorkboardStore } from "./store.js";
-import type { WorkboardCard } from "./types.js";
+import {
+  canonicalizeWorkboardWorkspaceAccess,
+  resolveAgentWorkboardWorkspaceRuntime,
+  resolveCommandWorkboardWorkspaceAccess,
+  resolveWorkboardAgentWorkspace,
+} from "./workspace-access.js";
 
 const ADMIN_SCOPE = "operator.admin";
 const WRITE_SCOPE = "operator.write";
-
-type WorkboardCommandApi = {
-  runtime: {
-    subagent: WorkboardSubagentRuntime;
-  };
-};
-
-function splitArgs(input: string | undefined): string[] {
-  return (input ?? "").trim().split(/\s+/).filter(Boolean);
-}
 
 function formatCardLine(card: WorkboardCard): string {
   const boardId = card.metadata?.automation?.boardId ?? "default";
@@ -41,104 +37,31 @@ function formatCardDetails(card: WorkboardCard): string {
   if (card.runId) {
     lines.push(`run: ${card.runId}`);
   }
+  if (card.metadata?.archivedAt) {
+    lines.push("archived: yes (excluded from dispatch)");
+  }
   if (card.notes) {
     lines.push("", card.notes);
   }
   return lines.join("\n");
 }
 
-function normalizeTitle(tokens: string[]): string {
-  return tokens.join(" ").trim();
-}
-
-function canMutateWorkboard(params: {
-  senderIsOwner?: boolean;
-  gatewayClientScopes?: readonly string[];
-}): boolean {
-  const scopes = params.gatewayClientScopes;
-  if (scopes) {
-    return scopes.includes(ADMIN_SCOPE) || scopes.includes(WRITE_SCOPE);
-  }
-  return params.senderIsOwner === true;
-}
-
 function requireWriteAccess(params: {
   senderIsOwner?: boolean;
   gatewayClientScopes?: readonly string[];
 }): { text: string; isError: true } | undefined {
-  if (canMutateWorkboard(params)) {
+  const scopes = params.gatewayClientScopes;
+  if (
+    scopes
+      ? scopes.includes(ADMIN_SCOPE) || scopes.includes(WRITE_SCOPE)
+      : params.senderIsOwner === true
+  ) {
     return undefined;
   }
   return {
     text: `This command requires gateway scope: ${WRITE_SCOPE}.`,
     isError: true,
   };
-}
-
-export async function handleWorkboardCommand(params: {
-  api: WorkboardCommandApi;
-  store: WorkboardStore;
-  args?: string;
-  senderIsOwner?: boolean;
-  gatewayClientScopes?: readonly string[];
-}): Promise<{ text: string; isError?: boolean }> {
-  const [action = "list", ...rest] = splitArgs(params.args);
-  if (action === "help") {
-    return {
-      text: [
-        "/workboard list",
-        "/workboard show <card-id>",
-        "/workboard create <title>",
-        "/workboard dispatch",
-      ].join("\n"),
-    };
-  }
-  if (action === "list") {
-    const cards = (await params.store.list()).filter((card) => !card.metadata?.archivedAt);
-    const rows = cards.slice(0, 12).map(formatCardLine);
-    return { text: rows.length ? rows.join("\n") : "No Workboard cards." };
-  }
-  if (action === "show" || action === "read") {
-    const id = rest[0];
-    if (!id) {
-      return { text: "Usage: /workboard show <card-id>", isError: true };
-    }
-    const cards = await params.store.list();
-    const { card, error } = resolveWorkboardCardByIdOrPrefix(cards, id);
-    return card ? { text: formatCardDetails(card) } : { text: error, isError: true };
-  }
-  if (action === "create") {
-    const accessError = requireWriteAccess(params);
-    if (accessError) {
-      return accessError;
-    }
-    const title = normalizeTitle(rest);
-    if (!title) {
-      return { text: "Usage: /workboard create <title>", isError: true };
-    }
-    const card = await params.store.create({ title });
-    return { text: `Created ${card.id.slice(0, 8)} ${card.title}` };
-  }
-  if (action === "dispatch") {
-    const accessError = requireWriteAccess(params);
-    if (accessError) {
-      return accessError;
-    }
-    const result = await dispatchAndStartWorkboardCards({
-      store: params.store,
-      subagent: params.api.runtime.subagent,
-    });
-    return {
-      text: [
-        `dispatch: started=${result.started.length} failures=${result.startFailures.length} promoted=${result.promoted.length} blocked=${result.blocked.length}`,
-        ...result.started.map((run) => `started ${run.cardId.slice(0, 8)} run=${run.runId}`),
-        ...result.startFailures.map(
-          (failure) => `failed ${failure.cardId.slice(0, 8)} ${failure.error}`,
-        ),
-      ].join("\n"),
-    };
-  }
-  return { text: `Unknown Workboard action: ${action}`, isError: true };
 }
 
 export function registerWorkboardCommand(params: {
@@ -150,13 +73,135 @@ export function registerWorkboardCommand(params: {
     description: "List, create, inspect, and dispatch Workboard cards.",
     acceptsArgs: true,
     exposeSenderIsOwner: true,
-    handler: async (ctx) =>
-      await handleWorkboardCommand({
-        api: params.api,
-        store: params.store,
-        args: ctx.args,
-        senderIsOwner: ctx.senderIsOwner,
+    handler: async (ctx): Promise<{ text: string; isError?: boolean }> => {
+      const api = params.api;
+      const store = params.store;
+      const args = ctx.args;
+      const senderIsOwner = ctx.senderIsOwner;
+      const assertOwnerCurrent = ctx.gatewayClientScopes ? undefined : ctx.assertOwnerCurrent;
+      const gatewayClientScopes = ctx.gatewayClientScopes;
+      const resolveAgentWorkspace = (agentId?: string) =>
+        resolveWorkboardAgentWorkspace(ctx.config, agentId);
+      const resolveAgentWorkspaceRuntime: ResolveAgentWorkspaceRuntime = (
+        agentId,
+        sessionKey,
+        workspaceDir,
+        modelProvider,
+        modelId,
+      ) =>
+        resolveAgentWorkboardWorkspaceRuntime({
+          config: ctx.config,
+          agentId,
+          sessionKey,
+          workspaceDir,
+          modelProvider,
+          modelId,
+          prepareSandboxWorkspaceAuthority: params.api.runtime.sandbox.prepareWorkspaceAuthority,
+        });
+      const commandWorkspaceAccess = resolveCommandWorkboardWorkspaceAccess({
+        config: ctx.config,
+        agentId: ctx.agentId,
+        sessionKey: ctx.sessionKey,
         gatewayClientScopes: ctx.gatewayClientScopes,
-      }),
+        resolveSandboxWorkspaceAuthority: params.api.runtime.sandbox.resolveWorkspaceAuthority,
+      });
+      const [action = "list", ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      if (action === "help") {
+        return {
+          text: [
+            "/workboard list",
+            "/workboard show <card-id>",
+            "/workboard create <title>",
+            "/workboard move <card-id> --status <status>",
+            "/workboard dispatch",
+          ].join("\n"),
+        };
+      }
+      if (action === "list") {
+        const cards = (await store.list()).filter((card) => !card.metadata?.archivedAt);
+        const rows = cards.slice(0, 12).map(formatCardLine);
+        return { text: rows.length ? rows.join("\n") : "No Workboard cards." };
+      }
+      if (action === "show" || action === "read") {
+        const id = rest[0];
+        if (!id) {
+          return { text: "Usage: /workboard show <card-id>", isError: true };
+        }
+        const cards = await store.list();
+        const { card, error } = resolveWorkboardCardByIdOrPrefix(cards, id);
+        return card ? { text: formatCardDetails(card) } : { text: error, isError: true };
+      }
+      if (action === "create" || action === "move" || action === "dispatch") {
+        const accessError = requireWriteAccess({ senderIsOwner, gatewayClientScopes });
+        if (accessError) {
+          return accessError;
+        }
+      }
+      if (action === "create") {
+        const title = rest.join(" ").trim();
+        if (!title) {
+          return { text: "Usage: /workboard create <title>", isError: true };
+        }
+        const workspaceAccess = await canonicalizeWorkboardWorkspaceAccess(
+          commandWorkspaceAccess ?? { unrestricted: true },
+        );
+        const card = await store.create({ title, workspaceAccess }, undefined, assertOwnerCurrent);
+        return { text: `Created ${card.id.slice(0, 8)} ${card.title}` };
+      }
+      if (action === "move") {
+        const id = rest[0];
+        const statusIndex = rest.indexOf("--status");
+        const status = statusIndex >= 0 ? rest[statusIndex + 1] : undefined;
+        if (!id || !status) {
+          return {
+            text: "Usage: /workboard move <card-id> --status <status>",
+            isError: true,
+          };
+        }
+        if (!(WORKBOARD_STATUSES as readonly string[]).includes(status)) {
+          return {
+            text: `status must be one of: ${WORKBOARD_STATUSES.join(", ")}.`,
+            isError: true,
+          };
+        }
+        const cards = await store.list();
+        const { card, error } = resolveWorkboardCardByIdOrPrefix(cards, id);
+        if (!card) {
+          return { text: error, isError: true };
+        }
+        return {
+          text: formatCardLine(
+            await store.move(card.id, status, undefined, undefined, {
+              assertOwnerCurrent,
+            }),
+          ),
+        };
+      }
+      if (action === "dispatch") {
+        const workspaceAccess = commandWorkspaceAccess ?? { unrestricted: true };
+        const result = await dispatchAndStartWorkboardCards({
+          store,
+          subagent: api.runtime.subagent,
+          worktrees: api.runtime.worktrees,
+          options: {
+            materializeWorktree: true,
+            resolveAgentWorkspace,
+            resolveAgentWorkspaceRuntime,
+            workspaceAccess,
+            assertOwnerCurrent,
+          },
+        });
+        return {
+          text: [
+            `dispatch: started=${result.started.length} failures=${result.startFailures.length} promoted=${result.promoted.length} blocked=${result.blocked.length}`,
+            ...result.started.map((run) => `started ${run.cardId.slice(0, 8)} run=${run.runId}`),
+            ...result.startFailures.map(
+              (failure) => `failed ${failure.cardId.slice(0, 8)} ${failure.error}`,
+            ),
+          ].join("\n"),
+        };
+      }
+      return { text: `Unknown Workboard action: ${action}`, isError: true };
+    },
   });
 }

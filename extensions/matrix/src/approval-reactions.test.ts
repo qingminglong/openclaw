@@ -1,188 +1,133 @@
-// Matrix tests cover approval reactions plugin behavior.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
+import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  buildMatrixApprovalReactionHint,
-  clearMatrixApprovalReactionTargetsForTest,
-  listMatrixApprovalReactionBindings,
-  registerMatrixApprovalReactionTarget,
-  resolveMatrixApprovalReactionTarget,
-  resolveMatrixApprovalReactionTargetWithPersistence,
-  unregisterMatrixApprovalReactionTarget,
+  registerMatrixApprovalReactionTarget as register,
+  resolveMatrixApprovalReactionTargetWithPersistence as resolve,
+  unregisterMatrixApprovalReactionTarget as unregister,
 } from "./approval-reactions.js";
 import { setMatrixRuntime } from "./runtime.js";
 
-afterEach(() => {
-  clearMatrixApprovalReactionTargetsForTest();
+const { clearRuntime: clearMatrixRuntime } = createPluginRuntimeStore<PluginRuntime>({
+  pluginId: "matrix",
+  errorMessage: "Matrix runtime not initialized",
+});
+
+const targets: Parameters<typeof unregister>[0][] = [];
+const anchor = { accountId: "default", roomId: "!ops:example.org", eventId: "$approval-msg" };
+const approval = { ...anchor, approvalId: "req-123", approvalKind: "exec" as const };
+
+async function registerTarget(params: Partial<Parameters<typeof register>[0]> = {}): Promise<void> {
+  const target = {
+    ...approval,
+    allowedDecisions: ["allow-once" as const],
+    ...params,
+  };
+  targets.push(target);
+  await register(target);
+}
+
+function resolveTarget(params: Partial<Parameters<typeof resolve>[0]> = {}) {
+  return resolve({ ...anchor, reactionKey: "✅", ...params });
+}
+
+beforeEach(clearMatrixRuntime);
+
+afterEach(async () => {
+  for (const target of targets.splice(0)) {
+    await unregister(target);
+  }
+  clearMatrixRuntime();
   vi.restoreAllMocks();
 });
 
 describe("matrix approval reactions", () => {
-  it("lists reactions in stable decision order", () => {
-    expect(listMatrixApprovalReactionBindings(["allow-once", "deny", "allow-always"])).toEqual([
-      { decision: "allow-once", emoji: "✅", label: "Allow once" },
-      { decision: "allow-always", emoji: "♾️", label: "Allow always" },
-      { decision: "deny", emoji: "❌", label: "Deny" },
-    ]);
+  it("ignores reactions that are not allowed on the registered approval anchor event", async () => {
+    await registerTarget({ allowedDecisions: ["allow-once", "deny"] });
+    expect(await resolveTarget({ reactionKey: "♾️" })).toBeNull();
   });
 
-  it("builds a compact reaction hint", () => {
-    expect(buildMatrixApprovalReactionHint(["allow-once", "deny"])).toBe(
-      "React here: ✅ Allow once, ❌ Deny",
-    );
-  });
-
-  it("resolves a registered approval anchor event back to an approval decision", () => {
-    registerMatrixApprovalReactionTarget({
-      roomId: "!ops:example.org",
-      eventId: "$approval-msg",
-      approvalId: "req-123",
-      allowedDecisions: ["allow-once", "allow-always", "deny"],
+  it("does not expose an approval reaction target to another Matrix account", async () => {
+    const shared = { roomId: "!shared:example.org", eventId: "$approval-msg" };
+    await registerTarget({
+      accountId: "account-a",
+      ...shared,
+      approvalId: "req-account-a",
     });
 
-    expect(
-      resolveMatrixApprovalReactionTarget({
-        roomId: "!ops:example.org",
-        eventId: "$approval-msg",
-        reactionKey: "✅",
-      }),
-    ).toEqual({
-      approvalId: "req-123",
+    expect(await resolveTarget({ accountId: "account-b", ...shared })).toBeNull();
+    expect(await resolveTarget({ accountId: "account-a", ...shared })).toEqual({
+      approvalId: "req-account-a",
+      approvalKind: "exec",
       decision: "allow-once",
     });
-    expect(
-      resolveMatrixApprovalReactionTarget({
-        roomId: "!ops:example.org",
-        eventId: "$approval-msg",
-        reactionKey: "♾️",
-      }),
-    ).toEqual({
-      approvalId: "req-123",
-      decision: "allow-always",
-    });
-    expect(
-      resolveMatrixApprovalReactionTarget({
-        roomId: "!ops:example.org",
-        eventId: "$approval-msg",
-        reactionKey: "❌",
-      }),
-    ).toEqual({
-      approvalId: "req-123",
-      decision: "deny",
-    });
   });
 
-  it("ignores reactions that are not allowed on the registered approval anchor event", () => {
-    registerMatrixApprovalReactionTarget({
-      roomId: "!ops:example.org",
-      eventId: "$approval-msg",
-      approvalId: "req-123",
-      allowedDecisions: ["allow-once", "deny"],
-    });
-
-    expect(
-      resolveMatrixApprovalReactionTarget({
-        roomId: "!ops:example.org",
-        eventId: "$approval-msg",
-        reactionKey: "♾️",
-      }),
-    ).toBeNull();
+  it("rejects reaction targets without a valid approval kind", async () => {
+    await registerTarget({ approvalKind: "invalid" } as never);
+    expect(await resolveTarget()).toBeNull();
   });
 
-  it("stops resolving reactions after the approval anchor event is unregistered", () => {
-    registerMatrixApprovalReactionTarget({
-      roomId: "!ops:example.org",
-      eventId: "$approval-msg",
-      approvalId: "req-123",
-      allowedDecisions: ["allow-once", "allow-always", "deny"],
-    });
-    unregisterMatrixApprovalReactionTarget({
-      roomId: "!ops:example.org",
-      eventId: "$approval-msg",
-    });
-
-    expect(
-      resolveMatrixApprovalReactionTarget({
-        roomId: "!ops:example.org",
-        eventId: "$approval-msg",
-        reactionKey: "✅",
-      }),
-    ).toBeNull();
-  });
-
-  it("persists approval reaction targets when runtime state is available", async () => {
-    const register = vi.fn().mockResolvedValue(undefined);
-    const lookup = vi.fn().mockResolvedValue({
+  it("persists system-agent approval reaction targets when runtime state is available", async () => {
+    const approvalKind = "system-agent" as const;
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const warn = vi.fn();
+    const persist = vi.fn().mockResolvedValue(undefined);
+    const persistedAnchor = { roomId: "!ops:example.org", eventId: "$approval-msg-2" };
+    const record = {
       version: 1,
-      target: { approvalId: "req-persisted", allowedDecisions: ["deny"] },
-    });
+      target: {
+        ...approval,
+        approvalKind,
+        ...persistedAnchor,
+        allowedDecisions: ["allow-once", "deny"] as const,
+      },
+    };
+    const lookup = vi.fn().mockResolvedValue(record);
     const openKeyedStore = vi.fn(() => ({
-      register,
+      register: persist,
       lookup,
       consume: vi.fn(),
-      delete: vi.fn(),
+      delete: vi.fn().mockResolvedValue(undefined),
       entries: vi.fn(),
       clear: vi.fn(),
     }));
     setMatrixRuntime({
-      state: { openKeyedStore },
-      logging: { getChildLogger: () => ({ warn: vi.fn() }) },
+      state: { openKeyedStoreV2: openKeyedStore },
+      logging: { getChildLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() }) },
     } as never);
 
-    registerMatrixApprovalReactionTarget({
-      roomId: "!ops:example.org",
-      eventId: "$approval-msg-2",
-      approvalId: "req-123",
-      allowedDecisions: ["allow-once", "deny"],
-      ttlMs: 1000,
-    });
+    await registerTarget({ ...record.target, ttlMs: 1 });
 
-    await vi.waitFor(() => expect(register).toHaveBeenCalledTimes(1));
-    expect(register).toHaveBeenCalledWith(
-      "!ops:example.org:$approval-msg-2",
-      {
-        version: 1,
-        target: { approvalId: "req-123", allowedDecisions: ["allow-once", "deny"] },
-      },
-      { ttlMs: 1000 },
+    expect(persist).toHaveBeenCalledExactlyOnceWith(
+      '["default","!ops:example.org","$approval-msg-2"]',
+      record,
+      { ttlMs: 1 },
     );
 
-    clearMatrixApprovalReactionTargetsForTest();
-    await expect(
-      resolveMatrixApprovalReactionTargetWithPersistence({
-        roomId: "!ops:example.org",
-        eventId: "$approval-msg-2",
-        reactionKey: "❌",
-      }),
-    ).resolves.toEqual({ approvalId: "req-persisted", decision: "deny" });
-    expect(openKeyedStore).toHaveBeenCalledTimes(2);
-    expect(lookup).toHaveBeenCalledWith("!ops:example.org:$approval-msg-2");
-  });
+    now.mockReturnValue(1_005);
+    await expect(resolveTarget({ ...persistedAnchor, reactionKey: "❌" })).resolves.toEqual({
+      approvalId: "req-123",
+      approvalKind,
+      decision: "deny",
+    });
+    expect(openKeyedStore).toHaveBeenCalledOnce();
+    expect(lookup).toHaveBeenCalledWith('["default","!ops:example.org","$approval-msg-2"]');
 
-  it("falls back to in-memory approval reaction targets when persistent state cannot open", () => {
-    const warn = vi.fn();
-    setMatrixRuntime({
-      state: {
-        openKeyedStore: vi.fn(() => {
-          throw new Error("sqlite unavailable");
-        }),
-      },
-      logging: { getChildLogger: () => ({ warn }) },
-    } as never);
-
-    registerMatrixApprovalReactionTarget({
-      roomId: "!ops:example.org",
+    persist.mockRejectedValueOnce(new Error("sqlite unavailable"));
+    await registerTarget({
       eventId: "$approval-msg-3",
       approvalId: "req-fallback",
+      approvalKind,
       allowedDecisions: ["deny"],
     });
+    expect(warn).toHaveBeenCalled();
 
     expect(
-      resolveMatrixApprovalReactionTarget({
-        roomId: "!ops:example.org",
+      await resolveTarget({
         eventId: "$approval-msg-3",
         reactionKey: "❌",
       }),
-    ).toEqual({ approvalId: "req-fallback", decision: "deny" });
-    expect(warn).toHaveBeenCalled();
+    ).toEqual({ approvalId: "req-fallback", approvalKind, decision: "deny" });
   });
 });

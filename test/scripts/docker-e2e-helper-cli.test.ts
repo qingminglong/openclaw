@@ -1,9 +1,28 @@
-// Docker E2E Helper Cli tests cover docker e2e helper cli script behavior.
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { parse } from "yaml";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+
+const LIVE_E2E_WORKFLOW = ".github/workflows/openclaw-live-and-e2e-checks-reusable.yml";
+const EXACT_TARGET_REF = "1".repeat(40);
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+function writeArtifact(fileName: string, payload: unknown) {
+  const root = tempDirs.make("openclaw-docker-e2e-helper-");
+  const file = path.join(root, fileName);
+  writeFileSync(file, `${JSON.stringify(payload)}\n`, "utf8");
+  return file;
+}
 
 function runHelper(script: string, ...args: Array<string | Record<string, string>>) {
   const maybeEnv = args.at(-1);
@@ -11,7 +30,10 @@ function runHelper(script: string, ...args: Array<string | Record<string, string
     maybeEnv && typeof maybeEnv === "object"
       ? (args.pop() as unknown as Record<string, string>)
       : {};
-  return spawnSync(process.execPath, [script, ...(args as string[])], {
+  const nodeArgs = script.endsWith(".mts")
+    ? ["--import", "tsx", script, ...(args as string[])]
+    : [script, ...(args as string[])];
+  return spawnSync(process.execPath, nodeArgs, {
     cwd: process.cwd(),
     encoding: "utf8",
     env: {
@@ -23,6 +45,95 @@ function runHelper(script: string, ...args: Array<string | Record<string, string
   });
 }
 
+function rerun(...args: Array<string | Record<string, string>>) {
+  return runHelper("scripts/docker-e2e-rerun.mts", ...args);
+}
+
+function writeFailures(overrides: Record<string, unknown> = {}) {
+  return writeArtifact("failures.json", {
+    lanes: [{ name: "gateway-network", status: 1 }],
+    status: "failed",
+    ...overrides,
+  });
+}
+
+function expectUsageError(result: ReturnType<typeof runHelper>, message: string) {
+  expect(result).toMatchObject({ status: 1, stdout: "" });
+  expect(result.stderr).toContain(message);
+  expect(result.stderr).not.toContain("Error:");
+  expect(result.stderr).not.toContain("at file:");
+}
+
+function expectSuccess(result: ReturnType<typeof runHelper>) {
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).toBe("");
+  return result.stdout;
+}
+
+function expectText(text: string, included: readonly string[], excluded: readonly string[] = []) {
+  for (const value of included) {
+    expect(text).toContain(value);
+  }
+  for (const value of excluded) {
+    expect(text).not.toContain(value);
+  }
+}
+
+function mockGitHub(
+  root: string,
+  artifactNames: string[],
+  download: { nested?: string; mixed?: boolean; collision?: boolean },
+  runInfo: Record<string, unknown> = {},
+) {
+  const info = {
+    headBranch: "main",
+    headSha: "f".repeat(40),
+    url: "https://example.invalid/run",
+    workflowName: "Live E2E",
+    ...runInfo,
+  };
+  const binDir = path.join(root, "bin");
+  const ghPath = path.join(binDir, "gh");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    ghPath,
+    `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+const download = ${JSON.stringify(download)};
+if (args[0] === 'run' && args[1] === 'view') {
+  console.log(JSON.stringify(${JSON.stringify(info)}));
+} else if (args[0] === 'api') {
+  console.log(JSON.stringify(${JSON.stringify(artifactNames.map((name) => ({ expired: false, name })))}));
+} else if (args[0] === 'run' && args[1] === 'download') {
+  const name = args[args.indexOf('--name') + 1];
+  const dir = args[args.indexOf('--dir') + 1];
+  const target = path.join(dir, download.nested ?? '');
+  fs.mkdirSync(target, { recursive: true });
+  if (download.collision) {
+    fs.writeFileSync(path.join(target, 'targeted-plan.json'), '{}', { flag: 'wx' });
+  }
+  fs.writeFileSync(path.join(target, 'failures.json'), JSON.stringify({
+    lanes: [{ name: name.endsWith('-b') ? 'install-e2e' : 'gateway-network', status: 1 }],
+    ref: (download.mixed ? (name.endsWith('-a') ? 'a' : 'b') : 'd').repeat(40),
+    status: 'failed',
+  }));
+} else {
+  console.error('unexpected gh args: ' + args.join(' '));
+  process.exit(1);
+}
+`,
+    "utf8",
+  );
+  chmodSync(ghPath, 0o755);
+  return { PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` };
+}
+
+function rerunGitHub(env: Record<string, string>, ...args: string[]) {
+  return rerun("12345", "--repo", "openclaw/openclaw", ...args, env);
+}
+
 function downloadedDir(stdout: string) {
   const match = stdout.match(/^Downloaded: (.+)$/mu);
   const dir = match?.[1];
@@ -32,441 +143,203 @@ function downloadedDir(stdout: string) {
   return dir;
 }
 
-describe("Docker E2E helper CLIs", () => {
-  it("prints scheduler helper help without throwing a stack trace", () => {
-    const result = runHelper("scripts/docker-e2e.mjs", "--help");
+function expectDeclaredDispatchInputs(stdout: string): void {
+  const workflow = parse(readFileSync(LIVE_E2E_WORKFLOW, "utf8")) as {
+    on?: { workflow_dispatch?: { inputs?: Record<string, unknown> } };
+  };
+  const declared = new Set(Object.keys(workflow.on?.workflow_dispatch?.inputs ?? {}));
+  const commands = stdout.split(/\r?\n/u).filter((line) => line.includes("gh workflow run"));
+  expect(commands.length).toBeGreaterThan(0);
+  for (const line of commands) {
+    const command = line.slice(line.indexOf("gh workflow run"));
+    const emitted = [...command.matchAll(/(?:^|\s)-f\s+([a-z0-9_]+)=/gu)].flatMap((match) =>
+      match[1] === undefined ? [] : [match[1]],
+    );
+    expect(emitted.length).toBeGreaterThan(0);
+    for (const input of emitted) {
+      expect(declared.has(input), `undeclared workflow_dispatch input: ${input}`).toBe(true);
+    }
+  }
+}
 
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("node scripts/docker-e2e.mjs github-outputs <plan.json>");
+describe("Docker E2E helper CLIs", () => {
+  it.each([
+    ["docker-e2e.mjs", "node scripts/docker-e2e.mjs github-outputs <plan.json>"],
+    [
+      "docker-e2e-timings.mts",
+      "Usage: node --import tsx scripts/docker-e2e-timings.mts <summary.json|lane-timings.json>",
+    ],
+    [
+      "docker-e2e-rerun.mts",
+      "node --import tsx scripts/docker-e2e-rerun.mts <run-id|summary.json|failures.json>",
+    ],
+  ])("prints %s help without processing inputs", (script, usage) => {
+    const result = runHelper(`scripts/${script}`, "--help");
+    expect(result).toMatchObject({ status: 0, stderr: "" });
+    expect(result.stdout).toContain(usage);
   });
 
   it("prints scheduler helper usage errors without a Node stack trace", () => {
-    const result = runHelper("scripts/docker-e2e.mjs");
-
-    expect(result.status).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toContain("node scripts/docker-e2e.mjs github-outputs <plan.json>");
-    expect(result.stderr).not.toContain("Error:");
-    expect(result.stderr).not.toContain("at file:");
+    expectUsageError(
+      runHelper("scripts/docker-e2e.mjs"),
+      "node scripts/docker-e2e.mjs github-outputs <plan.json>",
+    );
   });
 
   it("rejects oversized scheduler helper JSON artifacts without a Node stack trace", () => {
-    const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-helper-`);
-    try {
-      const file = path.join(root, "summary.json");
-      writeFileSync(file, `${JSON.stringify({ filler: "x".repeat(128) })}\n`, "utf8");
+    const file = writeArtifact("summary.json", { filler: "x".repeat(128) });
 
-      const result = runHelper("scripts/docker-e2e.mjs", "failed-reruns", file, {
-        OPENCLAW_DOCKER_E2E_JSON_ARTIFACT_MAX_BYTES: "64",
-      });
+    const result = runHelper("scripts/docker-e2e.mjs", "failed-reruns", file, {
+      OPENCLAW_DOCKER_E2E_JSON_ARTIFACT_MAX_BYTES: "64",
+    });
 
-      expect(result.status).toBe(1);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toContain("JSON artifact exceeded 64 bytes");
-      expect(result.stderr).not.toContain("Error:");
-      expect(result.stderr).not.toContain("at file:");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
-  });
-
-  it("prints timings help without treating --help as an artifact path", () => {
-    const result = runHelper("scripts/docker-e2e-timings.mjs", "--help");
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(result.stdout).toContain(
-      "Usage: node scripts/docker-e2e-timings.mjs <summary.json|lane-timings.json>",
-    );
-  });
-
-  it("rejects malformed timings limits without a Node stack trace", () => {
-    const result = runHelper("scripts/docker-e2e-timings.mjs", "summary.json", "--limit=1e3");
-
-    expect(result.status).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toContain("--limit must be a positive integer");
-    expect(result.stderr).not.toContain("Error:");
-    expect(result.stderr).not.toContain("at file:");
+    expectUsageError(result, "JSON artifact exceeded 64 bytes");
   });
 
   it("rejects unknown timings options without treating them as artifact paths", () => {
-    const result = runHelper("scripts/docker-e2e-timings.mjs", "--wat");
+    const result = runHelper("scripts/docker-e2e-timings.mts", "--wat");
 
-    expect(result.status).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toContain("unknown argument: --wat");
+    expectUsageError(result, "unknown argument: --wat");
     expect(result.stderr).toContain(
-      "Usage: node scripts/docker-e2e-timings.mjs <summary.json|lane-timings.json>",
+      "Usage: node --import tsx scripts/docker-e2e-timings.mts <summary.json|lane-timings.json>",
     );
     expect(result.stderr).not.toContain("ENOENT");
-    expect(result.stderr).not.toContain("Error:");
-    expect(result.stderr).not.toContain("at file:");
-  });
-
-  it("rejects oversized timing JSON artifacts without a Node stack trace", () => {
-    const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-timings-`);
-    try {
-      const file = path.join(root, "summary.json");
-      writeFileSync(file, `${JSON.stringify({ filler: "x".repeat(128) })}\n`, "utf8");
-
-      const result = runHelper("scripts/docker-e2e-timings.mjs", file, {
-        OPENCLAW_DOCKER_E2E_JSON_ARTIFACT_MAX_BYTES: "64",
-      });
-
-      expect(result.status).toBe(1);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toContain("JSON artifact exceeded 64 bytes");
-      expect(result.stderr).not.toContain("Error:");
-      expect(result.stderr).not.toContain("at file:");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
   });
 
   it("rejects missing timings limits without a Node stack trace", () => {
     for (const limit of [undefined, "-h"]) {
-      const args = ["scripts/docker-e2e-timings.mjs", "summary.json", "--limit"];
-      const result = runHelper(...(limit === undefined ? args : [...args, limit]));
+      const args = ["scripts/docker-e2e-timings.mts", "summary.json", "--limit"];
+      const result = runHelper(args[0]!, ...args.slice(1), ...(limit === undefined ? [] : [limit]));
 
-      expect(result.status).toBe(1);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toContain("--limit requires a value");
-      expect(result.stderr).not.toContain("Error:");
-      expect(result.stderr).not.toContain("at file:");
+      expectUsageError(result, "--limit requires a value");
     }
   });
 
-  it("prints rerun help without detecting the GitHub repository", () => {
-    const result = runHelper("scripts/docker-e2e-rerun.mjs", "--help");
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(result.stdout).toContain(
-      "node scripts/docker-e2e-rerun.mjs <run-id|summary.json|failures.json>",
+  it("prints local cleanup reruns without synthesizing Docker lane reruns from failures.json", () => {
+    const result = rerun(
+      writeFailures({
+        lanes: [
+          {
+            name: "cleanup-smoke",
+            rerunCommand: "pnpm test:docker:cleanup",
+            status: 42,
+            targetable: false,
+          },
+        ],
+        ref: "HEAD",
+      }),
+    );
+    expectText(
+      expectSuccess(result),
+      [
+        "Failed Docker E2E entries: cleanup-smoke",
+        "No targetable failed Docker E2E lanes found.",
+        "- cleanup-smoke: pnpm test:docker:cleanup",
+      ],
+      ["docker_lanes='cleanup-smoke'"],
     );
   });
 
-  it("rejects oversized rerun JSON artifacts without a Node stack trace", () => {
-    const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-rerun-`);
-    try {
-      const file = path.join(root, "summary.json");
-      writeFileSync(file, `${JSON.stringify({ filler: "x".repeat(128) })}\n`, "utf8");
-
-      const result = runHelper("scripts/docker-e2e-rerun.mjs", file, "--ref", "abc123", {
-        OPENCLAW_DOCKER_E2E_JSON_ARTIFACT_MAX_BYTES: "64",
-      });
-
-      expect(result.status).toBe(1);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toContain("JSON artifact exceeded 64 bytes");
-      expect(result.stderr).not.toContain("Error:");
-      expect(result.stderr).not.toContain("at file:");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
-  });
-
-  it.each(["summary.json", "failures.json"])(
-    "prints local cleanup reruns without synthesizing Docker lane reruns from %s",
-    (fileName) => {
-      const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-rerun-`);
-      try {
-        const cleanupFailure = {
-          lane: "cleanup-smoke",
-          logFile: "cleanup-smoke.log",
-          name: "cleanup-smoke",
-          rerunCommand: "pnpm test:docker:cleanup",
-          status: 42,
-          targetable: false,
-        };
-        const payload =
-          fileName === "summary.json"
-            ? {
-                failures: [cleanupFailure],
-                lanes: [
-                  {
-                    name: "gateway-network",
-                    status: 0,
-                  },
-                ],
-                status: "failed",
-              }
-            : {
-                lanes: [cleanupFailure],
-                status: "failed",
-              };
-        const file = path.join(root, fileName);
-        writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-
-        const result = runHelper("scripts/docker-e2e-rerun.mjs", file, "--ref", "abc123");
-
-        expect(result.status).toBe(0);
-        expect(result.stderr).toBe("");
-        expect(result.stdout).toContain("Failed Docker E2E entries: cleanup-smoke");
-        expect(result.stdout).toContain("No targetable failed Docker E2E lanes found.");
-        expect(result.stdout).toContain("- cleanup-smoke: pnpm test:docker:cleanup");
-        expect(result.stdout).not.toContain("docker_lanes='cleanup-smoke'");
-      } finally {
-        rmSync(root, { force: true, recursive: true });
-      }
-    },
-  );
-
   it("ignores artifact-provided GitHub rerun commands", () => {
-    const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-rerun-command-`);
-    try {
-      const file = path.join(root, "failures.json");
-      writeFileSync(
-        file,
-        `${JSON.stringify(
-          {
-            lanes: [
-              {
-                ghWorkflowCommand: "echo poisoned-command",
-                name: "gateway-network",
-                status: 1,
-              },
-            ],
-            status: "failed",
-          },
-          null,
-          2,
-        )}\n`,
-        "utf8",
-      );
+    const file = writeFailures({
+      lanes: [{ ghWorkflowCommand: "echo poisoned-command", name: "gateway-network", status: 1 }],
+    });
 
-      const result = runHelper("scripts/docker-e2e-rerun.mjs", file, "--ref", "abc123");
+    const result = rerun(file, "--ref", EXACT_TARGET_REF);
 
-      expect(result.status).toBe(0);
-      expect(result.stderr).toBe("");
-      expect(result.stdout).toContain("docker_lanes='gateway-network'");
-      expect(result.stdout).not.toContain("poisoned-command");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    expectText(expectSuccess(result), ["docker_lanes='gateway-network'"], ["poisoned-command"]);
   });
 
-  it("preserves whitelisted rerun inputs from artifact commands", () => {
-    const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-rerun-inputs-`);
-    try {
-      const file = path.join(root, "failures.json");
-      writeFileSync(
-        file,
-        `${JSON.stringify(
-          {
-            lanes: [
-              {
-                ghWorkflowCommand:
-                  "gh workflow run 'openclaw-live-and-e2e-checks-reusable.yml' --ref 'release/2026.6' -f package_artifact_run_id='12345' -f package_artifact_name='docker-e2e-package' -f docker_e2e_bare_image='ghcr.io/openclaw/openclaw-bare:test' -f published_upgrade_survivor_baselines='openclaw@2026.5.3' -f published_upgrade_survivor_scenarios='plugin-dependency-cleanup' -f unsafe_input='do-not-copy'",
-                name: "published-upgrade-survivor-openclaw-2026-5-3",
-                status: 1,
-              },
-            ],
-            status: "failed",
-          },
-          null,
-          2,
-        )}\n`,
-        "utf8",
-      );
+  it("uses the exact artifact target from summary.json instead of the workflow head", () => {
+    const targetRef = "a".repeat(40);
+    const workflowHead = "b".repeat(40);
+    const file = writeArtifact("summary.json", {
+      github: { selectedSha: targetRef },
+      failures: [{ name: "gateway-network", status: 1 }],
+      lanes: [{ name: "gateway-network", status: 1 }],
+      status: "failed",
+    });
 
-      const result = runHelper("scripts/docker-e2e-rerun.mjs", file, "--ref", "abc123");
-
-      expect(result.status).toBe(0);
-      expect(result.stderr).toBe("");
-      const combinedCommand = result.stdout.match(/Combined GitHub rerun:\n([^\n]+)/u)?.[1] ?? "";
-      expect(combinedCommand).toContain("--ref 'release/2026.6'");
-      expect(combinedCommand).toContain("package_artifact_run_id='12345'");
-      expect(combinedCommand).toContain(
-        "docker_e2e_bare_image='ghcr.io/openclaw/openclaw-bare:test'",
-      );
-      expect(combinedCommand).toContain(
-        "published_upgrade_survivor_baselines='openclaw@2026.5.3'",
-      );
-      expect(combinedCommand).toContain(
-        "published_upgrade_survivor_scenarios='plugin-dependency-cleanup'",
-      );
-      expect(combinedCommand).not.toContain("unsafe_input");
-      expect(result.stdout).toContain("package_artifact_run_id='12345'");
-      expect(result.stdout).toContain(
-        "docker_e2e_bare_image='ghcr.io/openclaw/openclaw-bare:test'",
-      );
-      expect(result.stdout).toContain(
-        "published_upgrade_survivor_baselines='openclaw@2026.5.3'",
-      );
-      expect(result.stdout).toContain(
-        "published_upgrade_survivor_scenarios='plugin-dependency-cleanup'",
-      );
-      expect(result.stdout).not.toContain("unsafe_input");
-      expect(result.stdout).not.toContain("do-not-copy");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    expectText(
+      expectSuccess(rerun(file, { GITHUB_SHA: workflowHead })),
+      [`Ref: ${targetRef}`, `-f ref='${targetRef}'`],
+      [workflowHead],
+    );
   });
 
-  it("groups combined reruns by recovered workflow inputs", () => {
-    const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-rerun-groups-`);
-    try {
-      const file = path.join(root, "failures.json");
-      writeFileSync(
-        file,
-        `${JSON.stringify(
-          {
-            lanes: [
-              {
-                ghWorkflowCommand:
-                  "gh workflow run 'openclaw-live-and-e2e-checks-reusable.yml' --ref 'release/2026.6' -f published_upgrade_survivor_baselines='openclaw@2026.5.3'",
-                name: "published-upgrade-survivor-openclaw-2026-5-3",
-                status: 1,
-              },
-              {
-                ghWorkflowCommand:
-                  "gh workflow run 'openclaw-live-and-e2e-checks-reusable.yml' --ref 'release/2026.6' -f published_upgrade_survivor_baselines='openclaw@2026.5.2'",
-                name: "published-upgrade-survivor-openclaw-2026-5-2",
-                status: 1,
-              },
-            ],
-            status: "failed",
-          },
-          null,
-          2,
-        )}\n`,
-        "utf8",
-      );
+  it("lets an explicit target ref override artifact refs", () => {
+    const artifactRef = "a".repeat(40);
+    const explicitRef = "c".repeat(40);
+    const file = writeFailures({
+      images: { bare: "ghcr.io/openclaw/openclaw-bare:artifact-a" },
+      ref: artifactRef,
+    });
 
-      const result = runHelper("scripts/docker-e2e-rerun.mjs", file, "--ref", "abc123");
+    const result = rerun(file, "--ref", explicitRef);
 
-      expect(result.status).toBe(0);
-      expect(result.stderr).toBe("");
-      expect(result.stdout).toContain("Combined GitHub reruns:");
-      expect(result.stdout).toContain(
-        "- published-upgrade-survivor-openclaw-2026-5-3: gh workflow run",
-      );
-      expect(result.stdout).toContain(
-        "- published-upgrade-survivor-openclaw-2026-5-2: gh workflow run",
-      );
-      expect(result.stdout).toContain(
-        "docker_lanes='published-upgrade-survivor-openclaw-2026-5-3'",
-      );
-      expect(result.stdout).toContain(
-        "docker_lanes='published-upgrade-survivor-openclaw-2026-5-2'",
-      );
-      expect(result.stdout).not.toContain(
-        "docker_lanes='published-upgrade-survivor-openclaw-2026-5-3 published-upgrade-survivor-openclaw-2026-5-2'",
-      );
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`Ref: ${explicitRef}`);
+    expect(result.stdout).toContain(`-f ref='${explicitRef}'`);
+    expect(result.stdout).not.toContain(`-f ref='${artifactRef}'`);
+    expect(result.stdout).not.toContain("docker_e2e_bare_image=");
+    expect(result.stdout).not.toContain("shared_image_policy=existing-only");
   });
 
-  it("merges duplicate lane entries before printing reruns", () => {
-    const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-rerun-merge-`);
-    try {
-      const file = path.join(root, "failures.json");
-      writeFileSync(
-        file,
-        `${JSON.stringify(
-          {
-            lanes: [
-              {
-                name: "published-upgrade-survivor-openclaw-2026-5-3",
-                status: 1,
-              },
-              {
-                ghWorkflowCommand:
-                  "gh workflow run 'openclaw-live-and-e2e-checks-reusable.yml' --ref 'release/2026.6' -f published_upgrade_survivor_baselines='openclaw@2026.5.3'",
-                name: "published-upgrade-survivor-openclaw-2026-5-3",
-                status: 1,
-              },
-            ],
-            status: "failed",
-          },
-          null,
-          2,
-        )}\n`,
-        "utf8",
-      );
+  it.each([
+    [undefined, [], ["missing an exact target ref", "pass --ref explicitly"], ["HEAD"]],
+    ["HEAD", [], ["invalid artifact target ref", "full commit SHA"], []],
+    [undefined, ["--ref", "abc123"], ["exact lowercase 40-character target SHA"], []],
+  ] as const)("rejects invalid target ref %s %j", (ref, args, messages, absent) => {
+    const result = rerun(writeFailures({ ref }), ...args);
+    expect(result).toMatchObject({ status: 1, stdout: "" });
+    expectText(result.stderr, messages, absent);
+  });
 
-      const result = runHelper("scripts/docker-e2e-rerun.mjs", file, "--ref", "abc123");
+  it("preserves declared rerun inputs but ignores package and workflow refs", () => {
+    const file = writeFailures({
+      lanes: [
+        {
+          ghWorkflowCommand:
+            "gh workflow run 'openclaw-live-and-e2e-checks-reusable.yml' --ref 'full-release-validation-temp-deleted' -f package_artifact_run_id='12345' -f package_artifact_name='docker-e2e-package' -f docker_e2e_bare_image='ghcr.io/openclaw/openclaw-bare:test' -f published_upgrade_survivor_baselines='openclaw@2026.5.3' -f published_upgrade_survivor_scenarios='plugin-dependency-cleanup' -f allow_unreleased_changelog=true -f unsafe_input='do-not-copy'",
+          name: "published-upgrade-survivor-openclaw-2026-5-3",
+          status: 1,
+        },
+      ],
+      ref: EXACT_TARGET_REF,
+    });
 
-      expect(result.status).toBe(0);
-      expect(result.stderr).toBe("");
-      const combinedCommand = result.stdout.match(/Combined GitHub rerun:\n([^\n]+)/u)?.[1] ?? "";
-      expect(combinedCommand).toContain("--ref 'release/2026.6'");
-      expect(combinedCommand).toContain(
-        "published_upgrade_survivor_baselines='openclaw@2026.5.3'",
-      );
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    const result = rerun(file, "--ref", EXACT_TARGET_REF);
+
+    expect(result).toMatchObject({ status: 0, stderr: "" });
+    const combinedCommand = result.stdout.match(/Combined GitHub rerun:\n([^\n]+)/u)?.[1] ?? "";
+    const reused = [
+      "docker_e2e_bare_image='ghcr.io/openclaw/openclaw-bare:test'",
+      "shared_image_policy=existing-only",
+      "published_upgrade_survivor_baselines='openclaw@2026.5.3'",
+      "published_upgrade_survivor_scenarios='plugin-dependency-cleanup'",
+    ];
+    const ignored = ["package_artifact_run_id=", "package_artifact_name=", "unsafe_input"];
+    expectText(
+      combinedCommand,
+      [...reused, "allow_unreleased_changelog=true"],
+      [...ignored, "--ref 'full-release-validation-temp-deleted'"],
+    );
+    expectText(result.stdout, reused, [...ignored, "do-not-copy"]);
+    expectDeclaredDispatchInputs(result.stdout);
   });
 
   it("downloads GitHub run artifacts into distinct default directories", () => {
-    const root = mkdtempSync(`${tmpdir()}/openclaw-docker-e2e-rerun-gh-`);
+    const root = tempDirs.make("openclaw-docker-e2e-rerun-gh-");
     const generatedDirs: string[] = [];
     try {
-      const binDir = path.join(root, "bin");
-      const ghPath = path.join(binDir, "gh");
-      mkdirSync(binDir, { recursive: true });
-      writeFileSync(
-        ghPath,
-        [
-          "#!/usr/bin/env node",
-          "const fs = require('node:fs');",
-          "const path = require('node:path');",
-          "const args = process.argv.slice(2);",
-          "if (args[0] === 'run' && args[1] === 'view') {",
-          "  console.log(JSON.stringify({",
-          "    conclusion: 'failure',",
-          "    databaseId: 12345,",
-          "    headBranch: 'main',",
-          "    headSha: 'abc123',",
-          "    status: 'completed',",
-          "    url: 'https://github.com/openclaw/openclaw/actions/runs/12345',",
-          "    workflowName: 'OpenClaw Live and E2E Checks',",
-          "  }));",
-          "  process.exit(0);",
-          "}",
-          "if (args[0] === 'api') {",
-          "  console.log(JSON.stringify([{ expired: false, name: 'docker-e2e-gateway-network' }]));",
-          "  process.exit(0);",
-          "}",
-          "if (args[0] === 'run' && args[1] === 'download') {",
-          "  const dir = args[args.indexOf('--dir') + 1];",
-          "  fs.mkdirSync(path.join(dir, 'artifact'), { recursive: true });",
-          "  fs.writeFileSync(path.join(dir, 'artifact', 'failures.json'), JSON.stringify({",
-          "    lanes: [{ name: 'gateway-network', status: 1 }],",
-          "    status: 'failed',",
-          "  }));",
-          "  process.exit(0);",
-          "}",
-          "console.error(`unexpected gh args: ${args.join(' ')}`);",
-          "process.exit(1);",
-          "",
-        ].join("\n"),
-        "utf8",
+      const env = mockGitHub(
+        root,
+        ["docker-e2e-gateway-network"],
+        { nested: "artifact" },
+        { headSha: "abc123" },
       );
-      chmodSync(ghPath, 0o755);
-
-      const env = {
-        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
-      };
-      const first = runHelper(
-        "scripts/docker-e2e-rerun.mjs",
-        "12345",
-        "--repo",
-        "openclaw/openclaw",
-        env,
-      );
-      const second = runHelper(
-        "scripts/docker-e2e-rerun.mjs",
-        "12345",
-        "--repo",
-        "openclaw/openclaw",
-        env,
-      );
+      const first = rerunGitHub(env);
+      const second = rerunGitHub(env);
 
       expect(first.status, first.stderr).toBe(0);
       expect(second.status, second.stderr).toBe(0);
@@ -474,15 +347,65 @@ describe("Docker E2E helper CLIs", () => {
       const secondDir = downloadedDir(second.stdout);
       generatedDirs.push(firstDir, secondDir);
       expect(firstDir).not.toBe(secondDir);
-      expect(path.basename(firstDir)).toMatch(/^openclaw-docker-e2e-rerun-12345-/u);
-      expect(path.basename(secondDir)).toMatch(/^openclaw-docker-e2e-rerun-12345-/u);
-      expect(existsSync(path.join(firstDir, "artifact", "failures.json"))).toBe(true);
-      expect(existsSync(path.join(secondDir, "artifact", "failures.json"))).toBe(true);
+      for (const [dir, result] of [
+        [firstDir, first],
+        [secondDir, second],
+      ] as const) {
+        expect(path.basename(dir)).toMatch(/^openclaw-docker-e2e-rerun-12345-/u);
+        const artifactDir = readdirSync(dir, { withFileTypes: true }).find((entry) =>
+          entry.isDirectory(),
+        );
+        expect(artifactDir).toBeDefined();
+        expect(
+          existsSync(path.join(dir, artifactDir?.name ?? "", "artifact", "failures.json")),
+        ).toBe(true);
+        expect(result.stdout).toContain(`-f ref='${"d".repeat(40)}'`);
+      }
+      expect(first.stdout).not.toContain("-f ref='abc123'");
     } finally {
       for (const dir of generatedDirs) {
         rmSync(dir, { force: true, recursive: true });
       }
-      rmSync(root, { force: true, recursive: true });
     }
+  });
+
+  it("isolates files with the same name across downloaded artifacts", () => {
+    const root = tempDirs.make("openclaw-docker-e2e-rerun-collisions-");
+    const env = mockGitHub(root, ["docker-e2e-a", "docker-e2e-b"], { collision: true });
+    const outputDir = path.join(root, "artifacts");
+
+    const result = rerunGitHub(env, "--dir", outputDir);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("gateway-network");
+    expect(result.stdout).toContain("install-e2e");
+    const artifactDirs = readdirSync(outputDir, { withFileTypes: true }).filter((entry) =>
+      entry.isDirectory(),
+    );
+    expect(artifactDirs).toHaveLength(2);
+    for (const entry of artifactDirs) {
+      expect(existsSync(path.join(outputDir, entry.name, "targeted-plan.json"))).toBe(true);
+    }
+  });
+
+  it("fails closed when downloaded artifacts contain mixed target refs", () => {
+    const root = tempDirs.make("openclaw-docker-e2e-rerun-mixed-refs-");
+    const env = mockGitHub(root, ["docker-e2e-a", "docker-e2e-b"], {
+      nested: "nested",
+      mixed: true,
+    });
+    const outputDir = path.join(root, "artifacts");
+
+    const result = rerunGitHub(env, "--dir", outputDir);
+
+    expect(result).toMatchObject({ status: 1, stdout: "" });
+    expect(result.stderr).toContain("mixed target refs");
+    expect(result.stderr).toContain("a".repeat(40));
+    expect(result.stderr).toContain("b".repeat(40));
+
+    const explicitRef = "c".repeat(40);
+    const override = rerunGitHub(env, "--dir", outputDir, "--ref", explicitRef);
+    expect(override.status, override.stderr).toBe(0);
+    expect(override.stdout).toContain(`-f ref='${explicitRef}'`);
   });
 });

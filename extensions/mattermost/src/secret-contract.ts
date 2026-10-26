@@ -1,60 +1,29 @@
-// Mattermost plugin module implements secret contract behavior.
+import { hasConfiguredAccountValue } from "openclaw/plugin-sdk/account-helpers";
 import {
   collectSimpleChannelFieldAssignments,
-  getChannelSurface,
-  type ResolverContext,
-  type SecretDefaults,
-  type SecretTargetRegistryEntry,
+  createChannelSecretContract,
 } from "openclaw/plugin-sdk/channel-secret-basic-runtime";
 
-export const secretTargetRegistryEntries: SecretTargetRegistryEntry[] = [
-  {
-    id: "channels.mattermost.accounts.*.botToken",
-    targetType: "channels.mattermost.accounts.*.botToken",
-    configFile: "openclaw.json",
-    pathPattern: "channels.mattermost.accounts.*.botToken",
-    secretShape: "secret_input",
-    expectedResolvedValue: "string",
-    includeInPlan: true,
-    includeInConfigure: true,
-    includeInAudit: true,
+export const channelSecrets = createChannelSecretContract({
+  channelKey: "mattermost",
+  account: ["botToken"],
+  channel: ["botToken"],
+  // Matches account listing: a root baseUrl plus a root or environment botToken keeps the
+  // implicit default account, so the root ref has to be collected for that account too.
+  hasImplicitDefaultAccount: ({ channel, context }) =>
+    Boolean(
+      typeof channel.baseUrl === "string" &&
+      channel.baseUrl.trim() &&
+      (hasConfiguredAccountValue(channel.botToken) || context.env.MATTERMOST_BOT_TOKEN?.trim()),
+    ),
+  collect(params) {
+    collectSimpleChannelFieldAssignments({
+      ...params,
+      field: "botToken",
+      topInactiveReason: "no enabled account inherits this top-level Mattermost botToken.",
+      accountInactiveReason: "Mattermost account is disabled.",
+    });
   },
-  {
-    id: "channels.mattermost.botToken",
-    targetType: "channels.mattermost.botToken",
-    configFile: "openclaw.json",
-    pathPattern: "channels.mattermost.botToken",
-    secretShape: "secret_input",
-    expectedResolvedValue: "string",
-    includeInPlan: true,
-    includeInConfigure: true,
-    includeInAudit: true,
-  },
-];
+});
 
-export function collectRuntimeConfigAssignments(params: {
-  config: { channels?: Record<string, unknown> };
-  defaults?: SecretDefaults;
-  context: ResolverContext;
-}): void {
-  const resolved = getChannelSurface(params.config, "mattermost");
-  if (!resolved) {
-    return;
-  }
-  const { channel: mattermost, surface } = resolved;
-  collectSimpleChannelFieldAssignments({
-    channelKey: "mattermost",
-    field: "botToken",
-    channel: mattermost,
-    surface,
-    defaults: params.defaults,
-    context: params.context,
-    topInactiveReason: "no enabled account inherits this top-level Mattermost botToken.",
-    accountInactiveReason: "Mattermost account is disabled.",
-  });
-}
-
-export const channelSecrets = {
-  secretTargetRegistryEntries,
-  collectRuntimeConfigAssignments,
-};
+export const { secretTargetRegistryEntries, collectRuntimeConfigAssignments } = channelSecrets;

@@ -1,18 +1,14 @@
-// Resolves plugin root directories for bundled and installed plugins.
 import path from "node:path";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
-import { resolveConfigDir, resolveUserPath } from "../utils.js";
+import { resolveUserPath } from "../utils.js";
 import { resolveBundledPluginsDir } from "./bundled-dir.js";
+import { resolveOpenClawDevSourceRoot } from "./dev-source-root.js";
+import { resolveDefaultPluginExtensionsDir } from "./install-paths.js";
 
 export type PluginSourceRoots = {
   stock?: string;
   global: string;
   workspace?: string;
-};
-
-export type PluginCacheInputs = {
-  roots: PluginSourceRoots;
-  loadPaths: string[];
 };
 
 export function resolvePluginSourceRoots(params: {
@@ -22,7 +18,7 @@ export function resolvePluginSourceRoots(params: {
   const env = params.env ?? process.env;
   const workspaceRoot = params.workspaceDir ? resolveUserPath(params.workspaceDir, env) : undefined;
   const stock = resolveBundledPluginsDir(env);
-  const global = path.join(resolveConfigDir(env), "extensions");
+  const global = resolveDefaultPluginExtensionsDir(env);
   const workspace = workspaceRoot ? path.join(workspaceRoot, ".openclaw", "extensions") : undefined;
   return { stock, global, workspace };
 }
@@ -30,9 +26,13 @@ export function resolvePluginSourceRoots(params: {
 // Shared env-aware key inputs for plugin loader registry reuse.
 export function resolvePluginCacheInputs(params: {
   workspaceDir?: string;
-  loadPaths?: string[];
+  loadPaths?: readonly string[];
   env?: NodeJS.ProcessEnv;
-}): PluginCacheInputs {
+}): {
+  roots: PluginSourceRoots;
+  loadPaths: string[];
+  devSourceRoot: string | null;
+} {
   const env = params.env ?? process.env;
   const roots = resolvePluginSourceRoots({
     workspaceDir: params.workspaceDir,
@@ -42,5 +42,5 @@ export function resolvePluginCacheInputs(params: {
   const loadPaths = normalizeStringEntries(
     (params.loadPaths ?? []).filter((entry): entry is string => typeof entry === "string"),
   ).map((entry) => resolveUserPath(entry, env));
-  return { roots, loadPaths };
+  return { roots, loadPaths, devSourceRoot: resolveOpenClawDevSourceRoot(env) };
 }

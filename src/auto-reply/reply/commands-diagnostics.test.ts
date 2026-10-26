@@ -1,14 +1,55 @@
 // Tests diagnostics command output and runtime diagnostic toggles.
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
+import * as sessionReads from "../../config/sessions/session-entry-read-runtime.js";
+import type {
+  LegacyInteractiveReply,
+  MessagePresentationAction,
+} from "../../interactive/payload.js";
 import { clearPluginCommands, registerPluginCommand } from "../../plugins/commands.js";
 import { createPluginRegistry } from "../../plugins/registry.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import type { PluginRuntime } from "../../plugins/runtime/types.js";
-import { createBundledPluginRecord } from "../../plugins/status.test-helpers.js";
-import type { PluginCommandContext, PluginCommandHandler } from "../../plugins/types.js";
+import { createBundledPluginRecord } from "../../plugins/status.test-fixtures.js";
+import type { OpenClawPluginCommandDefinition, PluginCommandContext } from "../../plugins/types.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
+
+type PluginCommandHandler = OpenClawPluginCommandDefinition["handler"];
 import type { MsgContext } from "../templating.js";
-import { createDiagnosticsCommandHandler } from "./commands-diagnostics.js";
+import { handleDiagnosticsCommand as defaultDiagnosticsCommandHandler } from "./commands-diagnostics.js";
 import type { HandleCommandsParams } from "./commands-types.js";
+
+const diagnosticsCommandMocks = vi.hoisted(() => ({
+  createExecTool: vi.fn(),
+  deliverPrivateCommandReply:
+    vi.fn<typeof import("./commands-private-route.js").deliverPrivateCommandReply>(),
+  resolvePrivateCommandRouteTargets:
+    vi.fn<typeof import("./commands-private-route.js").resolvePrivateCommandRouteTargets>(),
+}));
+
+vi.mock("../../agents/bash-tools.js", async () => {
+  const actual = await vi.importActual<typeof import("../../agents/bash-tools.js")>(
+    "../../agents/bash-tools.js",
+  );
+  return {
+    ...actual,
+    createExecTool: diagnosticsCommandMocks.createExecTool,
+  };
+});
+
+vi.mock("./commands-private-route.js", async () => {
+  const actual = await vi.importActual<typeof import("./commands-private-route.js")>(
+    "./commands-private-route.js",
+  );
+  return {
+    ...actual,
+    deliverPrivateCommandReply: diagnosticsCommandMocks.deliverPrivateCommandReply,
+    resolvePrivateCommandRouteTargets: diagnosticsCommandMocks.resolvePrivateCommandRouteTargets,
+  };
+});
 
 type ExecCall = {
   defaults: unknown;
@@ -17,6 +58,7 @@ type ExecCall = {
 
 type ExecDefaults = {
   accountId?: string;
+  approvalReviewerDeviceId?: string;
   approvalFollowup?: () => Promise<string | undefined>;
   approvalFollowupMode?: string;
   approvalFollowupText?: string;
@@ -32,7 +74,6 @@ type ExecDefaults = {
 type ExecParams = {
   ask?: string;
   command?: string;
-  security?: string;
 };
 
 type DiagnosticsSession = {
@@ -42,6 +83,11 @@ type DiagnosticsSession = {
   sessionFile?: string;
   sessionId?: string;
   sessionKey?: string;
+};
+
+type PrivateDiagnosticsReply = {
+  targets: Array<{ channel: string; to: string; accountId?: string | null }>;
+  text?: string;
 };
 
 function requireExecCall(execCalls: ExecCall[], index = 0) {
@@ -105,9 +151,7 @@ function buildDiagnosticsParams(
   } as HandleCommandsParams;
 }
 
-function registerHostTrustedReservedCommandForTest(
-  command: Parameters<typeof registerPluginCommand>[1],
-) {
+function registerCodexCommandForTest(handler: PluginCommandHandler) {
   const pluginRegistry = createPluginRegistry({
     logger: {
       info() {},
@@ -118,7 +162,23 @@ function registerHostTrustedReservedCommandForTest(
     runtime: {} as PluginRuntime,
     activateGlobalSideEffects: true,
   });
-  pluginRegistry.registerCommand(createBundledPluginRecord(command.name), command);
+  pluginRegistry.registerCommand(createBundledPluginRecord("codex"), {
+    name: "codex",
+    description: "Codex command",
+    acceptsArgs: true,
+    ownership: "reserved",
+    handler,
+  });
+  setActivePluginRegistry(pluginRegistry.registry);
+}
+
+function createCodexDiagnosticsSessionEntry() {
+  return {
+    sessionId: "session-1",
+    sessionFile: "/tmp/session.jsonl",
+    updatedAt: 1,
+    agentHarnessId: "codex",
+  };
 }
 
 function registerCodexDiagnosticsCommandForTest(
@@ -187,31 +247,28 @@ function registerCodexDiagnosticsCommandForTest(
       },
     };
   });
-  registerHostTrustedReservedCommandForTest({
-    name: "codex",
-    description: "Codex command",
-    acceptsArgs: true,
-    handler: commandHandler,
-    ownership: "reserved",
-  });
+  registerCodexCommandForTest(commandHandler);
   return { calls, commandHandler };
 }
 
 function createDiagnosticsHandlerForTest(
   options: {
     privateTargets?: Array<{ channel: string; to: string; accountId?: string | null }>;
+    deliveryOutcome?: Awaited<
+      ReturnType<typeof diagnosticsCommandMocks.deliverPrivateCommandReply>
+    >;
     execResult?: {
       content: Array<{ type: "text"; text: string }>;
       details?: { status: string; [key: string]: unknown };
     };
   } = {},
 ) {
+  diagnosticsCommandMocks.createExecTool.mockReset();
+  diagnosticsCommandMocks.deliverPrivateCommandReply.mockReset();
+  diagnosticsCommandMocks.resolvePrivateCommandRouteTargets.mockReset();
   const execCalls: ExecCall[] = [];
-  const privateReplies: Array<{
-    targets: Array<{ channel: string; to: string; accountId?: string | null }>;
-    text?: string;
-  }> = [];
-  const createExecTool = vi.fn((defaults: unknown) => ({
+  const privateReplies: PrivateDiagnosticsReply[] = [];
+  diagnosticsCommandMocks.createExecTool.mockImplementation((defaults: unknown) => ({
     execute: vi.fn(async (_toolCallId: string, params: unknown) => {
       execCalls.push({ defaults, params });
       return (
@@ -236,17 +293,25 @@ function createDiagnosticsHandlerForTest(
       );
     }),
   }));
+  diagnosticsCommandMocks.resolvePrivateCommandRouteTargets.mockResolvedValue(
+    options.privateTargets ?? [],
+  );
+  diagnosticsCommandMocks.deliverPrivateCommandReply.mockImplementation(
+    async ({
+      targets,
+      reply,
+    }: {
+      targets: PrivateDiagnosticsReply["targets"];
+      reply: { text?: string };
+    }) => {
+      privateReplies.push({ targets, text: reply.text });
+      return options.deliveryOutcome ?? "delivered";
+    },
+  );
   return {
     execCalls,
     privateReplies,
-    handleDiagnosticsCommand: createDiagnosticsCommandHandler({
-      createExecTool: createExecTool as never,
-      resolvePrivateDiagnosticsTargets: vi.fn(async () => options.privateTargets ?? []),
-      deliverPrivateDiagnosticsReply: vi.fn(async ({ targets, reply }) => {
-        privateReplies.push({ targets, text: reply.text });
-        return true;
-      }),
-    }),
+    handleDiagnosticsCommand: defaultDiagnosticsCommandHandler,
   };
 }
 
@@ -255,35 +320,6 @@ afterEach(() => {
 });
 
 describe("diagnostics command", () => {
-  it("requests Gateway diagnostics approval without a duplicate pending chat reply", async () => {
-    const { execCalls, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
-    const result = await handleDiagnosticsCommand(buildDiagnosticsParams("/diagnostics"), true);
-
-    expect(result?.shouldContinue).toBe(false);
-    expect(result?.reply).toBeUndefined();
-    expect(execCalls).toHaveLength(1);
-    const execCall = requireExecCall(execCalls);
-    expect(execCall.defaults.host).toBe("gateway");
-    expect(execCall.defaults.security).toBe("allowlist");
-    expect(execCall.defaults.ask).toBe("always");
-    expect(execCall.defaults.trigger).toBe("diagnostics");
-    expect(execCall.defaults.approvalFollowupMode).toBe("direct");
-    expect(execCall.defaults.approvalWarningText).toContain(
-      "Diagnostics can include sensitive local logs and host-level runtime metadata.",
-    );
-    expect(execCall.defaults.approvalWarningText).toContain(
-      "https://docs.openclaw.ai/gateway/diagnostics",
-    );
-    expect(execCall.params.security).toBe("allowlist");
-    expect(execCall.params.ask).toBe("always");
-    const command = execCall.params.command ?? "";
-    expect(command).toContain("gateway");
-    expect(command).toContain("diagnostics");
-    expect(command).toContain("export");
-    expect(command).toContain("--json");
-    expect(command).not.toBe("openclaw gateway diagnostics export --json");
-  });
-
   it("uses the originating Telegram route for native diagnostics followups", async () => {
     const { execCalls, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
     const params = buildDiagnosticsParams("/diagnostics", {
@@ -351,17 +387,11 @@ describe("diagnostics command", () => {
   it("wraps Codex feedback upload into the Gateway diagnostics approval", async () => {
     const { calls } = registerCodexDiagnosticsCommandForTest(async () => null);
     const { execCalls, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
-    const result = await handleDiagnosticsCommand(
-      buildDiagnosticsParams("/diagnostics flaky tool call", {
-        sessionEntry: {
-          sessionId: "session-1",
-          sessionFile: "/tmp/session.jsonl",
-          updatedAt: 1,
-          agentHarnessId: "codex",
-        },
-      }),
-      true,
-    );
+    const params = buildDiagnosticsParams("/diagnostics flaky tool call", {
+      sessionEntry: createCodexDiagnosticsSessionEntry(),
+    });
+    params.ctx.ApprovalReviewerDeviceId = "device-diagnostics-reviewer";
+    const result = await handleDiagnosticsCommand(params, true);
 
     expect(result?.shouldContinue).toBe(false);
     expect(result?.reply).toBeUndefined();
@@ -369,15 +399,26 @@ describe("diagnostics command", () => {
     expect(calls[0]?.args).toBe("diagnostics flaky tool call");
     expect(calls[0]?.diagnosticsPreviewOnly).toBe(true);
     expect(calls[0]?.senderIsOwner).toBe(true);
-    expect(calls[0]?.sessionFile).toBe("/tmp/session.jsonl");
+    expect(calls[0]?.sessionFile).toBe("agent:main:whatsapp:direct:user-1");
     const diagnosticsSessions = requireDiagnosticsSessions(calls[0]);
     expect(diagnosticsSessions).toHaveLength(1);
     expect(diagnosticsSessions[0]?.agentHarnessId).toBe("codex");
     expect(diagnosticsSessions[0]?.sessionId).toBe("session-1");
-    expect(diagnosticsSessions[0]?.sessionFile).toBe("/tmp/session.jsonl");
+    expect(diagnosticsSessions[0]?.sessionFile).toBe("agent:main:whatsapp:direct:user-1");
     expect(diagnosticsSessions[0]?.channel).toBe("whatsapp");
     expect(diagnosticsSessions[0]?.accountId).toBe("account-1");
-    const { defaults } = requireExecCall(execCalls);
+    expect(execCalls).toHaveLength(1);
+    const { defaults, params: execParams } = requireExecCall(execCalls);
+    expect(defaults.host).toBe("gateway");
+    expect(defaults.security).toBe("allowlist");
+    expect(defaults.ask).toBe("always");
+    expect(defaults.trigger).toBe("diagnostics");
+    expect(defaults.approvalReviewerDeviceId).toBe("device-diagnostics-reviewer");
+    expect(defaults.approvalFollowupMode).toBe("direct");
+    expect(execParams.ask).toBe("always");
+    expect(defaults.approvalWarningText).toContain(
+      "Diagnostics can include sensitive local logs and host-level runtime metadata.",
+    );
     expect(defaults.approvalWarningText).toContain("OpenAI Codex harness:");
     expect(defaults.approvalWarningText).toContain(
       "Approving diagnostics will also send this thread's feedback bundle to OpenAI servers.",
@@ -393,7 +434,7 @@ describe("diagnostics command", () => {
     expect(calls[1]?.diagnosticsUploadApproved).toBe(true);
   });
 
-  it("passes sidecar-bound session files to Codex diagnostics even when harness metadata is stale", async () => {
+  it("passes canonical session identities to Codex diagnostics when harness metadata is stale", async () => {
     const { calls } = registerCodexDiagnosticsCommandForTest(async () => null);
     const { execCalls, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
     const result = await handleDiagnosticsCommand(
@@ -414,7 +455,7 @@ describe("diagnostics command", () => {
             sessionId: "discord-session",
             sessionFile: "/tmp/discord.jsonl",
             updatedAt: 2,
-            channel: "discord",
+            delivery: normalizeSessionDeliveryState({ context: { channel: "discord" } }),
           },
         },
       }),
@@ -428,30 +469,73 @@ describe("diagnostics command", () => {
     expect(diagnosticsSessions).toHaveLength(2);
     expect(diagnosticsSessions[0]?.sessionKey).toBe("agent:main:telegram:direct:user-1");
     expect(diagnosticsSessions[0]?.sessionId).toBe("telegram-session");
-    expect(diagnosticsSessions[0]?.sessionFile).toBe("/tmp/telegram.jsonl");
+    expect(diagnosticsSessions[0]?.sessionFile).toBe("agent:main:telegram:direct:user-1");
     expect(diagnosticsSessions[0]?.channel).toBe("whatsapp");
     expect(diagnosticsSessions[1]?.sessionKey).toBe("agent:main:discord:channel:123");
     expect(diagnosticsSessions[1]?.sessionId).toBe("discord-session");
-    expect(diagnosticsSessions[1]?.sessionFile).toBe("/tmp/discord.jsonl");
+    expect(diagnosticsSessions[1]?.sessionFile).toBe("agent:main:discord:channel:123");
     expect(diagnosticsSessions[1]?.channel).toBe("discord");
     expect(requireExecCall(execCalls).defaults.approvalWarningText).toContain(
       "OpenAI Codex harness:",
     );
   });
 
+  it("loads diagnostics inventory after authorization when the reply view contains one row", async () => {
+    await withOpenClawTestState({ label: "diagnostics-session-inventory" }, async (state) => {
+      const storePath = path.join(state.sessionsDir("main"), "sessions.json");
+      const sessionKey = "agent:main:whatsapp:direct:user-1";
+      const otherKey = "agent:main:discord:channel:123";
+      const current = { sessionId: "active-session", updatedAt: Date.now() };
+      await upsertSessionEntryCore({ agentId: "main", sessionKey, storePath }, current);
+      await upsertSessionEntryCore(
+        { agentId: "main", sessionKey: otherKey, storePath },
+        {
+          sessionId: "other-session",
+          updatedAt: Date.now(),
+          agentHarnessId: "codex",
+          delivery: normalizeSessionDeliveryState({ context: { channel: "discord" } }),
+          skillsSnapshot: { prompt: "unrelated diagnostics prompt ".repeat(4096), skills: [] },
+        },
+      );
+      const { calls } = registerCodexDiagnosticsCommandForTest(async () => null);
+      const { handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
+      const params = buildDiagnosticsParams("/diagnostics", {
+        agentId: "main",
+        sessionKey,
+        sessionEntry: current,
+        sessionStore: { [sessionKey]: current },
+        storePath,
+      });
+      using reads = vi.spyOn(sessionReads, "readSessionEntrySummariesInWorker");
+
+      await handleDiagnosticsCommand(
+        { ...params, command: { ...params.command, senderIsOwner: false } },
+        true,
+      );
+      expect(reads).not.toHaveBeenCalled();
+      expect(calls).toHaveLength(0);
+      await handleDiagnosticsCommand(params, true);
+      expect(requireDiagnosticsSessions(calls[0])).toEqual([
+        expect.objectContaining({ sessionKey, sessionId: "active-session" }),
+        expect.objectContaining({
+          sessionKey: otherKey,
+          sessionId: "other-session",
+          agentHarnessId: "codex",
+          channel: "discord",
+        }),
+      ]);
+    });
+  });
+
   it("omits the Codex section for ordinary sessions without Codex targets", async () => {
-    registerHostTrustedReservedCommandForTest({
-      name: "codex",
-      description: "Codex command",
-      acceptsArgs: true,
-      ownership: "reserved",
-      handler: vi.fn(async () => ({
+    registerCodexCommandForTest(
+      vi.fn(async () => ({
         text: [
           "No Codex thread is attached to this OpenClaw session yet.",
           "Use /codex threads to find a thread, then /codex resume <thread-id> before sending diagnostics.",
         ].join("\n"),
       })),
-    });
+    );
     const { execCalls, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
 
     await handleDiagnosticsCommand(
@@ -470,7 +554,7 @@ describe("diagnostics command", () => {
     );
   });
 
-  it("routes group diagnostics details privately before starting collection", async () => {
+  it("reports private owner approval as pending before starting collection", async () => {
     const { calls } = registerCodexDiagnosticsCommandForTest(async () => null);
     const { execCalls, privateReplies, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest(
       {
@@ -484,19 +568,14 @@ describe("diagnostics command", () => {
     const result = await handleDiagnosticsCommand(
       buildDiagnosticsParams("/diagnostics flaky tool call", {
         isGroup: true,
-        sessionEntry: {
-          sessionId: "session-1",
-          sessionFile: "/tmp/session.jsonl",
-          updatedAt: 1,
-          agentHarnessId: "codex",
-        },
+        sessionEntry: createCodexDiagnosticsSessionEntry(),
       }),
       true,
     );
 
     expect(result?.shouldContinue).toBe(false);
     expect(result?.reply?.text).toBe(
-      "Diagnostics are sensitive. I sent the diagnostics details and approval prompts to the owner privately.",
+      "Diagnostics are sensitive. Owner approval is pending on the private route.",
     );
     expect(result?.reply?.text).not.toContain("codex-thread-1");
     expect(privateReplies).toHaveLength(0);
@@ -520,12 +599,7 @@ describe("diagnostics command", () => {
     const result = await handleDiagnosticsCommand(
       buildDiagnosticsParams("/diagnostics", {
         isGroup: true,
-        sessionEntry: {
-          sessionId: "session-1",
-          sessionFile: "/tmp/session.jsonl",
-          updatedAt: 1,
-          agentHarnessId: "codex",
-        },
+        sessionEntry: createCodexDiagnosticsSessionEntry(),
       }),
       true,
     );
@@ -536,80 +610,124 @@ describe("diagnostics command", () => {
     expect(privateReplies).toHaveLength(0);
   });
 
-  it("routes group diagnostics confirmations privately", async () => {
-    const commandHandler = vi.fn(async () => ({
-      text: [
-        "Codex diagnostics sent to OpenAI servers:",
-        "- channel whatsapp, OpenClaw session session-1, Codex thread codex-thread-1",
-      ].join("\n"),
-    }));
-    registerHostTrustedReservedCommandForTest({
-      name: "codex",
-      description: "Codex command",
-      acceptsArgs: true,
-      handler: commandHandler,
-      ownership: "reserved",
-    });
-    const { privateReplies, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest({
-      privateTargets: [
+  it.each([["suppressed", "Private delivery of the diagnostics details was suppressed"]] as const)(
+    "keeps %s diagnostics confirmations private",
+    async (outcome, acknowledgement) => {
+      const commandHandler = vi.fn(async () => ({
+        text: [
+          "Codex diagnostics sent to OpenAI servers:",
+          "- channel whatsapp, OpenClaw session session-1, Codex thread codex-thread-1",
+        ].join("\n"),
+      }));
+      registerCodexCommandForTest(commandHandler);
+      const { privateReplies, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest({
+        deliveryOutcome: outcome,
+        privateTargets: [
+          { channel: "telegram", to: "owner-dm", accountId: "account-1" },
+          { channel: "whatsapp", to: "backup-owner-dm", accountId: "account-2" },
+        ],
+      });
+
+      const result = await handleDiagnosticsCommand(
+        buildDiagnosticsParams("/diagnostics confirm abc123def456", { isGroup: true }),
+        true,
+      );
+
+      expect(result?.reply?.text).toContain(acknowledgement);
+      expect(result?.reply?.text).not.toContain("codex-thread-1");
+      expect(result?.reply?.text).not.toContain("session-1");
+      expect(result?.reply?.text).not.toContain("OpenAI servers");
+      expect(privateReplies).toHaveLength(1);
+      expect(privateReplies[0]?.targets).toEqual([
         { channel: "telegram", to: "owner-dm", accountId: "account-1" },
-        { channel: "whatsapp", to: "backup-owner-dm", accountId: "account-2" },
-      ],
-    });
+      ]);
+      expect(privateReplies[0]?.text).toContain("Codex diagnostics sent to OpenAI servers:");
+      expect(privateReplies[0]?.text).toContain("codex-thread-1");
+    },
+  );
 
-    const result = await handleDiagnosticsCommand(
-      buildDiagnosticsParams("/diagnostics confirm abc123def456", { isGroup: true }),
-      true,
-    );
-
-    expect(result?.reply?.text).toBe(
-      "Diagnostics are sensitive. I sent the diagnostics details and approval prompts to the owner privately.",
-    );
-    expect(privateReplies).toHaveLength(1);
-    expect(privateReplies[0]?.targets).toEqual([
-      { channel: "telegram", to: "owner-dm", accountId: "account-1" },
-    ]);
-    expect(privateReplies[0]?.text).toContain("Codex diagnostics sent to OpenAI servers:");
-    expect(privateReplies[0]?.text).toContain("codex-thread-1");
-  });
-
-  it("requires an owner for diagnostics", async () => {
-    const { handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
-    const result = await handleDiagnosticsCommand(
-      buildDiagnosticsParams("/diagnostics", {
-        command: {
-          ...buildDiagnosticsParams("/diagnostics").command,
-          senderIsOwner: false,
+  it("keeps an unconfirmed diagnostics reply pending without exposing approval details to the group", async () => {
+    const { execCalls, privateReplies, handleDiagnosticsCommand } = createDiagnosticsHandlerForTest(
+      {
+        deliveryOutcome: "pending",
+        privateTargets: [{ channel: "telegram", to: "owner-dm" }],
+        execResult: {
+          content: [{ type: "text", text: "Private failure details at /private/diagnostics.zip" }],
+          details: { status: "approval-unavailable", reason: "no-approval-route" },
         },
-      }),
-      true,
+      },
     );
-
-    expect(result).toEqual({ shouldContinue: false });
-  });
-
-  it("routes confirmations back to the Codex diagnostics handler without repeating the preamble", async () => {
-    const { handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
-    const commandHandler = vi.fn(async (ctx: PluginCommandContext) => ({
-      text: `confirmed ${ctx.args}`,
-    }));
-    registerHostTrustedReservedCommandForTest({
-      name: "codex",
-      description: "Codex command",
-      acceptsArgs: true,
-      handler: commandHandler,
-      ownership: "reserved",
-    });
 
     const result = await handleDiagnosticsCommand(
-      buildDiagnosticsParams("/diagnostics confirm abc123def456"),
+      buildDiagnosticsParams("/diagnostics", { isGroup: true }),
       true,
     );
 
-    expect(result?.shouldContinue).toBe(false);
-    expect(commandHandler).toHaveBeenCalledTimes(1);
-    expect(result?.reply?.text).toBe("confirmed diagnostics confirm abc123def456");
+    expect(result?.reply?.text).toContain(
+      "Private delivery is pending; I can't confirm receipt yet",
+    );
+    expect(result?.reply?.text).not.toContain("sent the diagnostics");
+    expect(result?.reply?.text).not.toContain("/private/diagnostics.zip");
+    expect(result?.reply?.text).not.toContain("openclaw gateway");
+    expect(privateReplies).toEqual([
+      {
+        targets: [{ channel: "telegram", to: "owner-dm" }],
+        text: expect.stringContaining("/private/diagnostics.zip"),
+      },
+    ]);
+    expect(execCalls).toHaveLength(1);
   });
+
+  it.each([
+    [
+      { type: "command", command: "/codex diagnostics confirm abc123def456" },
+      { type: "command", command: "/diagnostics confirm abc123def456" },
+    ],
+    [
+      { type: "callback", value: "/codex diagnostics cancel abc123def456" },
+      { type: "callback", value: "/diagnostics cancel abc123def456" },
+    ],
+    [
+      { type: "model-picker", version: 1, snapshotToken: "picker-1", intent: "cancel" },
+      {
+        type: "model-picker",
+        version: 1,
+        snapshotToken: "picker-1",
+        intent: "cancel",
+      },
+    ],
+  ] satisfies Array<readonly [MessagePresentationAction, MessagePresentationAction]>)(
+    "routes confirmations with %s.type actions without repeating the preamble",
+    async (action, expectedAction) => {
+      const { handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();
+      const interactive: LegacyInteractiveReply = {
+        blocks: [{ type: "buttons", buttons: [{ label: "Continue", action }] }],
+      };
+      const expectedInteractive: LegacyInteractiveReply = {
+        blocks: [{ type: "buttons", buttons: [{ label: "Continue", action: expectedAction }] }],
+      };
+      interactive.blocks.push({ type: "select", options: [{ label: "Continue", action }] });
+      expectedInteractive.blocks.push({
+        type: "select",
+        options: [{ label: "Continue", action: expectedAction }],
+      });
+      const commandHandler = vi.fn(async (ctx: PluginCommandContext) => ({
+        text: `confirmed ${ctx.args}`,
+        interactive,
+      }));
+      registerCodexCommandForTest(commandHandler);
+
+      const result = await handleDiagnosticsCommand(
+        buildDiagnosticsParams("/diagnostics confirm abc123def456"),
+        true,
+      );
+
+      expect(result?.shouldContinue).toBe(false);
+      expect(commandHandler).toHaveBeenCalledTimes(1);
+      expect(result?.reply?.text).toBe("confirmed diagnostics confirm abc123def456");
+      expect(result?.reply?.interactive).toEqual(expectedInteractive);
+    },
+  );
 
   it("does not delegate diagnostics to a non-Codex plugin command", async () => {
     const { handleDiagnosticsCommand } = createDiagnosticsHandlerForTest();

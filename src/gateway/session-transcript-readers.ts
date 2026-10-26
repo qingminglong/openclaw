@@ -1,418 +1,388 @@
-import type { SessionTranscriptReadScope } from "../config/sessions/session-accessor.js";
-import { resolveSessionTranscriptReadTarget } from "../config/sessions/session-accessor.js";
-import type {
-  ReadRecentSessionMessagesOptions,
-  ReadSessionMessagesAsyncOptions,
-} from "./session-utils.fs.js";
 import {
-  readFirstUserMessageFromTranscript as readFirstUserMessageFromTranscriptFile,
-  readLatestRecentSessionUsageFromTranscriptAsync as readLatestRecentSessionUsageFromTranscriptAsyncFile,
-  readLatestSessionUsageFromTranscript as readLatestSessionUsageFromTranscriptFile,
-  readLatestSessionUsageFromTranscriptAsync as readLatestSessionUsageFromTranscriptAsyncFile,
-  readRecentSessionMessages as readRecentSessionMessagesFile,
-  readRecentSessionMessagesAsync as readRecentSessionMessagesAsyncFile,
-  readRecentSessionMessagesWithStats as readRecentSessionMessagesWithStatsFile,
-  readRecentSessionMessagesWithStatsAsync as readRecentSessionMessagesWithStatsAsyncFile,
-  readRecentSessionTranscriptLines as readRecentSessionTranscriptLinesFile,
-  readRecentSessionUsageFromTranscript as readRecentSessionUsageFromTranscriptFile,
-  readRecentSessionUsageFromTranscriptAsync as readRecentSessionUsageFromTranscriptAsyncFile,
-  readSessionMessageByIdAsync as readSessionMessageByIdAsyncFile,
-  readSessionMessageCount as readSessionMessageCountFile,
-  readSessionMessageCountAsync as readSessionMessageCountAsyncFile,
-  readSessionMessages as readSessionMessagesFile,
-  readSessionMessagesAsync as readSessionMessagesAsyncFile,
-  readSessionMessagesWithSourceAsync as readSessionMessagesWithSourceAsyncFile,
-  readSessionPreviewItemsFromTranscript as readSessionPreviewItemsFromTranscriptFile,
-  readSessionTitleFieldsFromTranscript as readSessionTitleFieldsFromTranscriptFile,
-  readSessionTitleFieldsFromTranscriptAsync as readSessionTitleFieldsFromTranscriptAsyncFile,
-  visitSessionMessages as visitSessionMessagesFile,
-  visitSessionMessagesAsync as visitSessionMessagesAsyncFile,
-} from "./session-utils.fs.js";
+  isSessionTranscriptProjectionUnavailableError,
+  waitForSessionTranscriptProjection,
+} from "../config/sessions/session-accessor.sqlite-active-events.js";
+import type { SessionTranscriptReadScope } from "../config/sessions/session-accessor.sqlite-contract.js";
+import type { SessionTranscriptBoundedMessageTailOptions } from "../config/sessions/session-accessor.sqlite-projection-read.js";
+import { bindSessionTranscriptStoreScope } from "../config/sessions/session-accessor.transcript-target.js";
+import { withSessionActorStorage } from "../config/sessions/session-actor-storage-binding.js";
+import { captureSessionActorTranscriptRead } from "../config/sessions/session-actor-transcript-read.js";
+import type { SessionTranscriptAccountingOptions } from "../config/sessions/session-transcript-accounting.types.js";
+import type { ReadRecentSessionConversationTextOptions } from "../config/sessions/transcript-recent-text.js";
+import { captureSessionTranscriptStorageEnvironment } from "../config/sessions/transcript-target-binding.js";
+import type {
+  SessionArtifactReadQuery,
+  SessionArtifactReadResult,
+} from "./session-artifact-read.js";
+import { aggregateSessionTranscriptUsage } from "./session-transcript-derived-readers.js";
+import { createSessionActorTranscriptReader } from "./session-transcript-memory-reader.js";
+import type {
+  ReadSessionMessagesAsyncOptions,
+  SessionTranscriptReadOptions,
+  SessionTranscriptReader,
+} from "./session-transcript-read.types.js";
+import { collectSessionTranscriptMessages } from "./session-transcript-source-pages.js";
+import type {
+  SessionTranscriptSummaryQuery,
+  SessionTranscriptSummaryResult,
+} from "./session-transcript-summary.js";
 
-export type { ReadRecentSessionMessagesOptions, ReadSessionMessagesAsyncOptions };
-export { attachOpenClawTranscriptMeta, capArrayByJsonBytes } from "./session-utils.fs.js";
+export type { SessionTranscriptReadScope } from "./session-transcript-read.types.js";
+export { capArrayByJsonBytes } from "./session-utils.fs.js";
 
-export type { SessionTranscriptReadScope };
-
-type SessionTitleFields = {
-  firstUserMessage: string | null;
-  lastMessagePreview: string | null;
-};
-
-type ReadRecentSessionMessagesResult = {
-  messages: unknown[];
-  transcriptPath?: string;
-  totalMessages: number;
-};
-
-type ReadSessionMessagesResult = {
-  messages: unknown[];
-  transcriptPath?: string;
-};
-
-type ReadSessionMessageByIdResult = {
-  message?: unknown;
-  seq?: number;
-  oversized: boolean;
-  found: boolean;
-};
-
-type SessionTranscriptUsageSnapshot = {
-  modelProvider?: string;
-  model?: string;
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheRead?: number;
-  cacheWrite?: number;
-  totalTokens?: number;
-  totalTokensFresh?: boolean;
-  costUsd?: number;
-};
-
-type FileBackedReadScope = {
-  agentId?: string;
-  sessionFile: string;
-  sessionId: string;
-  storePath?: string;
-};
-
-function resolveFileBackedReadScope(scope: SessionTranscriptReadScope): FileBackedReadScope {
-  const target = resolveSessionTranscriptReadTarget(scope);
-  const storePath = resolveConcreteReadStorePath(scope.storePath);
+function captureHistoryReadScope(scope: SessionTranscriptReadScope): SessionTranscriptReadScope {
+  const target = bindSessionTranscriptStoreScope(scope);
   return {
     agentId: target.agentId,
-    sessionFile: target.sessionFile,
     sessionId: target.sessionId,
-    ...(storePath ? { storePath } : {}),
+    sessionKey: target.sessionKey,
+    storePath: target.storePath,
+    ...(target.sessionFile ? { sessionFile: target.sessionFile } : {}),
+    sessionEntry: target.sessionEntry ? { sessionId: target.sessionEntry.sessionId } : undefined,
+    env: captureSessionTranscriptStorageEnvironment(target.env ?? process.env),
   };
 }
 
-function resolveConcreteReadStorePath(storePath: string | undefined): string | undefined {
-  const trimmed = storePath?.trim();
-  if (!trimmed || trimmed === "(multiple)" || trimmed.includes("{agentId}")) {
-    return undefined;
-  }
-  return trimmed;
-}
-
-/** Reads display messages from a session transcript through the reader seam. */
-export function readSessionMessages(scope: SessionTranscriptReadScope): unknown[] {
-  const target = resolveFileBackedReadScope(scope);
-  return readSessionMessagesFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-  );
-}
-
-/** Reads recent display messages from a session transcript through the reader seam. */
-export function readRecentSessionMessages(
-  scope: SessionTranscriptReadScope,
-  opts?: ReadRecentSessionMessagesOptions,
-): unknown[] {
-  const target = resolveFileBackedReadScope(scope);
-  return readRecentSessionMessagesFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    opts,
-    target.agentId,
-  );
-}
-
-/** Visits display messages from a session transcript through the reader seam. */
-export function visitSessionMessages(
-  scope: SessionTranscriptReadScope,
-  visit: (message: unknown, seq: number) => void,
-): number {
-  const target = resolveFileBackedReadScope(scope);
-  return visitSessionMessagesFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    visit,
-    target.agentId,
-  );
-}
-
-/** Counts display messages in a session transcript through the reader seam. */
-export function readSessionMessageCount(scope: SessionTranscriptReadScope): number {
-  const target = resolveFileBackedReadScope(scope);
-  return readSessionMessageCountFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-  );
-}
-
-/** Reads display messages asynchronously through the reader seam. */
 export async function readSessionMessagesAsync(
   scope: SessionTranscriptReadScope,
-  opts: ReadSessionMessagesAsyncOptions,
+  options: ReadSessionMessagesAsyncOptions & SessionTranscriptReadOptions,
 ): Promise<unknown[]> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readSessionMessagesAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    opts,
-    target.agentId,
-  );
+  if (options.mode === "recent") {
+    return (await readRecentSessionMessagesWithStatsAsync(scope, options)).messages;
+  }
+  return collectSessionTranscriptMessages(readSessionMessagesWithSourceAsync, scope, options);
 }
 
-/** Reads display messages with source metadata through the reader seam. */
-export async function readSessionMessagesWithSourceAsync(
+function createHistoryPageReader<Options, Result>(
+  readActor: (
+    reader: SessionTranscriptReader,
+    target: SessionTranscriptReadScope,
+    options: Options,
+    signal?: AbortSignal,
+  ) => Promise<Result>,
+  readWorker: (
+    read: typeof import("../config/sessions/session-history-worker-runtime.js").readSessionHistoryPageInWorker,
+    target: SessionTranscriptReadScope,
+    options: Options,
+    signal?: AbortSignal,
+  ) => Promise<Result>,
+) {
+  return async (
+    scope: SessionTranscriptReadScope,
+    inputOptions: Options,
+    signal?: AbortSignal,
+  ): Promise<Result> => {
+    signal?.throwIfAborted();
+    const memory = captureSessionActorTranscriptRead(scope, signal);
+    if (memory) {
+      return readActor(createSessionActorTranscriptReader(memory), scope, inputOptions, signal);
+    }
+    const options = structuredClone(inputOptions);
+    const target = captureHistoryReadScope(scope);
+    const { readSessionHistoryPageInWorker } =
+      await import("../config/sessions/session-history-worker-runtime.js");
+    signal?.throwIfAborted();
+    const result = await readWorker(readSessionHistoryPageInWorker, target, options, signal);
+    signal?.throwIfAborted();
+    return result;
+  };
+}
+
+export const readSessionMessagesWithSourceAsync = createHistoryPageReader(
+  (
+    reader,
+    scope,
+    options: Parameters<SessionTranscriptReader["readSessionMessagesWithSourceAsync"]>[1],
+    signal,
+  ) => reader.readSessionMessagesWithSourceAsync(scope, options, signal),
+  (read, target, options, signal) =>
+    read({ kind: "source-messages", params: { target, options } }, signal),
+);
+
+export async function readSessionTranscriptAccountingAsync(
   scope: SessionTranscriptReadScope,
-  opts: ReadSessionMessagesAsyncOptions,
-): Promise<ReadSessionMessagesResult> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readSessionMessagesWithSourceAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    opts,
-    target.agentId,
+  options: SessionTranscriptAccountingOptions,
+  signal?: AbortSignal,
+) {
+  const captured: SessionTranscriptAccountingOptions = {
+    includeByteSize: options.includeByteSize,
+    includeUsage: options.includeUsage,
+    ...(Object.hasOwn(options, "includeTurnTaint")
+      ? { includeTurnTaint: options.includeTurnTaint }
+      : {}),
+    ...(Object.hasOwn(options, "usageEventLimit")
+      ? { usageEventLimit: options.usageEventLimit }
+      : {}),
+  };
+  const memory = captureSessionActorTranscriptRead(scope, signal);
+  if (memory) {
+    return memory.read("session.history.accounting", { options: captured });
+  }
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  return readSessionHistoryPageInWorker(
+    { kind: "active-accounting", params: { target, options: captured } },
+    signal,
   );
 }
 
-/** Reads recent display messages asynchronously through the reader seam. */
-export async function readRecentSessionMessagesAsync(
+export async function readSessionTranscriptBoundedMessageTailPageAsync(
   scope: SessionTranscriptReadScope,
-  opts?: ReadRecentSessionMessagesOptions,
-): Promise<unknown[]> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readRecentSessionMessagesAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    opts,
-    target.agentId,
+  options: SessionTranscriptBoundedMessageTailOptions,
+  signal?: AbortSignal,
+) {
+  const captured = structuredClone(options);
+  const memory = captureSessionActorTranscriptRead(scope, signal);
+  if (memory) {
+    return memory.read("session.history.bounded-tail", { options: captured });
+  }
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  return readSessionHistoryPageInWorker(
+    { kind: "bounded-tail", params: { target, options: captured } },
+    signal,
   );
 }
 
-/** Finds one display message by transcript id through the reader seam. */
-export async function readSessionMessageByIdAsync(
+export async function readRecentSessionConversationTextAsync(
   scope: SessionTranscriptReadScope,
-  messageId: string,
-  opts?: { allowResetArchiveFallback?: boolean },
-): Promise<ReadSessionMessageByIdResult> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readSessionMessageByIdAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    messageId,
-    { ...opts, agentId: target.agentId },
+  options: ReadRecentSessionConversationTextOptions,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  const captured = structuredClone(options);
+  const memory = captureSessionActorTranscriptRead(scope, signal);
+  if (memory) {
+    const result = memory.missing
+      ? []
+      : await memory.read("session.history.recent-text", {
+          options: captured,
+        });
+    memory.assertCurrent();
+    return result;
+  }
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  return readSessionHistoryPageInWorker(
+    { kind: "recent-text", params: { target, options: captured } },
+    signal,
   );
 }
 
-/** Visits display messages asynchronously through the reader seam. */
-export async function visitSessionMessagesAsync(
-  scope: SessionTranscriptReadScope,
-  visit: (message: unknown, seq: number) => void,
-  opts: { mode: "full"; reason: string; cache?: "reuse" | "skip" },
-): Promise<number> {
-  const target = resolveFileBackedReadScope(scope);
-  return await visitSessionMessagesAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    visit,
-    opts,
-    target.agentId,
-  );
-}
+export const readRecentSessionMessagesWithStatsAsync = createHistoryPageReader(
+  (
+    reader,
+    scope,
+    options: Parameters<SessionTranscriptReader["readRecentSessionMessagesWithStatsAsync"]>[1],
+  ) => reader.readRecentSessionMessagesWithStatsAsync(scope, options),
+  (read, target, options) => read({ kind: "recent-page", params: { target, options } }),
+);
 
-/** Counts display messages asynchronously through the reader seam. */
-export async function readSessionMessageCountAsync(
-  scope: SessionTranscriptReadScope,
-): Promise<number> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readSessionMessageCountAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-  );
-}
+const readRecentSessionUsage = createHistoryPageReader(
+  async (reader, target, maxBytes: number) =>
+    aggregateSessionTranscriptUsage(
+      (
+        await reader.readRecentSessionMessagesWithStatsAsync(target, {
+          maxBytes,
+          maxLines: 1000,
+          maxMessages: 1000,
+        })
+      ).messages,
+    ),
+  async (read, target, maxBytes) => read({ kind: "recent-usage", params: { target, maxBytes } }),
+);
 
-/** Reads recent messages with total-count metadata through the reader seam. */
-export function readRecentSessionMessagesWithStats(
-  scope: SessionTranscriptReadScope,
-  opts: ReadRecentSessionMessagesOptions,
-): ReadRecentSessionMessagesResult {
-  const target = resolveFileBackedReadScope(scope);
-  return readRecentSessionMessagesWithStatsFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    opts,
-    target.agentId,
-  );
-}
-
-/** Reads recent messages with total-count metadata asynchronously through the reader seam. */
-export async function readRecentSessionMessagesWithStatsAsync(
-  scope: SessionTranscriptReadScope,
-  opts: ReadRecentSessionMessagesOptions,
-): Promise<ReadRecentSessionMessagesResult> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readRecentSessionMessagesWithStatsAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    opts,
-    target.agentId,
-  );
-}
-
-/** Reads a bounded transcript tail for compaction and diagnostics through the reader seam. */
-export function readRecentSessionTranscriptLines(
-  params: SessionTranscriptReadScope & {
-    maxLines: number;
-  },
-): { lines: string[]; totalLines: number } | null {
-  const target = resolveFileBackedReadScope(params);
-  return readRecentSessionTranscriptLinesFile({
-    sessionId: target.sessionId,
-    storePath: target.storePath,
-    sessionFile: target.sessionFile,
-    agentId: target.agentId,
-    maxLines: params.maxLines,
-  });
-}
-
-/** Reads title and preview text from a transcript through the reader seam. */
-export function readSessionTitleFieldsFromTranscript(
-  scope: SessionTranscriptReadScope,
-  opts?: { includeInterSession?: boolean },
-): SessionTitleFields {
-  const target = resolveFileBackedReadScope(scope);
-  return readSessionTitleFieldsFromTranscriptFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-    opts,
-  );
-}
-
-/** Reads title and preview text asynchronously through the reader seam. */
-export async function readSessionTitleFieldsFromTranscriptAsync(
-  scope: SessionTranscriptReadScope,
-  opts?: { includeInterSession?: boolean },
-): Promise<SessionTitleFields> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readSessionTitleFieldsFromTranscriptAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-    opts,
-  );
-}
-
-/** Reads the first user message from a transcript through the reader seam. */
-export function readFirstUserMessageFromTranscript(
-  scope: SessionTranscriptReadScope,
-  opts?: { includeInterSession?: boolean },
-): string | null {
-  const target = resolveFileBackedReadScope(scope);
-  return readFirstUserMessageFromTranscriptFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-    opts,
-  );
-}
-
-/** Reads aggregate usage from a full transcript through the reader seam. */
-export function readLatestSessionUsageFromTranscript(
-  scope: SessionTranscriptReadScope,
-): SessionTranscriptUsageSnapshot | null {
-  const target = resolveFileBackedReadScope(scope);
-  return readLatestSessionUsageFromTranscriptFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-  );
-}
-
-/** Reads aggregate usage from a full transcript asynchronously through the reader seam. */
-export async function readLatestSessionUsageFromTranscriptAsync(
-  scope: SessionTranscriptReadScope,
-): Promise<SessionTranscriptUsageSnapshot | null> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readLatestSessionUsageFromTranscriptAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-  );
-}
-
-/** Reads aggregate usage from a bounded transcript tail through the reader seam. */
+/** Prepare bounded usage in the history owner before rendering a status response. */
 export async function readRecentSessionUsageFromTranscriptAsync(
   scope: SessionTranscriptReadScope,
   maxBytes: number,
-): Promise<SessionTranscriptUsageSnapshot | null> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readRecentSessionUsageFromTranscriptAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-    maxBytes,
+) {
+  return readRecentSessionUsage(
+    scope,
+    Math.max(1024, Math.floor(Number.isFinite(maxBytes) ? maxBytes : 8 * 1024 * 1024)),
   );
 }
 
-/** Reads latest usage from a bounded transcript tail through the reader seam. */
-export async function readLatestRecentSessionUsageFromTranscriptAsync(
+export const readSessionMessagesPageWithStatsAsync = createHistoryPageReader(
+  (
+    reader,
+    scope,
+    options: Parameters<SessionTranscriptReader["readSessionMessagesPageWithStatsAsync"]>[1],
+    signal,
+  ) => reader.readSessionMessagesPageWithStatsAsync(scope, options, signal),
+  (read, target, options, signal) =>
+    read({ kind: "message-page", params: { target, options } }, signal),
+);
+
+export const readSessionMessagesAroundIdWithStatsAsync = createHistoryPageReader(
+  (
+    reader,
+    scope,
+    options: Parameters<SessionTranscriptReader["readSessionMessagesAroundIdWithStatsAsync"]>[1],
+    signal,
+  ) => reader.readSessionMessagesAroundIdWithStatsAsync(scope, options, signal),
+  (read, target, options, signal) =>
+    read({ kind: "around-id", params: { target, options } }, signal),
+);
+
+export function readSessionTranscriptSummaryAsync<Query extends SessionTranscriptSummaryQuery>(
   scope: SessionTranscriptReadScope,
-  maxBytes: number,
-): Promise<SessionTranscriptUsageSnapshot | null> {
-  const target = resolveFileBackedReadScope(scope);
-  return await readLatestRecentSessionUsageFromTranscriptAsyncFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-    maxBytes,
+  query: Query,
+): Promise<Extract<SessionTranscriptSummaryResult, { kind: Query["kind"] }>>;
+export async function readSessionTranscriptSummaryAsync(
+  scope: SessionTranscriptReadScope,
+  inputQuery: SessionTranscriptSummaryQuery,
+): Promise<SessionTranscriptSummaryResult> {
+  const query = structuredClone(inputQuery);
+  const memory = captureSessionActorTranscriptRead(scope);
+  if (memory) {
+    const { prepareSessionTranscriptSummaryReader } =
+      await import("./session-transcript-summary.js");
+    const select = await prepareSessionTranscriptSummaryReader(query);
+    const messages: unknown[] = [];
+    await createSessionActorTranscriptReader(memory).visitSessionMessagesAsync(scope, (message) =>
+      messages.push(message),
+    );
+    return select((visit) => messages.forEach(visit));
+  }
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  return readSessionHistoryPageInWorker({ kind: "summary", params: { target, query } });
+}
+
+export function readSessionArtifacts<Query extends SessionArtifactReadQuery>(
+  scope: SessionTranscriptReadScope,
+  query: Query,
+): Promise<Extract<SessionArtifactReadResult, { kind: Query["kind"] }>>;
+export async function readSessionArtifacts(
+  scope: SessionTranscriptReadScope,
+  inputQuery: SessionArtifactReadQuery,
+): Promise<SessionArtifactReadResult> {
+  const query = structuredClone(inputQuery);
+  const memory = captureSessionActorTranscriptRead(scope);
+  if (memory) {
+    const { selectSessionArtifacts } = await import("./session-artifact-read.js");
+    return selectSessionArtifacts(scope, query, createSessionActorTranscriptReader(memory));
+  }
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  return readSessionHistoryPageInWorker({ kind: "artifacts", params: { target, query } });
+}
+
+export async function readSessionMessageByIdAsync(
+  scope: SessionTranscriptReadScope,
+  messageId: string,
+  options?: Parameters<SessionTranscriptReader["readSessionMessageByIdAsync"]>[2],
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  const memory = captureSessionActorTranscriptRead(scope, signal);
+  if (memory) {
+    return createSessionActorTranscriptReader(memory).readSessionMessageByIdAsync(
+      scope,
+      messageId,
+      options,
+      signal,
+    );
+  }
+  const capturedOptions = options ? structuredClone(options) : undefined;
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  return readSessionHistoryPageInWorker(
+    { kind: "message-by-id", params: { target, messageId, options: capturedOptions } },
+    signal,
   );
 }
 
-/** Reads aggregate usage from a bounded transcript tail synchronously through the reader seam. */
-export function readRecentSessionUsageFromTranscript(
+/** Keep exact membership and selected payload reads in the owning history backend. */
+export const readSessionMessagesMatchingIdAsync = createHistoryPageReader(
+  (reader, scope, messageId: string) => reader.readSessionMessagesMatchingIdAsync(scope, messageId),
+  (read, target, messageId) => read({ kind: "message-lookup", params: { target, messageId } }),
+);
+
+export async function readSessionMessageCountAsync(
   scope: SessionTranscriptReadScope,
-  maxBytes: number,
-): SessionTranscriptUsageSnapshot | null {
-  const target = resolveFileBackedReadScope(scope);
-  return readRecentSessionUsageFromTranscriptFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-    maxBytes,
-  );
+): Promise<number> {
+  const memory = captureSessionActorTranscriptRead(scope);
+  if (memory) {
+    return createSessionActorTranscriptReader(memory).readSessionMessageCountAsync(scope);
+  }
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  const readCount = () =>
+    readSessionHistoryPageInWorker({ kind: "message-count", params: { target } });
+  try {
+    return await readCount();
+  } catch (error) {
+    if (!isSessionTranscriptProjectionUnavailableError(error)) {
+      throw error;
+    }
+    // The failed read schedules the rebuild; wait before assigning a message sequence.
+    await waitForSessionTranscriptProjection(target);
+    return await readCount();
+  }
 }
 
-/** Reads compact session preview items through the reader seam. */
-export function readSessionPreviewItemsFromTranscript(
+export async function readSessionReactionsAsync(scope: SessionTranscriptReadScope) {
+  const memory = captureSessionActorTranscriptRead(scope);
+  if (memory) {
+    return (
+      (await withSessionActorStorage(
+        memory.target,
+        {
+          lifetime: {
+            assertCurrent: memory.assertCurrent,
+            assertReadable: memory.assertCurrent,
+          },
+          authority: { assertCurrent: memory.assertCurrent, authorize: memory.assertCurrent },
+        },
+        (binding) =>
+          binding.actor.storage.read(
+            { type: "session.reactions.read", input: { sessionId: scope.sessionId } },
+            binding.authority,
+          ),
+      )) ?? {}
+    );
+  }
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  return readSessionHistoryPageInWorker({ kind: "reactions", params: { target } });
+}
+
+export async function readSessionConversationBindingAsync(
   scope: SessionTranscriptReadScope,
-  maxItems: number,
-  maxChars: number,
-): ReturnType<typeof readSessionPreviewItemsFromTranscriptFile> {
-  const target = resolveFileBackedReadScope(scope);
-  return readSessionPreviewItemsFromTranscriptFile(
-    target.sessionId,
-    target.storePath,
-    target.sessionFile,
-    target.agentId,
-    maxItems,
-    maxChars,
-  );
+  conversationRef: string,
+) {
+  const memory = captureSessionActorTranscriptRead(scope);
+  if (memory) {
+    const { readConversation } = await import("../config/sessions/conversation-registry.js");
+    const conversation = await readConversation(
+      {
+        agentId: memory.target.agentId,
+        storePath: memory.target.storePath,
+        env: memory.target.env,
+      },
+      conversationRef,
+    );
+    if (!conversation) {
+      return null;
+    }
+    const { channel, accountId, target, threadId, nativeChannelId } = conversation;
+    return { channel, accountId, target, threadId, nativeChannelId };
+  }
+  const target = captureHistoryReadScope(scope);
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  return readSessionHistoryPageInWorker({
+    kind: "conversation-binding",
+    params: { target, conversationRef },
+  });
 }

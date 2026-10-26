@@ -1,46 +1,100 @@
-// docs-list tests cover source docs metadata discovery for docs-aware tooling.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanupTempDirs, makeTempDir } from "../helpers/temp-dir.js";
+import { renderDocsHeadingMap } from "../../scripts/docs-list.js";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { files } from "./docs-fixture.test-support.js";
 
-const tempDirs: string[] = [];
-const repoRoot = path.resolve(import.meta.dirname, "../..");
-const docsListScriptPath = path.join(repoRoot, "scripts", "docs-list.js");
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const docsListScriptPath = path.resolve(import.meta.dirname, "../../scripts/docs-list.js");
 
-function makeTempRepoRoot(prefix: string): string {
-  return makeTempDir(tempDirs, prefix);
+function makeDocs(contents: Record<string, string>) {
+  const root = tempDirs.make("openclaw-docs-list-");
+  const docs = path.join(root, "docs");
+  for (const [file, content] of Object.entries(contents)) {
+    files(docs).write(file, content);
+  }
+  return { root, docs };
 }
 
-function runDocsList(cwd: string): string {
-  return execFileSync(process.execPath, [docsListScriptPath], {
+function runDocsList(cwd: string, args: string[] = []): string {
+  return execFileSync(process.execPath, [docsListScriptPath, ...args], {
     cwd,
     encoding: "utf8",
   });
 }
 
-afterEach(() => {
-  cleanupTempDirs(tempDirs);
-});
-
 describe("docs-list", () => {
-  it("prints single-line read_when strings as read hints", () => {
-    const tempRepoRoot = makeTempRepoRoot("openclaw-docs-list-");
-    mkdirSync(path.join(tempRepoRoot, "docs"), { recursive: true });
-    writeFileSync(
-      path.join(tempRepoRoot, "docs", "page.md"),
-      `---
-summary: "Single-line read_when page"
-read_when: "Read this page when the hint is inline."
----
-`,
-      "utf8",
+  it("reads metadata across supported front matter forms", () => {
+    const cases = [
+      ["inline", "\n", 'read_when: "Read this page when the hint is inline."\n---'],
+      ["yaml-end", "\n", "..."],
+      ["annotated", "\r\n", "--- # end   "],
+    ] as const;
+    const { root } = makeDocs(
+      Object.fromEntries(
+        cases.map(([name, nl, end]) => [
+          `${name}.md`,
+          `---${nl}summary: "Summary for ${name}"${nl}${end}${nl}`,
+        ]),
+      ),
     );
+    const output = runDocsList(root);
 
-    const output = runDocsList(tempRepoRoot);
-
-    expect(output).toContain("page.md - Single-line read_when page");
+    for (const [name] of cases) {
+      expect(output).toContain(`${name}.md - Summary for ${name}`);
+    }
     expect(output).toContain("Read when: Read this page when the hint is inline.");
+    expect(output).not.toContain("unterminated front matter");
+  });
+
+  it("renders the publish docs map on demand without creating a mirror", () => {
+    const { root, docs } = makeDocs({
+      "page.md": [
+        '---\nsummary: "Page"\n# Hidden metadata\n... # end',
+        "# Visible title\n## `API[*]` <script>alert(1)</script>",
+        "### <scr<script>ipt>alert(1)</script>\n#### `![label](https://example.test/image)`",
+        "```md\n### Hidden fence\n```",
+        "````md\n```json\n### Hidden nested fence\n```\n````",
+        "~~~md\n### Hidden tilde fence\n~~~json\n### Hidden invalid closer\n~~~\n# Visible after fence\n",
+      ].join("\n"),
+      "nested/index.mdx": "# Nested\n",
+      "nested/page.md": "# Nested page\n",
+      "AGENTS.md": "# Instructions\n",
+    });
+
+    const output = runDocsList(root, ["--headings"]);
+
+    expect(output).toContain("## page.md\n\n- Route: /page");
+    expect(output).toContain("  - H1: Visible title");
+    expect(output).toContain("  - H2: `API[*]` &lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(output).toContain("  - H3: &lt;scr&lt;script&gt;ipt&gt;alert(1)&lt;/script&gt;");
+    expect(output).toContain("  - H4: `![label](https://example.test/image)`");
+    expect(output).toContain("## nested/index.mdx\n\n- Route: /nested");
+    expect(output).toContain("## nested/page.md\n\n- Route: /nested/page");
+    expect(output).not.toContain("Hidden");
+    expect(output).toContain("  - H1: Visible after fence");
+    expect(output).not.toContain("AGENTS.md");
+    expect(existsSync(path.join(docs, "docs_map.md"))).toBe(false);
+    expect(
+      renderDocsHeadingMap(docs, {
+        relativePath: (base, fullPath) => path.relative(base, fullPath).replace(/[\\/]+/gu, "\\"),
+      }),
+    ).toBe(output);
+  });
+
+  it.each([
+    ["nonbreaking space", "```md", "```\u00a0\n## Still hidden\n```"],
+    ["tabs", "```", "```\t\t"],
+  ])("recognizes closing fences with %s", (_name, opening, closing) => {
+    const { docs } = makeDocs({
+      "page.md": `${opening}\n# Hidden example\n${closing}\n# Visible after close\n`,
+    });
+    const output = renderDocsHeadingMap(docs);
+
+    expect(output).not.toContain("H1: Hidden example");
+    expect(output).not.toContain("H2: Still hidden");
+    expect(output).toContain("H1: Visible after close");
   });
 });

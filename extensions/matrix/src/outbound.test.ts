@@ -1,52 +1,79 @@
-// Matrix tests cover outbound plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../runtime-api.js";
+import { chunkTextForOutbound, type OpenClawConfig } from "../runtime-api.js";
 
 const mocks = vi.hoisted(() => ({
   sendMessageMatrix: vi.fn(),
   sendPollMatrix: vi.fn(),
 }));
 
-vi.mock("./matrix/send.js", () => ({
-  sendMessageMatrix: mocks.sendMessageMatrix,
-  sendPollMatrix: mocks.sendPollMatrix,
-}));
-
-vi.mock("./runtime.js", () => ({
-  getMatrixRuntime: () => ({
-    channel: {
-      text: {
-        chunkMarkdownText: (text: string) => [text],
-      },
-    },
-  }),
-}));
+// mock-isolation: Verify outbound translation without opening a Matrix SDK client or network connection.
+vi.mock("./matrix/send.js", () => mocks);
 
 import { matrixOutbound } from "./outbound.js";
 
-type MockCallSource = { mock: { calls: Array<Array<unknown>> } };
-
-function mockCall(source: MockCallSource, label: string, callIndex = 0): Array<unknown> {
-  const call = source.mock.calls[callIndex];
-  if (!call) {
-    throw new Error(`expected ${label} call ${callIndex}`);
-  }
-  return call;
+const to = "room:!room:example";
+type PayloadContext = Parameters<NonNullable<typeof matrixOutbound.sendPayload>>[0];
+function sendPayload(
+  payload: PayloadContext["payload"],
+  options: Partial<Omit<PayloadContext, "payload">> = {},
+) {
+  return matrixOutbound.sendPayload!({
+    cfg: {},
+    to,
+    text: payload.text ?? "",
+    payload,
+    ...options,
+  });
+}
+function expectSend(source: unknown, text: string, options: Record<string, unknown>, index = 1) {
+  expect(source).toHaveBeenNthCalledWith(index, to, text, expect.objectContaining(options));
 }
 
-function mockOptions(
-  source: MockCallSource,
-  label: string,
-  callIndex = 0,
-): Record<string, unknown> {
-  const value = mockCall(source, label, callIndex)[2];
-  if (!value || typeof value !== "object") {
-    throw new Error(`expected ${label} call ${callIndex} options`);
+function mockOptions(source: { mock: { calls: unknown[][] } }, callIndex = 0) {
+  const options = source.mock.calls[callIndex]?.[2];
+  if (!options || typeof options !== "object") {
+    throw new Error(`expected send options at call ${callIndex}`);
   }
-  return value as Record<string, unknown>;
+  return options as Record<string, unknown>;
+}
+
+function senderResult(
+  content: string,
+  ...parts: Array<[id: string, kind: "text" | "media" | "voice", replyToId?: string]>
+) {
+  const firstPart = parts[0];
+  const receipt = {
+    primaryPlatformMessageId: firstPart?.[0],
+    platformMessageIds: parts.map(([id]) => id),
+    parts: parts.map(([platformMessageId, kind, replyToId], index) => ({
+      platformMessageId,
+      kind,
+      index,
+      ...(replyToId ? { replyToId } : {}),
+    })),
+    ...(firstPart?.[2] ? { replyToId: firstPart[2] } : {}),
+    sentAt: 1,
+  };
+  return {
+    messageId: parts.at(-1)?.[0],
+    roomId: "!room:example",
+    primaryMessageId: firstPart?.[0],
+    receipt,
+    content,
+  };
 }
 
 describe("matrixOutbound cfg threading", () => {
+  const cfg: OpenClawConfig = {
+    channels: { matrix: { accessToken: "resolved-token" } },
+  };
+  const context = { cfg, to, accountId: "default" };
+  const presentationContent = {
+    version: 1,
+    type: "message.presentation",
+    blocks: [{ type: "divider" }],
+  };
+  const channelData = (extraContent: Record<string, unknown>) => ({ matrix: { extraContent } });
   beforeEach(() => {
     mocks.sendMessageMatrix.mockReset();
     mocks.sendPollMatrix.mockReset();
@@ -54,168 +81,85 @@ describe("matrixOutbound cfg threading", () => {
     mocks.sendPollMatrix.mockResolvedValue({ eventId: "$poll", roomId: "!room:example" });
   });
 
-  it("chunks outbound text without requiring Matrix runtime initialization", () => {
+  it("makes progress for fractional BMP and astral limits", () => {
     const chunker = matrixOutbound.chunker;
     if (!chunker) {
       throw new Error("matrixOutbound.chunker missing");
     }
 
-    expect(chunker("hello world", 5)).toEqual(["hello", "world"]);
+    expect(chunker("ABCD", 0.5)).toEqual(["A", "B", "C", "D"]);
+    expect(chunker("😀😀", 1.5)).toEqual(["😀", "😀"]);
+    expect(chunkTextForOutbound("ABCD", 0.5)).toEqual(["A", "B", "C", "D"]);
+    expect(chunkTextForOutbound("😀😀", 1.5)).toEqual(["😀", "😀"]);
   });
 
-  it("passes resolved cfg to sendMessageMatrix for text sends", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
-
-    await matrixOutbound.sendText!({
-      cfg,
-      to: "room:!room:example",
-      text: "hello",
-      accountId: "default",
-      threadId: "$thread",
-      replyToId: "$reply",
-    });
-
-    const call = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix");
-    expect(call[0]).toBe("room:!room:example");
-    expect(call[1]).toBe("hello");
-    const options = mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix");
-    expect(options.cfg).toBe(cfg);
-    expect(options.accountId).toBe("default");
-    expect(options.threadId).toBe("$thread");
-    expect(options.replyToId).toBe("$reply");
+  it("preserves Matrix compatibility behavior", () => {
+    expect(chunkTextForOutbound("", 5)).toEqual([""]);
+    expect(chunkTextForOutbound("", 0.5)).toEqual([""]);
+    expect(chunkTextForOutbound("abcdef   ", 5)).toEqual(["abcde", "f   "]);
   });
 
-  it("passes resolved cfg to sendMessageMatrix for media sends", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
-
-    await matrixOutbound.sendMedia!({
-      cfg,
+  it("preserves the complete Matrix sender result through sendMedia", async () => {
+    const sent = senderResult("first\nlast", ["$first", "media", "$reply"], ["$last", "text"]);
+    mocks.sendMessageMatrix.mockResolvedValueOnce(sent);
+    const result = await matrixOutbound.sendMedia!({
+      cfg: {} as OpenClawConfig,
       to: "room:!room:example",
-      text: "caption",
-      mediaUrl: "file:///tmp/cat.png",
-      mediaLocalRoots: ["/tmp/openclaw"],
+      text: "first\nlast",
+      mediaUrl: "file:///tmp/photo.png",
       accountId: "default",
-      audioAsVoice: true,
     });
 
-    const call = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix");
-    expect(call[0]).toBe("room:!room:example");
-    expect(call[1]).toBe("caption");
-    const options = mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix");
-    expect(options.cfg).toBe(cfg);
-    expect(options.mediaUrl).toBe("file:///tmp/cat.png");
-    expect(options.mediaLocalRoots).toEqual(["/tmp/openclaw"]);
-    expect(options.audioAsVoice).toBe(true);
+    expect(result).toMatchObject({
+      channel: "matrix",
+      messageId: "$last",
+      target: { kind: "room", id: "!room:example" },
+      primaryMessageId: "$first",
+      content: "first\nlast",
+    });
+    expect(result.receipt).toBe(sent.receipt);
   });
 
   it("passes resolved cfg through injected deps.matrix", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
     const matrix = vi.fn(async () => ({
       messageId: "evt-injected",
       roomId: "!room:example",
     }));
 
     await matrixOutbound.sendText!({
-      cfg,
-      to: "room:!room:example",
+      ...context,
       text: "hello via deps",
       deps: { matrix },
-      accountId: "default",
       threadId: "$thread",
       replyToId: "$reply",
     });
 
-    const call = mockCall(matrix, "deps.matrix");
-    expect(call[0]).toBe("room:!room:example");
-    expect(call[1]).toBe("hello via deps");
-    const options = mockOptions(matrix, "deps.matrix");
-    expect(options.cfg).toBe(cfg);
-    expect(options.accountId).toBe("default");
-    expect(options.threadId).toBe("$thread");
-    expect(options.replyToId).toBe("$reply");
+    expectSend(matrix, "hello via deps", {
+      cfg,
+      accountId: "default",
+      threadId: "$thread",
+      replyToId: "$reply",
+    });
+    expect(mockOptions(matrix).cfg).toBe(cfg);
   });
 
   it("passes resolved cfg to sendPollMatrix", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
-
     await matrixOutbound.sendPoll!({
-      cfg,
-      to: "room:!room:example",
+      ...context,
       poll: {
         question: "Snack?",
         options: ["Pizza", "Sushi"],
       },
-      accountId: "default",
       threadId: "$thread",
     });
 
-    const call = mockCall(mocks.sendPollMatrix, "sendPollMatrix");
-    expect(call[0]).toBe("room:!room:example");
-    expect(call[1]).toEqual({
-      question: "Snack?",
-      options: ["Pizza", "Sushi"],
-    });
-    const options = mockOptions(mocks.sendPollMatrix, "sendPollMatrix");
-    expect(options.cfg).toBe(cfg);
-    expect(options.accountId).toBe("default");
-    expect(options.threadId).toBe("$thread");
-  });
-
-  it("renders MessagePresentation into Matrix custom content metadata", async () => {
-    const presentation = {
-      title: "Select thinking level",
-      tone: "info" as const,
-      blocks: [
-        {
-          type: "buttons" as const,
-          buttons: [
-            { label: "Low", value: "/think low" },
-            { label: "High", value: "/think high", style: "primary" as const },
-          ],
-        },
-      ],
-    };
-
-    const rendered = await matrixOutbound.renderPresentation!({
-      payload: { text: "fallback", presentation },
-      presentation,
-      ctx: {} as never,
-    });
-
-    const matrixData = rendered?.channelData?.matrix as {
-      extraContent?: Record<string, unknown>;
-    };
-    expect(rendered?.text).toContain("fallback");
-    expect(rendered?.text).toContain("Select thinking level");
-    expect(matrixData.extraContent?.["com.openclaw.presentation"]).toEqual({
-      ...presentation,
-      version: 1,
-      type: "message.presentation",
-    });
+    expect(mocks.sendPollMatrix).toHaveBeenNthCalledWith(
+      1,
+      context.to,
+      { question: "Snack?", options: ["Pizza", "Sushi"] },
+      expect.objectContaining({ cfg, accountId: "default", threadId: "$thread" }),
+    );
+    expect(mockOptions(mocks.sendPollMatrix).cfg).toBe(cfg);
   });
 
   it("renders divider-only MessagePresentation with a non-empty Matrix fallback body", async () => {
@@ -241,269 +185,167 @@ describe("matrixOutbound cfg threading", () => {
     });
   });
 
-  it("passes Matrix presentation metadata through sendPayload extraContent", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
-
-    const presentationContent = {
-      version: 1,
-      type: "message.presentation",
-      title: "Select model",
+  it("keeps typed select commands actionable in Matrix fallback content", async () => {
+    const presentation = {
       blocks: [
         {
-          type: "select",
-          placeholder: "Choose model",
-          options: [{ label: "DeepSeek", value: "/model deepseek/deepseek-chat" }],
+          type: "select" as const,
+          placeholder: "Environment",
+          options: [
+            {
+              label: "Production",
+              action: { type: "command" as const, command: "/deploy production" },
+            },
+            {
+              label: "Opaque",
+              action: { type: "callback" as const, value: "private-callback-token" },
+            },
+          ],
         },
       ],
     };
 
-    await matrixOutbound.sendPayload!({
-      cfg,
-      to: "room:!room:example",
-      text: "Select model",
-      payload: {
-        text: "Select model",
-        channelData: {
-          matrix: {
-            extraContent: {
-              "com.openclaw.presentation": presentationContent,
-            },
-          },
-        },
-      },
-      accountId: "default",
-      threadId: "$thread",
-      replyToId: "$reply",
+    const rendered = await matrixOutbound.renderPresentation!({
+      payload: { text: "Choose", presentation },
+      presentation,
+      ctx: {} as never,
     });
 
-    const call = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix");
-    expect(call[0]).toBe("room:!room:example");
-    expect(call[1]).toBe("Select model");
-    const options = mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix");
-    expect(options.cfg).toBe(cfg);
-    expect(options.accountId).toBe("default");
-    expect(options.threadId).toBe("$thread");
-    expect(options.replyToId).toBe("$reply");
-    expect(options.extraContent).toEqual({
-      "com.openclaw.presentation": presentationContent,
+    expect(rendered?.text).toBe(
+      "Choose\n\nEnvironment:\n- Production: `/deploy production`\n- Opaque",
+    );
+    expect(rendered?.text).not.toContain("private-callback-token");
+  });
+
+  it.each([false, true])(
+    "forwards only presentation metadata with empty body=%s",
+    async (empty) => {
+      const text = empty ? "" : "Select model";
+      const presentation = empty ? presentationContent : { ...presentationContent, title: text };
+      const extraContent = { "com.openclaw.presentation": presentation };
+      const spoofed = empty
+        ? {}
+        : {
+            body: "spoofed",
+            msgtype: "m.notice",
+            "m.relates_to": { "m.in_reply_to": { event_id: "$spoof" } },
+          };
+      await sendPayload(
+        { text, channelData: channelData({ ...spoofed, ...extraContent }) },
+        context,
+      );
+      expectSend(mocks.sendMessageMatrix, empty ? "---" : "Select model", { extraContent });
+    },
+  );
+
+  it("preserves durable dispatch ownership across sendPayload media fanout", async () => {
+    const onPlatformSendDispatch = vi.fn();
+
+    await sendPayload(
+      {
+        text: "caption",
+        mediaUrls: ["", "file:///tmp/a.png", "   ", "file:///tmp/b.png"],
+      },
+      {
+        deliveryQueueId: "queue-1",
+        onPlatformSendDispatch,
+      },
+    );
+
+    expect(mocks.sendMessageMatrix).toHaveBeenCalledTimes(2);
+    expect(mockOptions(mocks.sendMessageMatrix, 0)).toMatchObject({
+      mediaUrl: "file:///tmp/a.png",
+      deliveryQueueId: "queue-1",
+      deliveryPartIndex: 0,
+      deliveryPartCount: 2,
+      onPlatformSendDispatch,
+    });
+    expect(mockOptions(mocks.sendMessageMatrix, 1)).toMatchObject({
+      mediaUrl: "file:///tmp/b.png",
+      deliveryQueueId: "queue-1",
+      deliveryPartIndex: 1,
+      deliveryPartCount: 2,
+      onPlatformSendDispatch,
     });
   });
 
-  it("sends empty Matrix presentation payloads with a minimal fallback body", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
+  it("combines media payload receipts without inventing replies on later events", async () => {
+    mocks.sendMessageMatrix
+      .mockResolvedValueOnce(
+        senderResult(
+          "caption\noverflow",
+          ["$image", "media", "$reply"],
+          ["$caption-overflow", "text"],
+        ),
+      )
+      .mockResolvedValueOnce(senderResult("second image", ["$second-image", "media"]));
 
-    const presentationContent = {
-      version: 1,
-      type: "message.presentation",
-      blocks: [{ type: "divider" }],
-    };
-
-    await matrixOutbound.sendPayload!({
-      cfg,
-      to: "room:!room:example",
-      text: "",
-      payload: {
-        text: "",
-        channelData: {
-          matrix: {
-            extraContent: {
-              "com.openclaw.presentation": presentationContent,
-            },
-          },
-        },
-      },
-      accountId: "default",
-    });
-
-    const call = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix");
-    expect(call[0]).toBe("room:!room:example");
-    expect(call[1]).toBe("---");
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix").extraContent).toEqual({
-      "com.openclaw.presentation": presentationContent,
-    });
-  });
-
-  it("only forwards presentation metadata from Matrix extraContent", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
-
-    const presentationContent = {
-      version: 1,
-      type: "message.presentation",
-      title: "Select model",
-      blocks: [{ type: "divider" }],
-    };
-
-    await matrixOutbound.sendPayload!({
-      cfg,
-      to: "room:!room:example",
-      text: "Select model",
-      payload: {
-        text: "Select model",
-        channelData: {
-          matrix: {
-            extraContent: {
-              body: "spoofed",
-              msgtype: "m.notice",
-              "m.relates_to": { "m.in_reply_to": { event_id: "$spoof" } },
-              "com.openclaw.presentation": presentationContent,
-            },
-          },
-        },
-      },
-      accountId: "default",
-    });
-
-    const call = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix");
-    expect(call[0]).toBe("room:!room:example");
-    expect(call[1]).toBe("Select model");
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix").extraContent).toEqual({
-      "com.openclaw.presentation": presentationContent,
-    });
-  });
-
-  it("sends all media URLs via sendPayload", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
-
-    await matrixOutbound.sendPayload!({
-      cfg,
-      to: "room:!room:example",
-      text: "caption",
-      payload: {
+    const result = await sendPayload(
+      {
         text: "caption",
         mediaUrls: ["file:///tmp/a.png", "file:///tmp/b.png"],
       },
-      accountId: "default",
-      threadId: "$thread",
-    });
+      {
+        accountId: "default",
+        replyToId: "$reply",
+        replyToIdSource: "implicit",
+        replyToMode: "first",
+      },
+    );
 
-    expect(mocks.sendMessageMatrix).toHaveBeenCalledTimes(2);
-    const firstCall = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix", 0);
-    expect(firstCall[0]).toBe("room:!room:example");
-    expect(firstCall[1]).toBe("caption");
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 0).mediaUrl).toBe(
-      "file:///tmp/a.png",
-    );
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 0).threadId).toBe("$thread");
-    const secondCall = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix", 1);
-    expect(secondCall[0]).toBe("room:!room:example");
-    expect(secondCall[1]).toBe("");
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 1).mediaUrl).toBe(
-      "file:///tmp/b.png",
-    );
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 1).threadId).toBe("$thread");
+    expect(mockOptions(mocks.sendMessageMatrix, 0)).toHaveProperty("replyToId", "$reply");
+    expect(mockOptions(mocks.sendMessageMatrix, 1)).toHaveProperty("replyToId", undefined);
+    expect(result).toMatchObject({
+      channel: "matrix",
+      messageId: "$second-image",
+      primaryMessageId: "$image",
+      content: "caption\noverflow\nsecond image",
+    });
+    expect(result.receipt?.primaryPlatformMessageId).toBe("$image");
+    expect(result.receipt?.platformMessageIds).toEqual([
+      "$image",
+      "$caption-overflow",
+      "$second-image",
+    ]);
+    expect(result.receipt?.parts).toMatchObject([
+      { platformMessageId: "$image", kind: "media", index: 0, replyToId: "$reply" },
+      { platformMessageId: "$caption-overflow", kind: "text", index: 1 },
+      { platformMessageId: "$second-image", kind: "media", index: 2 },
+    ]);
+    expect(result.receipt?.parts[1]).not.toHaveProperty("replyToId");
+    expect(result.receipt?.parts[2]).not.toHaveProperty("replyToId");
   });
 
-  it("sends mediaUrls with extraContent only on first item", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "resolved-token",
-        },
-      },
-    } as OpenClawConfig;
-
-    await matrixOutbound.sendPayload!({
-      cfg,
-      to: "room:!room:example",
-      text: "caption",
-      payload: {
+  it("applies caption and presentation metadata to the first non-empty media URL", async () => {
+    await sendPayload(
+      {
         text: "caption",
-        mediaUrls: ["file:///tmp/a.png", "file:///tmp/b.png"],
-        channelData: {
-          matrix: {
-            extraContent: {
-              "com.openclaw.presentation": {
-                version: 1,
-                type: "message.presentation",
-              },
-            },
-          },
-        },
+        mediaUrls: ["", "file:///tmp/a.png", "file:///tmp/b.png"],
+        channelData: channelData({
+          "com.openclaw.presentation": { version: 1, type: "message.presentation" },
+        }),
       },
-      accountId: "default",
-      threadId: "$thread",
-    });
+      {
+        ...context,
+        threadId: "$thread",
+      },
+    );
 
     expect(mocks.sendMessageMatrix).toHaveBeenCalledTimes(2);
-    const firstCall = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix", 0);
-    expect(firstCall[0]).toBe("room:!room:example");
-    expect(firstCall[1]).toBe("caption");
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 0).extraContent).toEqual({
-      "com.openclaw.presentation": {
-        version: 1,
-        type: "message.presentation",
-      },
+    expectSend(mocks.sendMessageMatrix, "caption", {
+      mediaUrl: "file:///tmp/a.png",
+      threadId: "$thread",
+      extraContent: { "com.openclaw.presentation": { version: 1, type: "message.presentation" } },
     });
-    const secondCall = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix", 1);
-    expect(secondCall[0]).toBe("room:!room:example");
-    expect(secondCall[1]).toBe("");
-    expect(
-      mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 1).extraContent,
-    ).toBeUndefined();
-  });
-
-  it("regression: mediaUrls are never silently dropped by sendPayload", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accessToken: "regression-token",
-        },
+    expectSend(
+      mocks.sendMessageMatrix,
+      "",
+      {
+        mediaUrl: "file:///tmp/b.png",
+        threadId: "$thread",
+        extraContent: undefined,
       },
-    } as OpenClawConfig;
-
-    await matrixOutbound.sendPayload!({
-      cfg,
-      to: "room:!room:regression",
-      text: "caption",
-      payload: {
-        text: "caption",
-        mediaUrls: ["file:///img1.png", "file:///img2.png", "file:///img3.png"],
-      },
-      accountId: "default",
-    });
-
-    expect(mocks.sendMessageMatrix).toHaveBeenCalledTimes(3);
-    const firstCall = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix", 0);
-    expect(firstCall[0]).toBe("room:!room:regression");
-    expect(firstCall[1]).toBe("caption");
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 0).mediaUrl).toBe(
-      "file:///img1.png",
-    );
-    const secondCall = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix", 1);
-    expect(secondCall[0]).toBe("room:!room:regression");
-    expect(secondCall[1]).toBe("");
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 1).mediaUrl).toBe(
-      "file:///img2.png",
-    );
-    const thirdCall = mockCall(mocks.sendMessageMatrix, "sendMessageMatrix", 2);
-    expect(thirdCall[0]).toBe("room:!room:regression");
-    expect(thirdCall[1]).toBe("");
-    expect(mockOptions(mocks.sendMessageMatrix, "sendMessageMatrix", 2).mediaUrl).toBe(
-      "file:///img3.png",
+      2,
     );
   });
 });

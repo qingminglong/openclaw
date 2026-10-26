@@ -1,27 +1,33 @@
-// Nostr plugin module implements channel behavior.
-import { describeAccountSnapshot } from "openclaw/plugin-sdk/account-helpers";
 import {
   createScopedDmSecurityResolver,
   createTopLevelChannelConfigAdapter,
 } from "openclaw/plugin-sdk/channel-config-helpers";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-contract";
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
+import { missingTargetError } from "openclaw/plugin-sdk/channel-feedback";
 import { createChannelMessageAdapterFromOutbound } from "openclaw/plugin-sdk/channel-outbound";
+import {
+  DEFAULT_ACCOUNT_ID,
+  formatPairingApproveHint,
+  type ChannelPlugin,
+} from "openclaw/plugin-sdk/channel-plugin-common";
+import {
+  buildChannelOutboundSessionRoute,
+  stripChannelTargetPrefix,
+  type ChannelOutboundSessionRouteParams,
+} from "openclaw/plugin-sdk/core";
 import {
   buildPassiveChannelStatusSummary,
   buildTrafficStatusSummary,
 } from "openclaw/plugin-sdk/extension-shared";
-import { createComputedAccountStatusAdapter } from "openclaw/plugin-sdk/status-helpers";
-import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
-  buildChannelConfigSchema,
   collectStatusIssuesFromLastError,
+  createComputedAccountStatusAdapter,
   createDefaultChannelRuntimeState,
-  DEFAULT_ACCOUNT_ID,
-  formatPairingApproveHint,
-  type ChannelPlugin,
-} from "./channel-api.js";
+} from "openclaw/plugin-sdk/status-helpers";
+import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { nostrSetupPlugin } from "./channel.setup.js";
 import type { NostrProfile } from "./config-schema.js";
-import { NostrConfigSchema } from "./config-schema.js";
 import {
   getActiveNostrBuses,
   nostrOutboundAdapter,
@@ -30,14 +36,53 @@ import {
 } from "./gateway.js";
 import { normalizePubkey } from "./nostr-key-utils.js";
 import type { ProfilePublishResult } from "./nostr-profile.js";
-import { resolveNostrOutboundSessionRoute } from "./session-route.js";
-import { nostrSetupAdapter, nostrSetupWizard } from "./setup-surface.js";
+import { nostrSetupContract, nostrSetupWizard } from "./setup-surface.js";
 import {
   listNostrAccountIds,
   resolveDefaultNostrAccountId,
   resolveNostrAccount,
   type ResolvedNostrAccount,
 } from "./types.js";
+
+const NOSTR_TARGET_HINT = "<npub|hex pubkey|nostr:npub...>";
+
+function stripNostrTargetPrefix(target: string): string {
+  return target.trim().replace(/^nostr:/i, "");
+}
+
+function normalizeNostrTarget(target: string): string {
+  const cleaned = stripNostrTargetPrefix(target);
+  try {
+    return normalizePubkey(cleaned);
+  } catch {
+    // Invalid prefixed tokens must stay distinct from "*" so formatting cannot widen access.
+    return target.trim();
+  }
+}
+
+function resolveNostrOutboundSessionRoute(params: ChannelOutboundSessionRouteParams) {
+  const rawTarget = stripChannelTargetPrefix(params.target, "nostr");
+  let target: string;
+  try {
+    target = normalizePubkey(rawTarget);
+  } catch {
+    return null;
+  }
+  return buildChannelOutboundSessionRoute({
+    cfg: params.cfg,
+    agentId: params.agentId,
+    channel: "nostr",
+    accountId: params.accountId,
+    recipientSessionExact: true,
+    peer: {
+      kind: "direct",
+      id: target,
+    },
+    chatType: "direct",
+    from: `nostr:${target}`,
+    to: `nostr:${target}`,
+  });
+}
 
 const resolveNostrDmPolicy = createScopedDmSecurityResolver<ResolvedNostrAccount>({
   channelKey: "nostr",
@@ -46,13 +91,7 @@ const resolveNostrDmPolicy = createScopedDmSecurityResolver<ResolvedNostrAccount
   policyPathSuffix: "dmPolicy",
   defaultPolicy: "pairing",
   approveHint: formatPairingApproveHint("nostr"),
-  normalizeEntry: (raw) => {
-    try {
-      return normalizePubkey(raw.trim().replace(/^nostr:/i, ""));
-    } catch {
-      return raw.trim();
-    }
-  },
+  normalizeEntry: normalizeNostrTarget,
 });
 
 const nostrConfigAdapter = createTopLevelChannelConfigAdapter<ResolvedNostrAccount>({
@@ -72,18 +111,7 @@ const nostrConfigAdapter = createTopLevelChannelConfigAdapter<ResolvedNostrAccou
   ],
   resolveAllowFrom: (account) => account.config.allowFrom,
   formatAllowFrom: (allowFrom) =>
-    normalizeStringEntries(allowFrom)
-      .map((entry) => {
-        if (entry === "*") {
-          return "*";
-        }
-        try {
-          return normalizePubkey(entry);
-        } catch {
-          return entry;
-        }
-      })
-      .filter(Boolean),
+    normalizeStringEntries(allowFrom).map(normalizeNostrTarget).filter(Boolean),
 });
 
 const nostrMessageAdapter = createChannelMessageAdapterFromOutbound({
@@ -91,80 +119,80 @@ const nostrMessageAdapter = createChannelMessageAdapterFromOutbound({
   outbound: nostrOutboundAdapter,
 });
 
+const nostrPluginOutboundAdapter: ChannelOutboundAdapter = {
+  ...nostrOutboundAdapter,
+  resolveTarget: ({ to }) => {
+    const trimmed = to?.trim() ?? "";
+    if (!trimmed) {
+      return {
+        ok: false,
+        error: missingTargetError("Nostr", NOSTR_TARGET_HINT),
+      };
+    }
+    try {
+      return { ok: true, to: normalizePubkey(stripNostrTargetPrefix(trimmed)) };
+    } catch {
+      return {
+        ok: false,
+        error: new Error("Nostr target must be a 64-character hex pubkey or npub value"),
+      };
+    }
+  },
+};
+
 export const nostrPlugin: ChannelPlugin<ResolvedNostrAccount> = createChatChannelPlugin({
   base: {
-    id: "nostr",
-    meta: {
-      id: "nostr",
-      label: "Nostr",
-      selectionLabel: "Nostr",
-      docsPath: "/channels/nostr",
-      docsLabel: "nostr",
-      blurb: "Decentralized DMs via Nostr relays (NIP-04)",
-      order: 100,
-    },
-    capabilities: {
-      chatTypes: ["direct"], // DMs only for MVP
-      media: false, // No media for MVP
-    },
-    reload: { configPrefixes: ["channels.nostr"] },
-    configSchema: buildChannelConfigSchema(NostrConfigSchema),
-    setup: nostrSetupAdapter,
+    ...nostrSetupPlugin,
+    setupContract: nostrSetupContract,
     setupWizard: nostrSetupWizard,
     config: {
+      ...nostrSetupPlugin.config,
       ...nostrConfigAdapter,
-      isConfigured: (account) => account.configured,
-      describeAccount: (account) =>
-        describeAccountSnapshot({
-          account,
-          configured: account.configured,
-          extra: {
-            publicKey: account.publicKey,
-          },
-        }),
     },
     messaging: {
       targetPrefixes: ["nostr"],
-      normalizeTarget: (target) => {
-        // Strip nostr: prefix if present
-        const cleaned = target.trim().replace(/^nostr:/i, "");
+      normalizeTarget: normalizeNostrTarget,
+      inferTargetChatType: ({ to }) => {
         try {
-          return normalizePubkey(cleaned);
+          normalizePubkey(stripNostrTargetPrefix(to));
+          return "direct";
         } catch {
-          return cleaned;
+          return undefined;
         }
       },
       targetResolver: {
-        looksLikeId: (input) => {
-          const trimmed = input.trim();
-          return trimmed.startsWith("npub1") || /^[0-9a-fA-F]{64}$/.test(trimmed);
+        looksLikeId: (input, normalized) => {
+          const trimmed = normalized?.trim() || stripNostrTargetPrefix(input);
+          return (
+            trimmed.startsWith("npub1") ||
+            trimmed.startsWith("NPUB1") ||
+            /^[0-9a-fA-F]{64}$/.test(trimmed)
+          );
         },
-        hint: "<npub|hex pubkey|nostr:npub...>",
+        hint: NOSTR_TARGET_HINT,
       },
-      resolveOutboundSessionRoute: (params) => resolveNostrOutboundSessionRoute(params),
+      resolveOutboundSessionRoute: resolveNostrOutboundSessionRoute,
     },
     message: nostrMessageAdapter,
-    status: {
-      ...createComputedAccountStatusAdapter<ResolvedNostrAccount>({
-        defaultRuntime: createDefaultChannelRuntimeState(DEFAULT_ACCOUNT_ID),
-        collectStatusIssues: (accounts) => collectStatusIssuesFromLastError("nostr", accounts),
-        buildChannelSummary: ({ snapshot }) =>
-          buildPassiveChannelStatusSummary(snapshot, {
-            publicKey: snapshot.publicKey ?? null,
-          }),
-        resolveAccountSnapshot: ({ account, runtime }) => ({
-          accountId: account.accountId,
-          name: account.name,
-          enabled: account.enabled,
-          configured: account.configured,
-          extra: {
-            publicKey: account.publicKey,
-            profile: account.profile,
-            ...buildTrafficStatusSummary(runtime),
-          },
+    status: createComputedAccountStatusAdapter<ResolvedNostrAccount>({
+      defaultRuntime: createDefaultChannelRuntimeState(DEFAULT_ACCOUNT_ID),
+      collectStatusIssues: (accounts) => collectStatusIssuesFromLastError("nostr", accounts),
+      buildChannelSummary: ({ snapshot }) =>
+        buildPassiveChannelStatusSummary(snapshot, {
+          publicKey: snapshot.publicKey ?? null,
         }),
+      resolveAccountSnapshot: ({ account, runtime }) => ({
+        accountId: account.accountId,
+        name: account.name,
+        enabled: account.enabled,
+        configured: account.configured,
+        extra: {
+          publicKey: account.publicKey,
+          profile: account.profile,
+          ...buildTrafficStatusSummary(runtime),
+        },
       }),
-    },
+    }),
     gateway: {
       startAccount: startNostrGatewayAccount,
     },
@@ -175,16 +203,9 @@ export const nostrPlugin: ChannelPlugin<ResolvedNostrAccount> = createChatChanne
   security: {
     resolveDmPolicy: resolveNostrDmPolicy,
   },
-  outbound: nostrOutboundAdapter,
+  outbound: nostrPluginOutboundAdapter,
 });
 
-/**
- * Publish a profile (kind:0) for a Nostr account.
- * @param accountId - Account ID (defaults to "default")
- * @param profile - Profile data to publish
- * @returns Publish results with successes and failures
- * @throws Error if account is not running
- */
 export async function publishNostrProfile(
   accountId: string | undefined,
   profile: NostrProfile,
@@ -197,16 +218,7 @@ export async function publishNostrProfile(
   return bus.publishProfile(profile);
 }
 
-/**
- * Get profile publish state for a Nostr account.
- * @param accountId - Account ID (defaults to "default")
- * @returns Profile publish state or null if account not running
- */
-export async function getNostrProfileState(accountId: string = DEFAULT_ACCOUNT_ID): Promise<{
-  lastPublishedAt: number | null;
-  lastPublishedEventId: string | null;
-  lastPublishResults: Record<string, "ok" | "failed" | "timeout"> | null;
-} | null> {
+export async function getNostrProfileState(accountId: string = DEFAULT_ACCOUNT_ID) {
   const bus = getActiveNostrBuses().get(accountId);
   if (!bus) {
     return null;

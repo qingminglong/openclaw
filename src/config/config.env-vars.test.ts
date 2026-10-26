@@ -1,361 +1,366 @@
-// Covers environment-variable config metadata and parsing.
-import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDotEnv } from "../infra/dotenv.js";
-import { resolveConfigEnvVars } from "./env-substitution.js";
+import {
+  clearFsSafeEnvFallback,
+  fsSafeEnvInput,
+  normalizeFsSafeNativeEnv,
+} from "../infra/fs-safe-env.js";
 import {
   applyConfigEnvVars,
-  collectDurableServiceEnvVars,
-  collectConfigRuntimeEnvVars,
+  captureConfigReadEnvMutation,
+  cloneEnvWithPlatformSemantics,
+  collectConfigRuntimeEnvOwnership,
   createConfigRuntimeEnv,
-  readStateDirDotEnvVars,
-} from "./env-vars.js";
-import { withEnvOverride, withTempHome, writeStateDirDotEnv } from "./test-helpers.js";
+  getPublishedConfigRuntimeEnvState as publishedEnv,
+  initializePublishedConfigRuntimeEnv,
+  prepareConfigRuntimeEnv as prepareEnv,
+  prepareConfigRuntimeEnvLoad as stageLoad,
+  resetPublishedConfigRuntimeEnv,
+  restoreEnvChangesIfUnchanged,
+  snapshotEnv,
+} from "./config-env-vars.js";
+import { resolveConfigEnvVars } from "./env-substitution.js";
+import { assertGatewayConfigEnvSelectionUnchanged } from "./gateway-env-selection.js";
+import { collectDurableServiceEnvVars } from "./state-dir-dotenv.js";
+import { withTempHome, writeStateDirDotEnv } from "./test-helpers.js";
 import type { OpenClawConfig } from "./types.js";
 
+const key = "OPENCLAW_TEST_ENV";
+const dotenvKey = "OPENCLAW_TEST_DOTENV";
+const shellKey = "OPENCLAW_TEST_SHELL";
+const config = (vars: Record<string, string>): OpenClawConfig => ({ env: { vars } });
+const prepareChange = (
+  previousConfig: OpenClawConfig,
+  nextConfig: OpenClawConfig,
+  env?: NodeJS.ProcessEnv,
+) => prepareEnv({ previousConfig, nextConfig, env });
+const windows = () => vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+function applied(source: OpenClawConfig) {
+  const env = {};
+  applyConfigEnvVars(source, env);
+  return env;
+}
+
+function initialize(ownedEnv: Record<string, string> = {}) {
+  for (const name of [key, dotenvKey, shellKey]) {
+    vi.stubEnv(name, ownedEnv[name]);
+  }
+  const previousConfig = config(ownedEnv);
+  initializePublishedConfigRuntimeEnv(previousConfig, { ownedEnv });
+  return previousConfig;
+}
+
+afterEach(() => {
+  resetPublishedConfigRuntimeEnv();
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
+
 describe("config env vars", () => {
-  it("applies env vars from env block when missing", async () => {
-    await withEnvOverride({ OPENROUTER_API_KEY: undefined }, async () => {
-      applyConfigEnvVars({ env: { vars: { OPENROUTER_API_KEY: "config-key" } } } as OpenClawConfig);
-      expect(process.env.OPENROUTER_API_KEY).toBe("config-key");
-    });
-  });
-
-  it("does not override existing env vars", async () => {
-    await withEnvOverride({ OPENROUTER_API_KEY: "existing-key" }, async () => {
-      applyConfigEnvVars({ env: { vars: { OPENROUTER_API_KEY: "config-key" } } } as OpenClawConfig);
-      expect(process.env.OPENROUTER_API_KEY).toBe("existing-key");
-    });
-  });
-
-  it("overrides only exact lower-precedence env values", () => {
-    const config = {
-      env: { vars: { OPENROUTER_API_KEY: "config-key" } },
-    } as OpenClawConfig;
-    const lowerPrecedenceEnv = { OPENROUTER_API_KEY: "shell-key" };
-    const shellEnv = { OPENROUTER_API_KEY: "shell-key" };
-    const changedEnv = { OPENROUTER_API_KEY: "changed-key" };
-
-    applyConfigEnvVars(config, shellEnv, { lowerPrecedenceEnv });
-    applyConfigEnvVars(config, changedEnv, { lowerPrecedenceEnv });
-
-    expect(shellEnv.OPENROUTER_API_KEY).toBe("config-key");
-    expect(changedEnv.OPENROUTER_API_KEY).toBe("changed-key");
-  });
-
-  it("applies config env above normalized lower-precedence aliases", () => {
-    const onLowerPrecedenceKeysReplaced = vi.fn();
-    const env = { ZAI_API_KEY: "shell-key" };
-
-    applyConfigEnvVars({ env: { vars: { Z_AI_API_KEY: "config-key" } } } as OpenClawConfig, env, {
-      lowerPrecedenceEnv: { ZAI_API_KEY: "shell-key" },
-      onLowerPrecedenceKeysReplaced,
-    });
-
-    expect(env).toEqual({
-      ZAI_API_KEY: "config-key",
-      Z_AI_API_KEY: "config-key",
-    });
-    expect(onLowerPrecedenceKeysReplaced).toHaveBeenCalledWith(["ZAI_API_KEY"]);
-  });
-
-  it("preserves a higher-precedence normalized alias", () => {
-    const env = {
-      ZAI_API_KEY: "shell-key",
-      Z_AI_API_KEY: "invocation-key",
-    };
-
-    applyConfigEnvVars({ env: { vars: { ZAI_API_KEY: "config-key" } } } as OpenClawConfig, env, {
-      lowerPrecedenceEnv: { ZAI_API_KEY: "shell-key" },
-    });
-
-    expect(env).toEqual({
-      ZAI_API_KEY: "invocation-key",
-      Z_AI_API_KEY: "invocation-key",
-    });
-  });
-
-  it("mirrors a higher-precedence canonical value into a config-declared alias", () => {
-    const env = { ZAI_API_KEY: "invocation-key" };
-
-    applyConfigEnvVars({ env: { vars: { Z_AI_API_KEY: "config-key" } } } as OpenClawConfig, env);
-
-    expect(env).toEqual({
-      ZAI_API_KEY: "invocation-key",
-      Z_AI_API_KEY: "invocation-key",
-    });
-  });
-
-  it.runIf(process.platform !== "win32")("keeps unrelated POSIX env casing distinct", () => {
-    const env = { FOO: "host-key" };
-
-    applyConfigEnvVars({ env: { vars: { foo: "config-key" } } } as OpenClawConfig, env);
-
-    expect(env).toEqual({
-      FOO: "host-key",
-      foo: "config-key",
-    });
-  });
-
-  it("applies env vars from env.vars when missing", async () => {
-    await withEnvOverride({ GROQ_API_KEY: undefined }, async () => {
-      applyConfigEnvVars({ env: { vars: { GROQ_API_KEY: "gsk-config" } } } as OpenClawConfig);
-      expect(process.env.GROQ_API_KEY).toBe("gsk-config");
-    });
-  });
-
-  it("skips non-string env.vars values from runtime JSON configs", async () => {
-    await withEnvOverride({ API_TOKEN: undefined, PORT: undefined, DEBUG: undefined }, async () => {
-      const cfg = JSON.parse(`{
-        "env": {
-          "vars": {
-            "API_TOKEN": "sk-test-123",
-            "PORT": 8080,
-            "DEBUG": true
-          }
-        }
-      }`);
-
-      expect(applyConfigEnvVars(cfg)).toBeUndefined();
-      expect(process.env.API_TOKEN).toBe("sk-test-123");
-      expect(process.env.PORT).toBeUndefined();
-      expect(process.env.DEBUG).toBeUndefined();
-    });
-  });
-
-  it("can build a merged runtime env without mutating process.env", async () => {
-    await withEnvOverride({ OPENROUTER_API_KEY: undefined }, async () => {
-      const merged = createConfigRuntimeEnv({
-        env: { vars: { OPENROUTER_API_KEY: "config-key" } },
-      } as OpenClawConfig);
-      expect(merged.OPENROUTER_API_KEY).toBe("config-key");
-      expect(process.env.OPENROUTER_API_KEY).toBeUndefined();
-    });
-  });
-
-  it("preserves Windows case-insensitive env precedence in merged runtime env", () => {
-    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    try {
-      const merged = createConfigRuntimeEnv(
-        { env: { vars: { OPENCLAW_LOAD_SHELL_ENV: "1" } } } as OpenClawConfig,
-        { OpenClaw_Load_Shell_Env: "0" },
-      );
-
-      expect(merged.OPENCLAW_LOAD_SHELL_ENV).toBe("0");
-      expect(Object.keys(merged)).toEqual(["OpenClaw_Load_Shell_Env"]);
-    } finally {
-      platformSpy.mockRestore();
-    }
-  });
-
-  it("blocks dangerous startup env vars from config env", async () => {
-    await withEnvOverride(
-      {
-        BASH_ENV: undefined,
-        SHELL: undefined,
-        HOME: undefined,
-        ZDOTDIR: undefined,
-        OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS: undefined,
-        OPENCLAW_INCLUDE_ROOTS: undefined,
-        openclaw_allow_older_binary_destructive_actions: undefined,
-        OPENROUTER_API_KEY: undefined,
-      },
-      async () => {
-        const config = {
-          env: {
-            vars: {
-              BASH_ENV: "/tmp/pwn.sh",
-              SHELL: "/tmp/evil-shell",
-              HOME: "/tmp/evil-home",
-              ZDOTDIR: "/tmp/evil-zdotdir",
-              OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS: "1",
-              OPENCLAW_INCLUDE_ROOTS: "/tmp/evil-include-root",
-              openclaw_allow_older_binary_destructive_actions: "1",
-              OPENROUTER_API_KEY: "config-key",
-            },
+  it("blocks config-owned host controls and startup env vars", () => {
+    expect(
+      applied({
+        env: {
+          OpenClaw_Config_ReadOnly: "1",
+          vars: {
+            ...Object.fromEntries(
+              `OPENCLAW_CONFIG_READONLY BASH_ENV SHELL HOME ZDOTDIR
+               OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS
+               openclaw_allow_older_binary_destructive_actions OPENCLAW_INCLUDE_ROOTS`
+                .split(/\s+/)
+                .map((name) => [name, "/tmp/blocked"]),
+            ),
+            OPENCLAW_DISABLE_GATEWAY_LOCAL_TERMINALS: "0",
+            OPENCLAW_DISABLE_CRON_HOST_EXECUTION: "0",
+            OPENCLAW_NIX_MODE: "1",
+            VALID: "literal",
           },
-        };
-        const entries = collectConfigRuntimeEnvVars(config as OpenClawConfig);
-        expect(entries.BASH_ENV).toBeUndefined();
-        expect(entries.SHELL).toBeUndefined();
-        expect(entries.HOME).toBeUndefined();
-        expect(entries.ZDOTDIR).toBeUndefined();
-        expect(entries.OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS).toBeUndefined();
-        expect(entries.OPENCLAW_INCLUDE_ROOTS).toBeUndefined();
-        expect(entries.openclaw_allow_older_binary_destructive_actions).toBeUndefined();
-        expect(entries.OPENROUTER_API_KEY).toBe("config-key");
+        },
+      }),
+    ).toEqual({ OPENCLAW_NIX_MODE: "1", VALID: "literal" });
+  });
 
-        applyConfigEnvVars(config as OpenClawConfig);
-        expect(process.env.BASH_ENV).toBeUndefined();
-        expect(process.env.SHELL).toBeUndefined();
-        expect(process.env.HOME).toBeUndefined();
-        expect(process.env.ZDOTDIR).toBeUndefined();
-        expect(process.env.OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS).toBeUndefined();
-        expect(process.env.OPENCLAW_INCLUDE_ROOTS).toBeUndefined();
-        expect(process.env.openclaw_allow_older_binary_destructive_actions).toBeUndefined();
-        expect(process.env.OPENROUTER_API_KEY).toBe("config-key");
-      },
+  it.each<[string, OpenClawConfig]>([
+    [
+      "malformed entries",
+      JSON.parse(
+        '{"env":{"NOT-PORTABLE":"bad","vars":{" BAD KEY":"bad","PORT":8080,"DEBUG":true,"EMPTY":"","VALID":"literal"}}}',
+      ),
+    ],
+    [
+      "unresolved references",
+      config({ BARE_REF: "${SOME_VAR}", DEFAULT_REF: "${SOME_VAR:-fallback}", VALID: "literal" }),
+    ],
+  ])("ignores %s", (_name, source) => {
+    expect(applied(source)).toEqual({ VALID: "literal" });
+  });
+
+  it("prepares updates and removals without mutating the target", () => {
+    const previousConfig = config({ UPDATE_ME: "old", REMOVE_ME: "owned", KEEP_OVERRIDE: "owned" });
+    const env: NodeJS.ProcessEnv = applied(previousConfig);
+    env.KEEP_OVERRIDE = "ambient";
+    const prepared = prepareChange(previousConfig, config({ UPDATE_ME: "new" }), env);
+    expect(env).toEqual({ UPDATE_ME: "old", REMOVE_ME: "owned", KEEP_OVERRIDE: "ambient" });
+    expect(prepared.env).toEqual({ UPDATE_ME: "new", KEEP_OVERRIDE: "ambient" });
+    const rollback = prepared.publish();
+    expect(env).toEqual({ UPDATE_ME: "new", KEEP_OVERRIDE: "ambient" });
+    rollback();
+    expect(env).toEqual({ UPDATE_ME: "old", REMOVE_ME: "owned", KEEP_OVERRIDE: "ambient" });
+  });
+
+  it("keeps same-valued dotenv and shell entries ambient when staged config is removed", () => {
+    const previousConfig = initialize();
+    const stage = stageLoad({ previousConfig });
+    stage.env[dotenvKey] = "shared";
+    stage.captureDotEnvBaseline();
+    const nextConfig = config({ [dotenvKey]: "shared", [key]: "config" });
+    applyConfigEnvVars(nextConfig, stage.env);
+    stage.env[shellKey] = "shell";
+    stage.prepare(nextConfig).publish().commit();
+    expect(publishedEnv().ownedEnv).toEqual({ [key]: "config" });
+    prepareChange(nextConfig, {}).publish().commit();
+    expect([process.env[key], process.env[dotenvKey], process.env[shellKey]]).toEqual([
+      undefined,
+      "shared",
+      "shell",
+    ]);
+  });
+
+  it("publishes only captured dotenv after failed loading and preserves prior ownership", () => {
+    const previousConfig = initialize({ [key]: "previous" });
+    vi.stubEnv("OPENCLAW_TEST_FAILED_CONFIG", undefined);
+    const stage = stageLoad({ previousConfig });
+    stage.env[dotenvKey] = "loaded before failure";
+    stage.captureDotEnvBaseline();
+    applyConfigEnvVars(
+      config({ [key]: "candidate", OPENCLAW_TEST_FAILED_CONFIG: "candidate" }),
+      stage.env,
     );
-  });
-
-  it("drops non-portable env keys from config env", async () => {
-    await withEnvOverride({ OPENROUTER_API_KEY: undefined }, async () => {
-      const config = {
-        env: {
-          vars: {
-            " BAD KEY": "oops",
-            OPENROUTER_API_KEY: "config-key",
-          },
-          "NOT-PORTABLE": "bad",
-        },
-      };
-      const entries = collectConfigRuntimeEnvVars(config as OpenClawConfig);
-      expect(entries.OPENROUTER_API_KEY).toBe("config-key");
-      expect(entries[" BAD KEY"]).toBeUndefined();
-      expect(entries["NOT-PORTABLE"]).toBeUndefined();
+    stage.env[shellKey] = "candidate shell";
+    stage.env[dotenvKey] = "later config mutation";
+    const rollback = stage.prepareFailure().publish();
+    expect([
+      process.env[key],
+      process.env[dotenvKey],
+      process.env.OPENCLAW_TEST_FAILED_CONFIG,
+      process.env[shellKey],
+    ]).toEqual(["previous", "loaded before failure", undefined, undefined]);
+    expect(publishedEnv()).toEqual({
+      sourceConfig: previousConfig,
+      ownedEnv: { [key]: "previous" },
+    });
+    rollback();
+    expect([process.env[dotenvKey], process.env[key]]).toEqual([undefined, "previous"]);
+    expect(publishedEnv()).toEqual({
+      sourceConfig: previousConfig,
+      ownedEnv: { [key]: "previous" },
     });
   });
 
-  it("drops unresolved env references from config env", async () => {
-    const entries = collectConfigRuntimeEnvVars({
-      env: {
-        vars: {
-          OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}",
-          BRAVE_API_KEY: "config-key",
-        },
-      },
-    } as OpenClawConfig);
-
-    expect(entries.OPENROUTER_API_KEY).toBeUndefined();
-    expect(entries.BRAVE_API_KEY).toBe("config-key");
-  });
-
-  it("drops unresolved env references from top-level config env", async () => {
-    const entries = collectConfigRuntimeEnvVars({
-      env: {
-        OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}",
-        BRAVE_API_KEY: "config-key",
-      },
-    } as OpenClawConfig);
-
-    expect(entries.OPENROUTER_API_KEY).toBeUndefined();
-    expect(entries.BRAVE_API_KEY).toBe("config-key");
-  });
-
-  it("keeps resolved env references from config env", async () => {
-    const resolvedConfig = resolveConfigEnvVars(
-      {
-        env: {
-          vars: {
-            OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}",
-            BRAVE_API_KEY: "config-key",
-          },
-        },
-      },
-      { OPENROUTER_API_KEY: "resolved-key" },
-    ) as OpenClawConfig;
-
-    const entries = collectConfigRuntimeEnvVars(resolvedConfig);
-
-    expect(entries.OPENROUTER_API_KEY).toBe("resolved-key");
-    expect(entries.BRAVE_API_KEY).toBe("config-key");
-  });
-
-  it("loads ${VAR} substitutions from ~/.openclaw/.env on repeated runtime loads", async () => {
-    await withTempHome(async (_home) => {
-      await withEnvOverride({ BRAVE_API_KEY: undefined }, async () => {
-        const stateDir = process.env.OPENCLAW_STATE_DIR?.trim();
-        if (!stateDir) {
-          throw new Error("Expected OPENCLAW_STATE_DIR to be set by withTempHome");
-        }
-        await fs.mkdir(stateDir, { recursive: true });
-        await fs.writeFile(path.join(stateDir, ".env"), "BRAVE_API_KEY=from-dotenv\n", "utf-8");
-
-        const config: OpenClawConfig = {
-          tools: {
-            web: {
-              search: {
-                apiKey: "${BRAVE_API_KEY}",
-              },
-            },
-          },
-        };
-
-        loadDotEnv({ quiet: true });
-        const first = resolveConfigEnvVars(config, process.env) as OpenClawConfig;
-        expect(first.tools?.web?.search?.apiKey).toBe("from-dotenv");
-
-        delete process.env.BRAVE_API_KEY;
-        loadDotEnv({ quiet: true });
-        const second = resolveConfigEnvVars(config, process.env) as OpenClawConfig;
-        expect(second.tools?.web?.search?.apiKey).toBe("from-dotenv");
-      });
+  it("retains live overrides during isolated loading and after publication", () => {
+    const previousConfig = config({ CONFIG_VALUE: "old" });
+    const env: NodeJS.ProcessEnv = applied(previousConfig);
+    const stage = stageLoad({ previousConfig, env });
+    stage.captureDotEnvBaseline();
+    const nextConfig = config({ CONFIG_VALUE: "candidate", ADDED_VALUE: "added" });
+    applyConfigEnvVars(nextConfig, stage.env);
+    env.CONFIG_VALUE = "external during load";
+    const rollback = stage.prepare(nextConfig).publish();
+    expect(env).toEqual({ CONFIG_VALUE: "external during load", ADDED_VALUE: "added" });
+    env.ADDED_VALUE = "external after publish";
+    rollback();
+    expect(env).toEqual({
+      CONFIG_VALUE: "external during load",
+      ADDED_VALUE: "external after publish",
     });
   });
 
-  it("reads key-value pairs from the state-dir .env file", async () => {
-    await withTempHome(async (_home) => {
-      await writeStateDirDotEnv("BRAVE_API_KEY=BSA-test-key\nDISCORD_BOT_TOKEN=discord-tok\n", {
-        env: process.env,
-      });
-      const vars = readStateDirDotEnvVars(process.env);
-      expect(vars.BRAVE_API_KEY).toBe("BSA-test-key");
-      expect(vars.DISCORD_BOT_TOKEN).toBe("discord-tok");
+  it("rejects process-stable Gateway selector changes during reload", () => {
+    expect(() =>
+      assertGatewayConfigEnvSelectionUnchanged({}, config({ OPENCLAW_CONFIG_PATH: "1" })),
+    ).toThrow("process-stable Gateway selector OPENCLAW_CONFIG_PATH");
+  });
+
+  it("restores the last committed config environment after a rejected replacement", () => {
+    const previousConfig = initialize();
+    const acceptedConfig = config({ [key]: "accepted" });
+    prepareChange(previousConfig, acceptedConfig).publish().commit();
+    const replacement = prepareChange(acceptedConfig, config({ [key]: "rejected" })).publish();
+    expect(process.env[key]).toBe("rejected");
+
+    replacement();
+    expect(process.env[key]).toBe("accepted");
+    expect(publishedEnv()).toMatchObject({
+      sourceConfig: acceptedConfig,
+      ownedEnv: { [key]: "accepted" },
     });
   });
 
-  it("returns empty record when the state-dir .env file is missing", async () => {
-    await withTempHome(async (_home) => {
-      expect(readStateDirDotEnvVars(process.env)).toStrictEqual({});
+  it("preserves Windows case-insensitive precedence in a merged runtime env", () => {
+    windows();
+    const merged = createConfigRuntimeEnv(config({ OPENCLAW_LOAD_SHELL_ENV: "1" }), {
+      OpenClaw_Load_Shell_Env: "0",
+    });
+    expect(merged.OPENCLAW_LOAD_SHELL_ENV).toBe("0");
+    expect(Object.keys(merged)).toEqual(["OpenClaw_Load_Shell_Env"]);
+  });
+
+  it.each([false, true])(
+    "rolls back Windows spelling unless concurrently renamed: %s",
+    (concurrent) => {
+      windows();
+      const previousConfig = config({ Config_Value: "old" });
+      const env: NodeJS.ProcessEnv = applied(previousConfig);
+      const prepared = prepareChange(
+        previousConfig,
+        config({ CONFIG_VALUE: concurrent ? "new" : "old" }),
+        env,
+      );
+      const rollback = prepared.publish();
+      expect(env).toEqual({ CONFIG_VALUE: concurrent ? "new" : "old" });
+      if (concurrent) {
+        delete env.CONFIG_VALUE;
+        env.config_value = "new";
+      }
+      rollback();
+      expect(env).toEqual(concurrent ? { config_value: "new" } : { Config_Value: "old" });
+    },
+  );
+
+  it("does not adopt a concurrent Windows case-only rename as config-owned", () => {
+    windows();
+    const concurrentKey = key.toLowerCase();
+    vi.stubEnv(concurrentKey, undefined);
+    const previousConfig = initialize({ [key]: "owned" });
+    const unchanged = prepareChange(previousConfig, previousConfig);
+    delete process.env[key];
+    process.env[concurrentKey] = "owned";
+    unchanged.publish().commit();
+    prepareChange(previousConfig, {}).publish().commit();
+    expect(process.env[concurrentKey]).toBe("owned");
+  });
+
+  it("reloads state-dir dotenv substitutions after the environment is cleared", async () => {
+    await withTempHome(async () => {
+      vi.stubEnv("BRAVE_API_KEY", undefined);
+      await writeStateDirDotEnv("BRAVE_API_KEY=from-dotenv\n", { env: process.env });
+      const cfg = { token: "${BRAVE_API_KEY}" };
+      const expected = { token: "from-dotenv" };
+      loadDotEnv();
+      expect(resolveConfigEnvVars(cfg, process.env)).toEqual(expected);
+      delete process.env.BRAVE_API_KEY;
+      loadDotEnv();
+      expect(resolveConfigEnvVars(cfg, process.env)).toEqual(expected);
     });
   });
 
-  it("drops dangerous and empty values from the state-dir .env file", async () => {
-    await withTempHome(async (_home) => {
+  it("filters dangerous and empty durable service env values", async () => {
+    await withTempHome(async () => {
       await writeStateDirDotEnv(
         "NODE_OPTIONS=--require /tmp/evil.js\nOPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS=1\nEMPTY=\nVALID=ok\n",
         { env: process.env },
       );
-      const vars = readStateDirDotEnvVars(process.env);
-      expect(vars.NODE_OPTIONS).toBeUndefined();
-      expect(vars.OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS).toBeUndefined();
-      expect(vars.EMPTY).toBeUndefined();
-      expect(vars.VALID).toBe("ok");
+      expect(collectDurableServiceEnvVars({ env: process.env })).toEqual({ VALID: "ok" });
     });
   });
 
-  it("respects OPENCLAW_STATE_DIR when reading state-dir .env vars", async () => {
-    await withTempHome(async (_home) => {
-      const customStateDir = path.join(process.env.OPENCLAW_STATE_DIR ?? "", "custom-state");
-      await writeStateDirDotEnv("CUSTOM_KEY=from-override\n", {
-        stateDir: customStateDir,
-      });
-      expect(
-        readStateDirDotEnvVars({
-          OPENCLAW_STATE_DIR: customStateDir,
-        }).CUSTOM_KEY,
-      ).toBe("from-override");
+  it("tracks equal lower-precedence replacements as owned across reload", () => {
+    const previousConfig = config({ [key]: "shared" });
+    const env = { [key]: "shared" };
+    const before = { ...env };
+    const replacedLowerPrecedenceKeys: string[] = [];
+    applyConfigEnvVars(previousConfig, env, {
+      lowerPrecedenceEnv: before,
+      onLowerPrecedenceKeysReplaced: (keys) => replacedLowerPrecedenceKeys.push(...keys),
     });
+    const ownedEnv = collectConfigRuntimeEnvOwnership(previousConfig, before, env, {
+      replacedLowerPrecedenceKeys,
+    });
+    const prepared = prepareChange(previousConfig, config({ [key]: "next" }), env);
+    expect(ownedEnv).toEqual({ [key]: "shared" });
+    expect(prepared.env[key]).toBe("next");
   });
 
-  it("lets config service env vars override state-dir .env vars", async () => {
-    await withTempHome(async (_home) => {
-      await writeStateDirDotEnv("MY_KEY=from-dotenv\n", {
-        env: process.env,
-      });
+  it("lets config override dotenv from the selected state directory", async () => {
+    await withTempHome(async () => {
+      const stateDir = path.join(process.env.OPENCLAW_STATE_DIR ?? "", "custom-state");
+      await writeStateDirDotEnv("MY_KEY=from-dotenv\nCUSTOM_KEY=from-override\n", { stateDir });
       expect(
         collectDurableServiceEnvVars({
-          env: process.env,
-          config: {
-            env: {
-              vars: {
-                MY_KEY: "from-config",
-              },
-            },
-          } as OpenClawConfig,
-        }).MY_KEY,
-      ).toBe("from-config");
+          env: { OPENCLAW_STATE_DIR: stateDir },
+          config: config({ MY_KEY: "from-config" }),
+        }),
+      ).toEqual({ MY_KEY: "from-config", CUSTOM_KEY: "from-override" });
     });
+  });
+});
+
+describe("config-owned fs-safe mode migration", () => {
+  const nativeKey = "OPENCLAW_FS_SAFE_NATIVE_MODE";
+  const legacyKey = "FS_SAFE_PYTHON_MODE";
+
+  beforeEach(() => {
+    for (const name of [
+      nativeKey,
+      "FS_SAFE_NATIVE_MODE",
+      legacyKey,
+      "OPENCLAW_FS_SAFE_PYTHON_MODE",
+    ]) {
+      vi.stubEnv(name, undefined);
+    }
+    vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+  });
+  afterEach(() => clearFsSafeEnvFallback(process.env));
+
+  it("restores legacy fallback after a rejected native publication without adopting it", () => {
+    const source = config({ [legacyKey]: "require" });
+    const before = snapshotEnv(process.env);
+    applyConfigEnvVars(source);
+    initializePublishedConfigRuntimeEnv(source, {
+      ownedEnv: collectConfigRuntimeEnvOwnership(source, before, process.env),
+    });
+    const replacement = prepareChange(source, config({ [nativeKey]: "off" })).publish();
+    expect([process.env[nativeKey], process.env[legacyKey]]).toEqual(["off", undefined]);
+    replacement();
+    expect(process.env[nativeKey]).toBe("require");
+    expect(publishedEnv().ownedEnv).toEqual({ [legacyKey]: "require" });
+    prepareChange(source, {}).publish().commit();
+    expect(process.env[nativeKey]).toBeUndefined();
+  });
+
+  it("recomputes isolated candidates without changing their parent's legacy projection", () => {
+    const env: NodeJS.ProcessEnv = { [legacyKey]: "off" };
+    normalizeFsSafeNativeEnv(env);
+    const clone = cloneEnvWithPlatformSemantics(env);
+    applyConfigEnvVars(config({ [nativeKey]: "require" }), clone);
+    expect(clone[nativeKey]).toBe("require");
+    expect(env[nativeKey]).toBe("off");
+    expect(fsSafeEnvInput(env)[nativeKey]).toBeUndefined();
+  });
+
+  it("restores invalid native input after a rejected config read introduced legacy mode", () => {
+    const env: NodeJS.ProcessEnv = { [nativeKey]: "invalid" };
+    const before = snapshotEnv(env);
+    applyConfigEnvVars(config({ [legacyKey]: "require" }), env);
+    expect(env[nativeKey]).toBe("require");
+    restoreEnvChangesIfUnchanged({ env, before, after: snapshotEnv(env) });
+    expect(env).toEqual({ [nativeKey]: "invalid" });
+  });
+
+  it("compensates synchronous read mutations using source keys, preserving later operator changes", () => {
+    const env: NodeJS.ProcessEnv = {};
+    let restore: (() => void) | undefined;
+    captureConfigReadEnvMutation(
+      env,
+      () => applyConfigEnvVars(config({ [legacyKey]: "off" }), env),
+      (receipt) => {
+        restore = receipt;
+      },
+    );
+    expect(env[nativeKey]).toBe("off");
+    env.FS_SAFE_NATIVE_MODE = "require";
+    restore?.();
+    expect(env).toEqual({ FS_SAFE_NATIVE_MODE: "require" });
   });
 });

@@ -1,3 +1,9 @@
+import type {
+  SessionTranscriptDeliveryMirror,
+  SubagentCompletionDirectDeliveryMirror,
+} from "../../config/sessions/transcript-mirror.js";
+import type { SkillWorkshopChangeNotice } from "../../shared/skill-workshop-change-notice.js";
+
 /**
  * Transcript append data emitted after an outbound send completes.
  */
@@ -7,6 +13,13 @@ export type OutboundMirror = {
   text?: string;
   mediaUrls?: string[];
   idempotencyKey?: string;
+  expectedSessionId?: string;
+  deliveryMirror?:
+    | SessionTranscriptDeliveryMirror
+    | SubagentCompletionDirectDeliveryMirror
+    | SkillWorkshopChangeNotice;
+  /** Queue transcript bookkeeping behind the requester without delaying the send. */
+  deferToSessionLane?: boolean;
 };
 
 /**

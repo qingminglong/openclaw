@@ -1,6 +1,4 @@
-// Qa Lab plugin module implements auth profile.fixture behavior.
-import fs from "node:fs/promises";
-import path from "node:path";
+import { readQaAuthProfiles, writeQaAuthProfiles } from "./providers/shared/auth-store.js";
 
 export const QA_CODEX_OAUTH_PROFILE_ID = "openai:qa-oauth";
 export const QA_OPENAI_API_KEY_PROFILE_ID = "openai:media-api";
@@ -36,8 +34,6 @@ export type QaCodexAuthProfileSelection =
   | {
       status: "ready";
       profileId: string;
-      provider: "openai";
-      mode: "oauth";
     }
   | {
       status: "blocked";
@@ -45,10 +41,6 @@ export type QaCodexAuthProfileSelection =
     };
 
 const QA_FIXED_OAUTH_EXPIRY_MS = Date.UTC(2036, 0, 1);
-
-function authProfilesPath(agentDir: string) {
-  return path.join(agentDir, "auth-profiles.json");
-}
 
 function buildCodexOAuthProfile(): QaOAuthAuthProfile {
   return {
@@ -72,20 +64,13 @@ function buildOpenAiApiKeyProfile(): QaApiKeyAuthProfile {
 }
 
 function buildProfileMap(shape: QaAuthProfileShape): Record<string, QaAuthProfile> {
-  switch (shape) {
-    case "oauth-only":
-      return {
-        [QA_CODEX_OAUTH_PROFILE_ID]: buildCodexOAuthProfile(),
-      };
-    case "apikey-only":
-      return {
-        [QA_OPENAI_API_KEY_PROFILE_ID]: buildOpenAiApiKeyProfile(),
-      };
-    case "mixed":
-      return {
-        [QA_CODEX_OAUTH_PROFILE_ID]: buildCodexOAuthProfile(),
-        [QA_OPENAI_API_KEY_PROFILE_ID]: buildOpenAiApiKeyProfile(),
-      };
+  if (shape === "oauth-only" || shape === "apikey-only" || shape === "mixed") {
+    return {
+      ...(shape !== "apikey-only" ? { [QA_CODEX_OAUTH_PROFILE_ID]: buildCodexOAuthProfile() } : {}),
+      ...(shape !== "oauth-only"
+        ? { [QA_OPENAI_API_KEY_PROFILE_ID]: buildOpenAiApiKeyProfile() }
+        : {}),
+    };
   }
   const exhaustive: never = shape;
   return exhaustive;
@@ -127,28 +112,22 @@ function normalizeAuthProfileSnapshot(value: unknown): QaAuthProfileSnapshot {
 
 export async function seedAuthProfiles(
   shape: QaAuthProfileShape,
-  agentDir: string,
+  params: { agentId: string; stateDir: string },
 ): Promise<QaAuthProfileSnapshot> {
   const snapshot = {
     version: QA_AUTH_PROFILE_STORE_VERSION,
     profiles: buildProfileMap(shape),
   };
-  await fs.mkdir(agentDir, { recursive: true });
-  await fs.writeFile(authProfilesPath(agentDir), `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  await writeQaAuthProfiles({
+    ...params,
+    profiles: snapshot.profiles,
+    replace: true,
+  });
   return snapshot;
 }
 
 export async function snapshotAuthProfiles(agentDir: string): Promise<QaAuthProfileSnapshot> {
-  const raw = await fs.readFile(authProfilesPath(agentDir), "utf8").catch((error: unknown) => {
-    if (error && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  });
-  if (!raw) {
-    return { version: QA_AUTH_PROFILE_STORE_VERSION, profiles: {} };
-  }
-  return normalizeAuthProfileSnapshot(JSON.parse(raw) as unknown);
+  return normalizeAuthProfileSnapshot(await readQaAuthProfiles(agentDir));
 }
 
 export function resolveCodexAuthProfile(
@@ -172,7 +151,5 @@ export function resolveCodexAuthProfile(
   return {
     status: "ready",
     profileId,
-    provider: "openai",
-    mode: "oauth",
   };
 }

@@ -1,35 +1,41 @@
-# OpenClaw iOS (Super Alpha)
+# OpenClaw iOS
 
-This iOS app is super-alpha and internal-use only. The first public App Store release targets iPhone and connects to an OpenClaw Gateway as a `role: node`.
+OpenClaw iOS is the officially released iPhone app. It connects to an OpenClaw Gateway as a `role: node` for chat, voice, approvals, sharing, and device-aware automation.
 
 ## Distribution Status
 
-- Public distribution: App Store Connect app created; production signing is configured through the App Store release Fastlane path.
-- Internal TestFlight distribution: uses the same App Store distribution archive uploaded to App Store Connect.
-- Local/manual deploy from source via Xcode remains the default development path.
+- Public distribution: App Store.
+- App Store Connect uploads use the App Store release Fastlane path.
+- Local/manual deploy from source via Xcode remains the default development path for app development.
 
-## Super-Alpha Disclaimer
+## Support Notes
 
-- Breaking changes are expected.
-- UI and onboarding flows can change without migration guarantees.
-- Foreground use is the only reliable mode right now.
-- Treat this build as sensitive while permissions and background behavior are still being hardened.
+- UI and onboarding changes ship through normal app releases.
+- Upgrade migrations support data written by releases shipped on or after July 1, 2026. Earlier UserDefaults gateway locations are no longer imported; reconnect from Gateway settings if needed. Push registrations without a relay profile are refreshed through normal registration.
+- Connections use the current `openclaw-ios` client identity without pre-rename retries or undocumented legacy client-ID overrides. Talk credentials come from the Gateway's configuration; local provider keys whose writer retired before July are no longer read.
+- Some node commands require foreground access because of iOS platform limits.
+- Embedded Settings can answer HTTP Basic authentication challenges using the Gateway's configured `Authorization: Basic ...` custom header. Credentials stay in native code and are supplied only to the same HTTPS origin, including its resource and WebSocket requests. Other custom header schemes and the Desktop/Terminal browser SSO flows are unchanged.
+- Permissions, background behavior, and push delivery are documented below so release and support checks stay explicit.
+
+## Adaptive Navigation
+
+- Navigation uses available window width, not orientation: iPhone and accessibility text sizes use a drawer. On iPad, below 800pt it is a drawer; at 800pt and above it defaults to a persistent sidebar (300pt sidebar plus at least 500pt detail). The sidebar grows only to 320pt.
+- Hiding the persistent sidebar is remembered while the window narrows and widens. Entering a compact window closes the drawer; keyboard appearance does not change navigation mode.
+- The detail view stays mounted across navigation layout changes. On iPad, native Chat messages, composer, and progress content use a centered column capped at 760pt within the remaining detail space. Assistant answers, including streaming output, use this shared column instead of a nested 560pt cap. Detail-pane margins grow from 12pt to 24pt with available width. User bubbles retain their 560pt maximum; iPhone spacing is unchanged.
 
 ## Exact Xcode Manual Deploy Flow
 
 1. Prereqs:
-   - Xcode 16+
+   - Xcode 26.x or newer with the iOS and watchOS SDKs
    - `pnpm`
    - `xcodegen`
+   - The pinned [Watch Rust toolchain](#watch-companion-build-requirements)
    - Apple Development signing set up in Xcode
 2. From repo root:
 
 ```bash
 pnpm install
-./scripts/ios-configure-signing.sh
-cd apps/ios
-xcodegen generate
-open OpenClaw.xcodeproj
+pnpm ios:open
 ```
 
 3. In Xcode:
@@ -41,49 +47,102 @@ open OpenClaw.xcodeproj
    - Use unique local bundle IDs via `apps/ios/LocalSigning.xcconfig`.
    - Start from `apps/ios/LocalSigning.xcconfig.example`.
 
-Shortcut command (same flow + open project):
+Generate without opening Xcode:
 
 ```bash
-pnpm ios:open
+pnpm ios:gen
 ```
+
+### Watch companion build requirements
+
+The normal `OpenClaw` iPhone scheme embeds the Watch app, so even an iPhone-only
+build compiles the native Watch WebRTC library. Install the official
+[rustup toolchain manager](https://rustup.rs/), then install the pinned compiler
+and standard-library sources:
+
+```bash
+rustup toolchain install nightly-2026-10-02 --profile minimal --component rust-src
+```
+
+Both `rustup` and the rustup-managed `cargo` shim must be on the build's `PATH`.
+If you installed rustup through Homebrew, add its shim directory before running
+a command-line build such as `pnpm ios:build`:
+
+```bash
+export PATH="$(brew --prefix rustup)/bin:$PATH"
+```
+
+On Apple Silicon with the default Homebrew prefix, this directory is
+`/opt/homebrew/opt/rustup/bin`. Having `rustup` in `/opt/homebrew/bin` does not
+mean `cargo` is available. The Watch build phase adds `$HOME/.cargo/bin`,
+`/opt/homebrew/bin`, and `/usr/local/bin`, but not Homebrew's rustup shim directory.
+For GUI-launched Xcode builds, include that directory in the build
+phase's `PATH`; exporting it in a terminal alone does not configure Xcode.
+Verify the pinned Cargo is reachable from the build environment:
+
+```bash
+cargo +nightly-2026-10-02 --version
+```
+
+`apps/shared/OpenClawWatchRTC/build.sh` uses that exact toolchain with
+`cargo --locked` and `-Z build-std`; it never installs a toolchain or changes the
+global default. Select Xcode through its command-line-tool setting or
+`DEVELOPER_DIR`. The Watch device and simulator slices were verified with the
+watchOS 27 SDK; the app's deployment target remains watchOS 11. See the
+[native Watch module README](../shared/OpenClawWatchRTC/README.md) for supported
+architectures, build output locations, and dependency notices.
+
+Run `OpenClawWatchTests` through the `OpenClawWatchApp` scheme for configuration,
+call lifecycle, and native codec coverage. These tests and signed simulator
+builds do not prove a real Watch microphone/speaker route, background audio,
+wrist-down behavior, Wi-Fi/cellular handoff, or multi-hour battery endurance.
+A native macOS provider roundtrip is interoperability evidence, not Watch
+hardware proof. Validate those behaviors separately through a physical Watch's
+normal **Enable Standalone Voice → Talk on Watch → Start** flow; see
+[Watch setup and limits](https://docs.openclaw.ai/platforms/ios#standalone-voice).
 
 ## App Store Release Flow
 
 Prereqs:
 
-- Xcode 16+
+- Xcode 26.x
 - `pnpm`
 - `xcodegen`
-- `fastlane`
-- Apple account signed into Xcode for the canonical OpenClaw team (`FWJYW4S8P8`)
-- Fastlane Apple Developer Portal session for the canonical OpenClaw team when creating bundle IDs or enabling services
+- The pinned [Watch Rust toolchain](#watch-companion-build-requirements)
+- Ruby 4.0.7 and Bundler 4.0.23 (`fastlane` is installed from `apps/ios/Gemfile.lock`)
+- Apple account signed into Xcode for the official OpenClaw team (`FWJYW4S8P8`)
+- Fastlane Apple Developer Portal session for the official OpenClaw team when creating bundle IDs or enabling services
 - Release-owner access to the encrypted signing repo password (`MATCH_PASSWORD`)
 - App Store Connect app already created for `ai.openclawfoundation.app`
 - App Store Connect API key set up in Keychain via `scripts/ios-app-store-connect-keychain-setup.sh` when auto-resolving a build number or uploading to App Store Connect
 
 Release behavior:
 
-- Local development uses the canonical `ai.openclawfoundation.app*` bundle IDs when the OpenClaw team is available, and unique `ai.openclawfoundation.app.test.*` bundle IDs only for non-canonical fallback teams.
-- App Store release uses canonical `ai.openclawfoundation.app*` bundle IDs through a temporary generated xcconfig in `apps/ios/build/AppStoreRelease.xcconfig`.
+- Local development uses the official `ai.openclawfoundation.app*` bundle IDs when the OpenClaw team is available, and unique `ai.openclawfoundation.app.test.*` bundle IDs only for other development teams.
+- App Store release uses official `ai.openclawfoundation.app*` bundle IDs through a temporary generated xcconfig in `apps/ios/build/AppStoreRelease.xcconfig`.
 - App Store release uses manual `Apple Distribution` signing with profile names pinned in `apps/ios/Config/AppStoreSigning.json`.
 - Fastlane owns one-time Developer Portal setup, encrypted `match` signing sync to the repo/branch pinned in `apps/ios/Config/AppStoreSigning.json`, and release handling.
-- App Store release also switches the app to `OpenClawPushMode=appStore`, which derives relay transport, official distribution, the canonical production relay, production APNs, production relay profile, `appleStrict` proof, and the App-Attest-capable entitlement file.
-- `pnpm ios:release:upload` generates App Store screenshots, uploads release notes, and attaches `apps/ios/APP-REVIEW-NOTES.md` as a rendered PDF before archiving and uploading the IPA.
+- App Store release also switches the app to `OpenClawPushMode=appStore`, which derives relay transport, official distribution, the official production relay, production APNs, production relay profile, `appleStrict` proof, and the App-Attest-capable entitlement file.
+- `pnpm ios:release:upload` generates reviewed notes and App Store screenshots, archives and validates the IPA, stages screenshots and the rendered `apps/ios/APP-REVIEW-NOTES-APPLE.md` attachment, uploads the IPA, waits for Apple processing, then stages the saved notes and selects the build.
+- Agent-driven App Store uploads must use `pnpm ios:release:upload` as the only release path. If that command fails, stop and fix the failing screenshot, metadata, archive, validation, or upload step before trying again.
+- Do not treat `pnpm ios:release:archive`, `asc builds upload`, `asc release stage`, `asc publish appstore`, direct Fastlane lanes, or App Store Connect mutation commands as fallback upload paths after `pnpm ios:release:upload` fails.
 - The release archive is validated before upload by inspecting the exported IPA's signed entitlements, embedded App Store profile, and push mode. The upload fails if the IPA is not an App Store production relay build.
 - App Review submission is manual in App Store Connect. The release lane uploads a build, public metadata, and the App Review PDF attachment, but it does not submit for review or upload the App Store Connect `Notes` field.
+- Before submitting a HealthKit-enabled build, the release owner must update the public privacy policy and App Store Connect privacy details for the Health & Fitness aggregates shared with the user's configured AI provider.
 - The release flow does not modify `apps/ios/.local-signing.xcconfig` or `apps/ios/LocalSigning.xcconfig`.
-- `apps/ios/version.json` is the pinned iOS release version source.
-- `apps/ios/CHANGELOG.md` is the iOS-only changelog and release-note source.
-- The pinned iOS version must use CalVer like `2026.4.10`.
-- That pinned value becomes:
-  - `CFBundleShortVersionString = 2026.4.10`
-  - `CFBundleVersion = next App Store Connect build number for 2026.4.10`
-- Changing the root gateway version does not change the iOS app version until you explicitly pin from the gateway.
+- Release uploads derive the gateway from root `package.json` and the App Store revision/build from live App Store Connect state.
+- `apps/ios/CHANGELOG.md` remains historical documentation; store notes come from the saved Git-history artifact.
+- The gateway version must use CalVer like `2026.7.2`.
+- Gateway `2026.7.2`, App Store revision `1` becomes:
+  - `CFBundleShortVersionString = 2026.7.21`
+  - `CFBundleVersion = next App Store Connect build number for 2026.7.21`
+- Each App Store version has its own build sequence beginning at `1`.
+- Local defaults and release planning derive the gateway from root `package.json`; App Store Connect versions and build uploads determine the release revision and build.
 - See `apps/ios/VERSIONING.md` for the full workflow.
 
 Relay behavior for App Store builds:
 
-- App Store release builds use the canonical hosted relay at `https://ios-push-relay.openclaw.ai`.
+- App Store release builds use the official hosted relay at `https://ios-push-relay.openclaw.ai`.
 - App Store release builds reject custom relay URL overrides. Future self-hosted relay support should use a separate explicit release path, not the public App Store build lane.
 
 Signing setup commands:
@@ -108,28 +167,46 @@ Release-owner secrets:
 Prepare the generated release xcconfig/project without archiving:
 
 ```bash
-pnpm ios:release:prepare -- --build-number 7
+pnpm ios:release:prepare -- --version 2026.7.2 --revision 1 --build-number 3
 ```
 
 Archive without upload:
 
 ```bash
-pnpm ios:release:archive
+pnpm ios:release:archive -- --version 2026.7.2 --revision 1
 ```
 
-Archive and upload to App Store Connect:
+This command is for local archive validation only. It is not a fallback upload
+path after `pnpm ios:release:upload` fails.
+
+Run **iOS Store Release** in GitHub Actions from `main`, with no input parameters, or
+run the same entry point from a clean local `main` matching `origin/main`:
 
 ```bash
 pnpm ios:release:upload
 ```
 
-If you need to force a specific build number:
+GitHub first qualifies pairing and chat in a separate job. Signing and upload
+then use a fresh checkout of the same commit, so qualification build outputs
+cannot dirty the release source.
 
-```bash
-pnpm ios:release:upload -- --build-number 7
-```
+The qualification proof includes Gateway process and host resource snapshots around
+simulator boot and elapsed setup RPC authentication, dispatch, and response timings.
+The setup-code request has a 60-second deadline; a request still pending after 10 seconds
+captures one bounded process sample, a read-only worker/queue snapshot, and classified
+Gateway events. Setup failures also capture this evidence, and cleanup failures identify
+the fixture owner. Diagnostic capture finishes before fixture cleanup and does not
+change the setup result. The artifact excludes raw logs, command arguments, paths,
+and pairing credentials.
 
-### Maintainer Quick Release Checklist
+The entry point freezes the live App Store plan and unchanged source SHA,
+generates reviewed release notes from changes since the latest public build,
+and saves the text as a release artifact. After upload and Apple processing, it
+stages those notes and selects the exact build for manual App Review submission.
+It does not create commits or metadata PRs. Notes generation requires
+`OPENAI_API_KEY`; see [release notes](VERSIONING.md#release-notes).
+
+## Maintainer Quick Release Checklist
 
 Use this when a clone is missing local iOS release setup and you want the shortest path to an App Store Connect upload.
 
@@ -137,7 +214,7 @@ Use this when a clone is missing local iOS release setup and you want the shorte
 
 ```bash
 cd apps/ios
-fastlane ios auth_check
+BUNDLE_GEMFILE="$PWD/Gemfile" bundle _4.0.23_ exec fastlane ios auth_check
 ```
 
 2. If auth is missing, bootstrap it once on this Mac:
@@ -161,76 +238,38 @@ This should create `apps/ios/fastlane/.env` with non-secret App Store Connect va
 
    Use `pnpm ios:release:signing:setup` for the initial portal setup, then `MATCH_PASSWORD=... pnpm ios:release:signing:sync:push` to publish encrypted Fastlane match assets to the shared private repo.
 
-4. If you are starting a brand-new production release train, pin iOS to the current gateway version first:
+4. Inspect the plan if needed, then release:
 
 ```bash
-pnpm ios:version:pin -- --from-gateway
-```
-
-5. Upload the build:
-
-```bash
+pnpm ios:release:plan -- --json
 pnpm ios:release:upload
 ```
 
-6. Expected behavior:
-   - Fastlane reads `apps/ios/version.json`
-   - verifies synced iOS versioning artifacts
-   - resolves the next App Store Connect build number for that short version
-   - generates deterministic App Store screenshots
-   - uploads release notes, screenshots, and the App Review PDF attachment to the editable App Store version
-   - generates `apps/ios/build/AppStoreRelease.xcconfig`
-   - archives `OpenClaw`
-   - validates the exported IPA's push mode, signed entitlements, and embedded App Store profile
-   - uploads the IPA to App Store Connect for TestFlight/App Review use
-   - leaves App Review submission for a maintainer to complete manually
-
-7. Expected outputs after a successful run:
-   - `apps/ios/build/app-store/OpenClaw-<version>.ipa`
-   - `apps/ios/build/app-store/OpenClaw-<version>.app.dSYM.zip`
-   - Fastlane log line like `Uploaded iOS App Store build: version=<version> short=<short> build=<build>`
-
-8. If this is a fresh clone on a maintainer machine that already works elsewhere, it is OK to copy the non-secret `apps/ios/fastlane/.env` from another trusted local clone on the same Mac. The Keychain-backed private key remains machine-local and is not stored in the repo.
+If processing succeeds but notes or build selection fails, use
+[staging recovery](VERSIONING.md#staging-recovery) with the saved artifacts.
+Do not upload another build to retry staging.
 
 ## iOS Versioning Workflow
 
-- Pinned iOS release version: `apps/ios/version.json`
-- iOS-only changelog: `apps/ios/CHANGELOG.md`
-- Generated checked-in artifacts:
-  - `apps/ios/Config/Version.xcconfig`
-  - `apps/ios/fastlane/metadata/en-US/release_notes.txt`
-- Useful commands:
+- Release gateway and local default version: root `package.json`.
+- App Store revision and build: App Store Connect plan calculated from the current release state.
+- Store release notes: reviewed `release-notes.json` artifact from Git history.
+- Historical human-maintained notes: `apps/ios/CHANGELOG.md`.
+- Generated local artifacts: `apps/ios/build/Version.xcconfig`,
+  `apps/ios/build/AppStoreRelease.xcconfig`, and `apps/ios/SwiftSources.input.xcfilelist`.
+
+Inspect versioning without uploading:
 
 ```bash
 pnpm ios:version
 pnpm ios:version:check
-pnpm ios:version:sync
-pnpm ios:version:pin -- --from-gateway
-pnpm ios:version:pin -- --version 2026.4.10
+pnpm ios:release:plan -- --json
 ```
 
-Recommended flow:
-
-### TestFlight iteration on an existing train
-
-1. Keep `apps/ios/version.json` pinned to the current train version.
-2. Update `apps/ios/CHANGELOG.md`, usually under `## Unreleased` while iterating.
-3. Run `pnpm ios:version:sync` after changelog changes.
-4. Upload more TestFlight builds with `pnpm ios:release:upload`.
-5. Let Fastlane bump only the numeric build number.
-
-### Starting the next production release train
-
-1. Pin iOS to the current gateway version:
-
-```bash
-pnpm ios:version:pin -- --from-gateway
-```
-
-2. Update `apps/ios/CHANGELOG.md` for the new release as needed.
-3. Run `pnpm ios:version:sync`.
-4. Submit the first App Store Connect build for that newly pinned version.
-5. Keep iterating on that same version until the release candidate is ready.
+Land the app changes, then run `pnpm ios:release:upload`. No changelog cut is
+required. Failed, processing, and complete Apple-visible uploads all advance
+the next numeric build. After App Store distribution, the planner allocates the
+next revision automatically.
 
 See `apps/ios/VERSIONING.md` for the detailed spec.
 
@@ -250,7 +289,7 @@ See `apps/ios/VERSIONING.md` for the detailed spec.
 
 ## APNs Expectations For Official Builds
 
-- Official/TestFlight builds register with the external push relay before they publish `push.apns.register` to the gateway.
+- Official App Store builds register with the external push relay before they publish `push.apns.register` to the gateway.
 - The gateway registration for relay mode contains an opaque relay handle, a registration-scoped send grant, relay origin metadata, and installation metadata instead of the raw APNs token.
 - The relay registration is bound to the gateway identity fetched from `gateway.identity.get`, so another gateway cannot reuse that stored registration.
 - The app persists the relay handle metadata locally so reconnects can republish the gateway registration without re-registering on every connect.
@@ -265,7 +304,7 @@ See `apps/ios/VERSIONING.md` for the detailed spec.
   - The operator session is used to fetch `gateway.identity.get`.
 - `iOS -> relay`
   - The app registers with the relay over HTTPS using App Attest plus a StoreKit app transaction JWS.
-  - The relay requires the official production/TestFlight distribution path, which is why local
+  - The relay requires the official App Store distribution path, which is why local
     Xcode/dev installs cannot use the hosted relay.
 - `gateway delegation`
   - The app includes the gateway identity in relay registration.
@@ -278,21 +317,24 @@ See `apps/ios/VERSIONING.md` for the detailed spec.
   - Production APNs credentials and raw official-build APNs tokens stay in the relay deployment,
     not on the gateway.
 
-This exists to keep the hosted relay limited to genuine OpenClaw official builds and to ensure a
-gateway can only send pushes for iOS devices that paired with that gateway.
+This limits the hosted relay to genuine official OpenClaw builds and lets each
+Gateway send pushes only to iOS devices paired with it.
 
 ## What Works Now (Concrete)
 
 - Pairing via QR or setup code flow (`/pair qr` or `/pair`, then `/pair approve` in Telegram).
 - Gateway connection via discovery or manual host/port with TLS fingerprint trust prompt.
-- Chat + Talk surfaces through the operator gateway session.
-- iOS node commands in foreground: camera snap/clip, canvas present/navigate/eval/snapshot, screen record, location, contacts, calendar, reminders, photos, motion, local notifications.
+- One Chat surface for text, realtime voice, dictation, and voice notes through the operator gateway session.
+- Chat availability follows its operator connection independently of the device/node connection. Transient node failures remain available in Settings while chat is connected. Dismissed connection banners stay dismissed through identical retry failures; a changed problem or recovery resets dismissal. Authentication and pairing warnings remain visible.
+- Two distinct Watch voice paths: iPhone-relayed **Talk to Claw**, and opt-in **Talk on Watch** with native UDP media and Gateway-owned agent/tool control. Physical-Watch voice and endurance validation remain separate from simulator coverage.
+- iOS node commands in foreground: camera snap/clip, screen record, location, contacts, calendar, reminders, photos, motion, local notifications.
 - Authenticated background `node.presence.alive` beacons that update gateway last-seen metadata when the app moves between foreground and background, without treating suspended sockets as connected.
+- Connected nodes publish CPU count and memory immediately and every 60 seconds through `node.host.stats`, supplying the Control UI Devices meters. iOS reports neither load averages nor disk capacity (Apple's required-reason API policy does not allow sending disk-space values off-device). Reporting stops when the node route disconnects or changes, and iOS suspension can pause updates.
 - Share extension deep-link forwarding into the connected gateway session.
 
 ## Computer Use Relationship
 
-The iOS app is not a Codex Computer Use backend. Computer Use and `cua-driver mcp` are macOS desktop-control paths; iOS exposes device capabilities as OpenClaw node commands through the gateway. Agents can drive the iPhone canvas, camera, screen, location, voice, and other node capabilities with `node.invoke`, subject to iOS foreground/background limits.
+The iOS app is not a Codex Computer Use backend. Computer Use and `cua-driver mcp` are macOS desktop-control paths; iOS exposes device capabilities as OpenClaw node commands through the gateway. Agents can drive the iPhone camera, screen recorder, location, voice, and other node capabilities with `node.invoke`, subject to iOS foreground/background limits.
 
 ## Location Automation Use Case (Testing)
 
@@ -328,7 +370,7 @@ Pass criteria:
 ## Known Issues / Limitations / Problems
 
 - Foreground-first: iOS can suspend sockets in background; reconnect recovery is still being tuned.
-- Background command limits are strict: `canvas.*`, `camera.*`, `screen.*`, and `talk.*` are blocked when backgrounded.
+- Background command limits are strict: `camera.*`, `screen.*`, and `talk.*` are blocked when backgrounded.
 - Background location requires `Always` location permission.
 - Pairing/auth errors intentionally pause reconnect loops until a human fixes auth/pairing state.
 - Voice Wake and Talk contend for the same microphone; Talk suppresses wake capture while active.

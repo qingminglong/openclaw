@@ -1,5 +1,6 @@
-// Channel legacy config migration tests cover doctor repair of old channel config shapes.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import "../../../test-utils/prepare-compiled-subprocesses.js";
+import type { OpenClawConfig } from "../../../config/types.js";
 
 const { applyPluginDoctorCompatibilityMigrations, collectRelevantDoctorPluginIds } = vi.hoisted(
   () => ({
@@ -10,20 +11,24 @@ const { applyPluginDoctorCompatibilityMigrations, collectRelevantDoctorPluginIds
 const loadBundledChannelDoctorContractApi = vi.hoisted(() => vi.fn());
 const getBootstrapChannelPlugin = vi.hoisted(() => vi.fn());
 
-vi.mock("../../../plugins/doctor-contract-registry.js", () => ({
-  applyPluginDoctorCompatibilityMigrations: (...args: unknown[]) =>
-    applyPluginDoctorCompatibilityMigrations(...args),
-  collectRelevantDoctorPluginIds: (...args: unknown[]) => collectRelevantDoctorPluginIds(...args),
-}));
+// mock-isolation: Control migration discovery while retaining the real deferred-migration guard.
+vi.mock(import("../../../plugins/doctor-contract-registry.js"), async (importOriginal) => {
+  const { isPluginDoctorMigrationDeferred } = await importOriginal();
+  return {
+    isPluginDoctorMigrationDeferred,
+    collectDoctorConfigRepairPluginIds: collectRelevantDoctorPluginIds,
+    applyPluginDoctorCompatibilityMigrations,
+    collectRelevantDoctorPluginIds,
+  };
+});
 
+// mock-isolation: Supply migration contracts without activating channel runtimes.
 vi.mock("../../../channels/plugins/doctor-contract-api.js", () => ({
-  loadBundledChannelDoctorContractApi: (...args: unknown[]) =>
-    loadBundledChannelDoctorContractApi(...args),
+  loadBundledChannelDoctorContractApi,
 }));
 
-vi.mock("../../../channels/plugins/bootstrap-registry.js", () => ({
-  getBootstrapChannelPlugin: (...args: unknown[]) => getBootstrapChannelPlugin(...args),
-}));
+// mock-isolation: The fixture owns bootstrap lookup; no runtime plugin registry is loaded.
+vi.mock("../../../channels/plugins/bootstrap-registry.js", () => ({ getBootstrapChannelPlugin }));
 
 let applyChannelDoctorCompatibilityMigrations: typeof import("./channel-legacy-config-migrate.js").applyChannelDoctorCompatibilityMigrations;
 
@@ -42,173 +47,126 @@ beforeEach(() => {
   getBootstrapChannelPlugin.mockReset();
 });
 
-function firstMigrationCall() {
-  return applyPluginDoctorCompatibilityMigrations.mock.calls[0];
-}
-
 describe("bundled channel legacy config migrations", () => {
-  it("prefers bundled channel doctor contract normalizers before plugin registry fallback", () => {
-    collectRelevantDoctorPluginIds.mockReturnValueOnce([]);
-    loadBundledChannelDoctorContractApi.mockImplementation((channelId: string) =>
-      channelId === "slack"
-        ? {
-            normalizeCompatibilityConfig: ({
-              cfg,
-            }: {
-              cfg: { channels?: { slack?: Record<string, unknown> } };
-            }) => ({
-              config: {
-                ...cfg,
-                channels: {
-                  ...cfg.channels,
-                  slack: {
-                    ...cfg.channels?.slack,
-                    normalizedByBundledContract: true,
-                  },
-                },
-              },
-              changes: ["Normalized channels.slack via bundled doctor contract."],
-            }),
-          }
-        : undefined,
-    );
-    getBootstrapChannelPlugin.mockReturnValue(undefined);
+  it("does not treat channel metadata or blank ids as channel plugins", () => {
+    collectRelevantDoctorPluginIds.mockReturnValue([]);
 
-    const result = applyChannelDoctorCompatibilityMigrations({
-      channels: {
-        slack: {
-          streaming: true,
-        },
-      },
+    applyChannelDoctorCompatibilityMigrations({
+      channels: { defaults: {}, modelByChannel: { discord: "openai/gpt-5.6-luna" }, " ": {} },
     });
 
+    expect(loadBundledChannelDoctorContractApi).not.toHaveBeenCalled();
+    expect(getBootstrapChannelPlugin).not.toHaveBeenCalled();
     expect(applyPluginDoctorCompatibilityMigrations).not.toHaveBeenCalled();
-    expect(loadBundledChannelDoctorContractApi).toHaveBeenCalledWith("slack");
-    const nextChannels = (result.next.channels ?? {}) as {
-      slack?: Record<string, unknown>;
-    };
-    expect(nextChannels.slack?.streaming).toBe(true);
-    expect(nextChannels.slack?.normalizedByBundledContract).toBe(true);
-    expect(result.changes).toEqual(["Normalized channels.slack via bundled doctor contract."]);
   });
 
-  it("normalizes legacy private-network aliases exposed through bundled contract surfaces", () => {
-    collectRelevantDoctorPluginIds.mockReturnValueOnce(["mattermost"]);
-    loadBundledChannelDoctorContractApi.mockReturnValue(undefined);
-    getBootstrapChannelPlugin.mockReturnValue(undefined);
-    applyPluginDoctorCompatibilityMigrations.mockReturnValueOnce({
-      config: {
-        channels: {
-          mattermost: {
-            network: {
-              dangerouslyAllowPrivateNetwork: true,
-            },
-            accounts: {
-              work: {
-                network: {
-                  dangerouslyAllowPrivateNetwork: false,
-                },
-              },
-            },
-          },
-        },
-      },
-      changes: [
-        "Moved channels.mattermost.allowPrivateNetwork → channels.mattermost.network.dangerouslyAllowPrivateNetwork (true).",
-        "Moved channels.mattermost.accounts.work.allowPrivateNetwork → channels.mattermost.accounts.work.network.dangerouslyAllowPrivateNetwork (false).",
-      ],
+  it("only renames heartbeat blocks that use the common visibility shape", () => {
+    collectRelevantDoctorPluginIds.mockReturnValue([]);
+    loadBundledChannelDoctorContractApi.mockReturnValue({
+      normalizeCompatibilityConfig: ({ cfg }: { cfg: OpenClawConfig }) => ({
+        config: cfg,
+        changes: [],
+      }),
     });
 
+    const customHeartbeat = {
+      heartbeat: { visibility: "hidden", intervalMs: 1000 },
+      accounts: { work: { heartbeat: { visibility: "visible" } }, empty: { heartbeat: {} } },
+    };
     const result = applyChannelDoctorCompatibilityMigrations({
       channels: {
-        mattermost: {
-          allowPrivateNetwork: true,
-          accounts: {
-            work: {
-              allowPrivateNetwork: false,
-            },
-          },
+        feishu: structuredClone(customHeartbeat),
+        slack: {
+          heartbeat: { showOk: true },
+          accounts: { work: { heartbeat: { showAlerts: false } } },
         },
       },
     });
 
-    expect(applyPluginDoctorCompatibilityMigrations).toHaveBeenCalledOnce();
-    const migrationCall = firstMigrationCall();
-    expect(typeof migrationCall?.[0]).toBe("object");
-    expect(migrationCall?.[1]?.config).toStrictEqual({
-      channels: {
-        mattermost: {
-          allowPrivateNetwork: true,
-          accounts: {
-            work: {
-              allowPrivateNetwork: false,
-            },
-          },
-        },
+    expect(result.next.channels).toEqual({
+      feishu: customHeartbeat,
+      slack: {
+        heartbeatVisibility: { showOk: true },
+        accounts: { work: { heartbeatVisibility: { showAlerts: false } } },
       },
     });
-    expect(migrationCall?.[1]?.pluginIds).toStrictEqual(["mattermost"]);
+  });
 
-    const nextChannels = (result.next.channels ?? {}) as {
-      mattermost?: Record<string, unknown>;
+  it.each([false, true])(
+    "prefers bundled channel doctor contracts (pluginContracts=%s)",
+    (pluginContracts) => {
+      collectRelevantDoctorPluginIds.mockReturnValueOnce([]);
+      loadBundledChannelDoctorContractApi.mockImplementation((channelId: string) =>
+        channelId === "slack"
+          ? {
+              normalizeCompatibilityConfig: ({ cfg }: { cfg: OpenClawConfig }) => ({
+                config: {
+                  channels: {
+                    slack: { ...cfg.channels?.slack, normalizedByBundledContract: true },
+                  },
+                },
+                changes: ["Normalized channels.slack via bundled doctor contract."],
+              }),
+            }
+          : undefined,
+      );
+
+      const result = applyChannelDoctorCompatibilityMigrations(
+        { channels: { slack: { streaming: true } } },
+        { pluginContracts },
+      );
+      expect(collectRelevantDoctorPluginIds).toHaveBeenCalledTimes(pluginContracts ? 1 : 0);
+
+      expect(applyPluginDoctorCompatibilityMigrations).not.toHaveBeenCalled();
+      expect(loadBundledChannelDoctorContractApi).toHaveBeenCalledWith("slack");
+      expect(result.next).toHaveProperty("channels.slack", {
+        streaming: true,
+        normalizedByBundledContract: true,
+      });
+      expect(result.changes).toEqual(["Normalized channels.slack via bundled doctor contract."]);
+    },
+  );
+
+  it("uses registry fallback when a bundled channel contract is unavailable", () => {
+    collectRelevantDoctorPluginIds.mockReturnValueOnce(["mattermost"]);
+    const config = { channels: { mattermost: { allowPrivateNetwork: true } } };
+    const migrated = {
+      channels: { mattermost: { network: { dangerouslyAllowPrivateNetwork: true } } },
     };
+    const changes = ["Migrated channel config."];
+    applyPluginDoctorCompatibilityMigrations.mockReturnValueOnce({ config: migrated, changes });
 
-    expect(nextChannels.mattermost).toEqual({
-      network: {
-        dangerouslyAllowPrivateNetwork: true,
-      },
-      accounts: {
-        work: {
-          network: {
-            dangerouslyAllowPrivateNetwork: false,
-          },
-        },
-      },
+    const result = applyChannelDoctorCompatibilityMigrations(config);
+
+    expect(loadBundledChannelDoctorContractApi).toHaveBeenCalledWith("mattermost");
+    expect(getBootstrapChannelPlugin).toHaveBeenCalledWith("mattermost");
+    expect(applyPluginDoctorCompatibilityMigrations).toHaveBeenCalledTimes(1);
+    expect(applyPluginDoctorCompatibilityMigrations).toHaveBeenCalledWith(config, {
+      config,
+      pluginIds: ["mattermost"],
     });
-    expect(result.changes).toStrictEqual([
-      "Moved channels.mattermost.allowPrivateNetwork → channels.mattermost.network.dangerouslyAllowPrivateNetwork (true).",
-      "Moved channels.mattermost.accounts.work.allowPrivateNetwork → channels.mattermost.accounts.work.network.dangerouslyAllowPrivateNetwork (false).",
-    ]);
+    expect(result).toEqual({ next: migrated, changes });
   });
 
   it("applies plugin doctor normalizers for configured non-channel plugin entries", () => {
+    const model = "openai-codex/gpt-5.4-mini";
+    const pluginConfig = (config: Record<string, unknown>) => ({
+      plugins: { entries: { "lossless-claw": config } },
+    });
     collectRelevantDoctorPluginIds.mockReturnValueOnce(["lossless-claw"]);
     applyPluginDoctorCompatibilityMigrations.mockReturnValueOnce({
-      config: {
-        plugins: {
-          entries: {
-            "lossless-claw": {
-              llm: {
-                allowModelOverride: true,
-                allowedModels: ["openai-codex/gpt-5.4-mini"],
-              },
-            },
-          },
-        },
-      },
+      config: pluginConfig({ llm: { allowModelOverride: true, allowedModels: [model] } }),
       changes: ["Configured plugins.entries.lossless-claw.llm.allowedModels."],
     });
 
-    const config = {
-      plugins: {
-        entries: {
-          "lossless-claw": {
-            config: {
-              summaryModel: "openai-codex/gpt-5.4-mini",
-            },
-          },
-        },
-      },
-    };
+    const config = pluginConfig({ config: { summaryModel: model } });
     const result = applyChannelDoctorCompatibilityMigrations(config);
 
     expect(applyPluginDoctorCompatibilityMigrations).toHaveBeenCalledOnce();
-    const migrationCall = firstMigrationCall();
-    expect(typeof migrationCall?.[0]).toBe("object");
-    expect(migrationCall?.[1]).toStrictEqual({
-      config,
-      pluginIds: ["lossless-claw"],
-    });
+    expect(applyPluginDoctorCompatibilityMigrations.mock.calls[0]).toStrictEqual([
+      expect.any(Object),
+      { config, pluginIds: ["lossless-claw"], historicalWebhookListeners: undefined },
+    ]);
     expect(result.changes).toEqual(["Configured plugins.entries.lossless-claw.llm.allowedModels."]);
   });
 });

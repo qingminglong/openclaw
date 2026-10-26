@@ -1,72 +1,103 @@
-// Gateway cron lazy loader.
 // Defers scheduler startup until cron is touched by runtime or API handlers.
-import type { CliDeps } from "../cli/deps.types.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
-import type { CronServiceContract } from "../cron/service-contract.js";
-import { resolveCronJobsStorePath } from "../cron/store.js";
-import type { GatewayCronState } from "./server-cron.js";
-
-type LazyGatewayCronParams = {
-  cfg: OpenClawConfig;
-  deps: CliDeps;
-  broadcast: (event: string, payload: unknown, opts?: { dropIfSlow?: boolean }) => void;
-};
-
-type LoadedGatewayCronState = {
-  state: GatewayCronState;
-  started: boolean;
-};
+import { DEFAULT_CRON_ENABLED } from "../config/cron-limits.js";
+import { captureSqliteReadOnlyWorkerScope } from "../infra/sqlite-readonly-worker-context.js";
+import { getSpawnBroker, runWithSpawnBroker } from "../process/spawn-broker/context.js";
+import { createLazyPromiseLoader, createLazyRuntimeMethodBinder } from "../shared/lazy-runtime.js";
+import type {
+  GatewayCronServiceContract,
+  GatewayCronExitWatcherHandoff,
+  GatewayCronState,
+} from "./server-cron-contract.js";
+import type { buildGatewayCronService } from "./server-cron.js";
 
 /** Creates a cron state proxy that imports the real cron service on first use. */
-export function createLazyGatewayCronState(params: LazyGatewayCronParams): GatewayCronState {
-  const storePath = resolveCronJobsStorePath(params.cfg.cron?.store);
-  const cronEnabled = process.env.OPENCLAW_SKIP_CRON !== "1" && params.cfg.cron?.enabled !== false;
-  let loaded: LoadedGatewayCronState | null = null;
-  let loading: Promise<LoadedGatewayCronState> | null = null;
+export function createLazyGatewayCronState(
+  params: Parameters<typeof buildGatewayCronService>[0],
+): GatewayCronState {
+  const spawnBroker = getSpawnBroker();
+  const runWithReadOnlyWorkers = captureSqliteReadOnlyWorkerScope();
+  const env = params.env ?? process.env;
+  const storePath = params.storePath;
+  const cronEnabled =
+    env.OPENCLAW_SKIP_CRON !== "1" && (params.cfg.cron?.enabled ?? DEFAULT_CRON_ENABLED);
+  let loaded: GatewayCronState | null = null;
   let stopped = false;
+  let lifecycleGeneration = 0;
+  let exitWatcherHandoff: GatewayCronExitWatcherHandoff | undefined;
+  let exitWatcherHandoffStop: Promise<void> | undefined;
+  let schedulingPaused = false;
+  const cronStateLoader = createLazyPromiseLoader(
+    () =>
+      import("./server-cron.js").then(({ buildGatewayCronService }) => {
+        loaded = runWithSpawnBroker(spawnBroker, () =>
+          runWithReadOnlyWorkers(() => buildGatewayCronService(params)),
+        );
+        if (schedulingPaused) {
+          loaded.cron.pauseScheduling();
+        }
+        return loaded;
+      }),
+    { cacheRejections: true },
+  );
 
-  const load = async (): Promise<LoadedGatewayCronState> => {
+  const load = async (): Promise<GatewayCronState> => {
     if (loaded) {
       return loaded;
     }
     // Share the same import promise across concurrent API calls so only one
     // scheduler instance is built for a Gateway process.
-    loading ??= import("./server-cron.js").then(({ buildGatewayCronService }) => {
-      loaded = {
-        state: buildGatewayCronService(params),
-        started: false,
-      };
-      return loaded;
-    });
-    return await loading;
+    return await cronStateLoader.load();
+  };
+  const bindCron = createLazyRuntimeMethodBinder(load);
+  const bindStartedCron = createLazyRuntimeMethodBinder(async () => {
+    const resolved = await load();
+    // Startup recovery must finish before a new receipt can become running.
+    if (!stopped) {
+      await cron.start();
+    }
+    return resolved;
+  });
+
+  const stopResolvedCron = async (resolved: GatewayCronState): Promise<void> => {
+    if (exitWatcherHandoff) {
+      // A cancelled startup must join the exact prepared owner's drain, not
+      // prepare or stop another owner after its watchers have been adopted.
+      await (exitWatcherHandoffStop ??= exitWatcherHandoff.stopOwner());
+    } else if (resolved.cron.stopAndDrain) {
+      await resolved.cron.stopAndDrain();
+    } else {
+      resolved.cron.stop();
+      await resolved.stopStreamWatchers();
+    }
   };
 
-  const cron: CronServiceContract = {
+  const stopLoadedCronAndDrain = async (handoff?: GatewayCronExitWatcherHandoff): Promise<void> => {
+    stopped = true;
+    lifecycleGeneration += 1;
+    exitWatcherHandoff ??= handoff;
+    const loading = cronStateLoader.peek();
+    const resolved = loaded ?? (loading ? await loading : null);
+    if (resolved) {
+      await stopResolvedCron(resolved);
+    }
+  };
+
+  const cron: GatewayCronServiceContract = {
     async start() {
       stopped = false;
       const resolved = await load();
-      if (stopped) {
-        return;
-      }
-      if (resolved.started) {
-        return;
-      }
-      resolved.started = true;
-      await resolved.state.cron.start();
-      // If stop raced the lazy import/start path, immediately stop the loaded
-      // scheduler so shutdown does not leave a background loop alive.
-      if (stopped && resolved.started) {
-        resolved.started = false;
-        resolved.state.cron.stop();
+      if (!stopped) {
+        await resolved.cron.start();
       }
     },
     stop() {
       stopped = true;
+      lifecycleGeneration += 1;
       if (loaded) {
-        loaded.started = false;
-        loaded.state.cron.stop();
+        loaded.cron.stop();
         return;
       }
+      const loading = cronStateLoader.peek();
       if (loading) {
         // Stop may happen while the dynamic import is still in flight; attach a
         // cleanup continuation instead of forcing cron to load synchronously.
@@ -75,65 +106,128 @@ export function createLazyGatewayCronState(params: LazyGatewayCronParams): Gatew
             if (!stopped) {
               return;
             }
-            resolved.started = false;
-            resolved.state.cron.stop();
+            resolved.cron.stop();
           })
-          .catch(() => {});
+          .catch(() => {
+            // Failed loading created no service to stop; its caller owns the error.
+          });
       }
     },
-    async status() {
-      return await (await load()).state.cron.status();
+    async stopAndDrain() {
+      await stopLoadedCronAndDrain();
     },
-    async list(opts) {
-      return await (await load()).state.cron.list(opts);
+    pauseScheduling() {
+      schedulingPaused = true;
+      if (loaded) {
+        loaded.cron.pauseScheduling();
+      }
     },
-    async listPage(opts) {
-      return await (await load()).state.cron.listPage(opts);
+    resumeScheduling() {
+      schedulingPaused = false;
+      loaded?.cron.resumeScheduling();
     },
-    async add(input) {
-      return await (await load()).state.cron.add(input);
+    getSuspensionBlockerCount() {
+      return loaded?.cron.getSuspensionBlockerCount?.() ?? 0;
     },
-    async update(id, patch) {
-      return await (await load()).state.cron.update(id, patch);
+    status: bindCron((state) => state.cron.status.bind(state.cron)),
+    list: bindCron((state) => state.cron.list.bind(state.cron)),
+    listPage: bindCron((state) => state.cron.listPage.bind(state.cron)),
+    add: bindCron((state) => state.cron.add.bind(state.cron)),
+    update: bindCron((state) => state.cron.update.bind(state.cron)),
+    updateWithPrecondition: bindCron((state) => state.cron.updateWithPrecondition.bind(state.cron)),
+    remove: bindCron((state) => state.cron.remove.bind(state.cron)),
+    removeStaleJobFamily: bindCron((state) => state.cron.removeStaleJobFamily.bind(state.cron)),
+    async removeAgentJobsTransactional(agentId, commit) {
+      return await (await load()).cron.removeAgentJobsTransactional(agentId, commit);
     },
-    async remove(id) {
-      return await (await load()).state.cron.remove(id);
-    },
-    async run(id, mode) {
-      return await (await load()).state.cron.run(id, mode);
-    },
-    async enqueueRun(id, mode) {
-      return await (await load()).state.cron.enqueueRun(id, mode);
+    quiesceJobs: bindCron((state) => state.cron.quiesceJobs.bind(state.cron)),
+    run: bindStartedCron((state) => state.cron.run.bind(state.cron)),
+    enqueueRun: bindStartedCron((state) => state.cron.enqueueRun.bind(state.cron)),
+    waitForManualRun: bindCron((state) => state.cron.waitForManualRun.bind(state.cron)),
+    readEventSources: bindCron((state) => state.cron.readEventSources.bind(state.cron)),
+    runEvent: bindCron((state) => state.cron.runEvent.bind(state.cron)),
+    getStoreKey() {
+      const storeKey = loaded?.cron.getStoreKey?.();
+      if (!storeKey) {
+        throw new Error("Cron store is not prepared; read cron jobs first");
+      }
+      return storeKey;
     },
     getJob(id) {
-      if (!loaded) {
-        return undefined;
-      }
-      return loaded.state.cron.getJob(id);
+      return loaded?.cron.getJob(id);
     },
-    async readJob(id) {
-      return await (await load()).state.cron.readJob(id);
+    getLoadedJobs() {
+      return loaded?.cron.getLoadedJobs();
     },
+    readJob: bindCron((state) => state.cron.readJob.bind(state.cron)),
+    async readScratch(id, options) {
+      options?.assertCurrent?.();
+      const current = await load();
+      options?.assertCurrent?.();
+      return await current.cron.readScratch(id, options);
+    },
+    writeScratch: bindCron((state) => state.cron.writeScratch.bind(state.cron)),
     getDefaultAgentId() {
-      if (!loaded) {
-        return undefined;
-      }
-      return loaded.state.cron.getDefaultAgentId();
+      return loaded?.cron.getDefaultAgentId();
     },
-    wake(opts) {
+    async prepareWake() {
+      await load();
+    },
+    async wake(opts) {
       if (!loaded) {
         // A wake should kick off lazy loading but cannot claim success before
         // cron exists and knows whether the target job is wakeable.
         void load();
         return { ok: false };
       }
-      return loaded.state.cron.wake(opts);
+      return loaded.cron.wake(opts);
     },
   };
 
   return {
     cron,
+    get readHeartbeatSummary() {
+      return loaded?.readHeartbeatSummary;
+    },
+    deferHookWake: async (opts) => {
+      const generation = lifecycleGeneration;
+      const commitGuard = () => {
+        opts.commitGuard();
+        if (stopped || lifecycleGeneration !== generation) {
+          throw new Error("Scheduled Hook wake owner changed; retry the request");
+        }
+      };
+      commitGuard();
+      const current = await load();
+      commitGuard();
+      const defer = current.deferHookWake;
+      if (!defer) {
+        throw new Error("Scheduled Hook wake admission is unavailable; restart the Gateway");
+      }
+      return await defer({ ...opts, commitGuard });
+    },
     storePath,
     cronEnabled,
+    prepareExitWatcherHandoff: async (): Promise<GatewayCronExitWatcherHandoff | undefined> => {
+      const loading = cronStateLoader.peek();
+      const resolved = loaded ?? (loading ? await loading : null);
+      const handoff = await resolved?.prepareExitWatcherHandoff?.();
+      if (!handoff) {
+        return undefined;
+      }
+      return {
+        ...handoff,
+        stopOwner: async () => {
+          await stopLoadedCronAndDrain(handoff);
+        },
+      };
+    },
+    // Reload hooks follow the serving lazy owner.
+    reconcileExitWatchers: bindCron((state) => state.reconcileExitWatchers.bind(state)),
+    reconcileStreamWatchers: bindCron((state) => state.reconcileStreamWatchers.bind(state)),
+    async stopStreamWatchers() {
+      // Nothing to stop before the heavy cron service is built.
+      await loaded?.stopStreamWatchers();
+    },
   };
 }
