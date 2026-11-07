@@ -31,8 +31,8 @@ async function expectReply(reply: HttpReply | Promise<HttpReply>, expected: obje
   return response;
 }
 
-function taskRequest(id: string, requestId = "task", method = "GetTask") {
-  return rpc(method, { id }, requestId);
+function taskRequest(id: string, requestId = "task", method = "GetTask", tenant?: string) {
+  return rpc(method, { id, ...(tenant === undefined ? {} : { tenant }) }, requestId);
 }
 
 const taskResult = (task: unknown) => ({ result: { task } });
@@ -191,6 +191,7 @@ function sendRequest({
   id = "send-1",
   text = "hello",
   returnImmediately,
+  tenant,
   ...message
 }: {
   id?: string | number;
@@ -199,12 +200,14 @@ function sendRequest({
   messageId?: string;
   text?: string;
   returnImmediately?: boolean;
+  tenant?: string;
 } = {}) {
   return rpc(
     "SendMessage",
     {
       message: { ...message, role: "ROLE_USER", parts: [{ text }] },
       ...(returnImmediately ? { configuration: { returnImmediately: true } } : {}),
+      ...(tenant === undefined ? {} : { tenant }),
     },
     id,
   );
@@ -443,6 +446,27 @@ describe("A2A HTTP authentication and request limits", () => {
 });
 
 describe("A2A JSON-RPC protocol boundary", () => {
+  it("rejects non-empty tenant routing on SendMessage", async () => {
+    const onDispatch = vi.fn(async () => {});
+    const harness = await startHttpHarness({ onDispatch });
+
+    await expectReply(
+      harness.post(sendRequest({ tenant: "tenant-a", returnImmediately: true })),
+      rpcError(-32602, "Multi-tenant routing is not supported"),
+    );
+    expect(onDispatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-empty tenant routing on GetTask", async () => {
+    const harness = await startHttpHarness({ onDispatch: async () => {} });
+    const taskId = await workingTask(harness);
+
+    await expectReply(
+      harness.post(taskRequest(taskId, "tenant-get", "GetTask", "tenant-a")),
+      rpcError(-32602, "Multi-tenant routing is not supported"),
+    );
+  });
+
   it.each([
     ["malformed JSON", "{", -32700],
     ["empty batch", "[]", -32600],

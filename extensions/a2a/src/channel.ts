@@ -47,6 +47,7 @@ import {
   A2aTaskRequestParamsSchema,
   extractA2aMessageText,
   resolveA2aRpcMethod,
+  truncateA2aTaskHistory,
 } from "./protocol.js";
 import { getA2aChannelRuntime } from "./runtime.js";
 import { A2aTaskStore } from "./task-store.js";
@@ -428,7 +429,9 @@ export const a2aChannelPlugin: ChannelPlugin<ResolvedA2aChannelAccount> = create
                   const timeoutMs = a2aConfig.replyTimeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS;
                   await store.wait(task, timeoutMs);
                 }
-                result = { task };
+                result = {
+                  task: truncateA2aTaskHistory(task, send.data.configuration?.historyLength),
+                };
               } else {
                 const taskParams = A2aTaskRequestParamsSchema.safeParse(request.params);
                 if (!taskParams.success) {
@@ -438,7 +441,7 @@ export const a2aChannelPlugin: ChannelPlugin<ResolvedA2aChannelAccount> = create
                 if (!task) {
                   throw new A2aProtocolError(-32001, "Task not found");
                 }
-                result = task;
+                result = truncateA2aTaskHistory(task, taskParams.data.historyLength);
               }
             } catch (error) {
               if (notification) {
