@@ -41,6 +41,14 @@ export type A2aTaskRecord = {
   history: A2aMessageRecord[];
 };
 
+export function truncateA2aTaskHistory(
+  task: A2aTaskRecord,
+  historyLength: number | undefined,
+): A2aTaskRecord {
+  if (historyLength === undefined) return task;
+  return { ...task, history: historyLength === 0 ? [] : task.history.slice(-historyLength) };
+}
+
 export const A2aRpcRequestSchema = z.object({
   jsonrpc: z.literal("2.0"),
   id: z.union([z.string(), z.number().finite(), z.null()]).optional(),
