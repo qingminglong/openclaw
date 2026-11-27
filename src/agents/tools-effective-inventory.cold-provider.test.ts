@@ -32,10 +32,8 @@ import {
 import * as pluginRuntime from "../plugins/runtime.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { withPluginRuntimeRegistryScope } from "../plugins/runtime/gateway-request-scope.js";
-import {
-  getPluginRuntimeGenerationRegistry,
-  withPluginRuntimeGenerationScope,
-} from "../plugins/runtime/generation-scope.js";
+import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
+import { getPluginRuntimeGenerationRegistry } from "../plugins/runtime/generation-state.js";
 import {
   createColdPluginFixture,
   isColdPluginRuntimeLoaded,
@@ -46,7 +44,8 @@ import {
   withOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
-import type { McpToolCatalog } from "./agent-bundle-mcp-types.js";
+import type { McpToolCatalog } from "./agent-bundle-mcp-catalog.types.js";
+import { catalogTool } from "./agent-bundle-mcp-fixture.test-support.js";
 import { resolveModelAsync } from "./embedded-agent-runner/model.js";
 import * as modelCatalog from "./model-catalog.js";
 import {
@@ -93,7 +92,7 @@ vi.mock("./agent-bundle-mcp-tools.js", async (importOriginal) => {
 });
 
 // mock-isolation: Keep tool assembly inert while provider normalization and lifetime stay real.
-vi.mock("./agent-tools.js", () => {
+vi.mock("./agent-tools.async.js", () => {
   const execute = async () => {
     throw new Error("Inventory must not execute tools");
   };
@@ -768,13 +767,10 @@ it("owns base and sandbox MCP normalization without caching", async () => {
       generatedAt: 1,
       servers: {},
       tools: [
-        {
-          serverName: "inventory",
-          safeServerName: "inventory",
-          toolName: "probe",
+        catalogTool("inventory", "probe", {
           inputSchema: Type.Object({}),
           fallbackDescription: "Synthetic inventory probe",
-        },
+        }),
       ],
     };
     warmMcp.runtime = {

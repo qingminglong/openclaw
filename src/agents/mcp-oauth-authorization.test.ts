@@ -229,6 +229,7 @@ it("retains the canonical clear fence when native settlement is unknown despite 
     const context = captureOpenClawStateWorkerContext();
     const lease: OpenClawStateAsyncLeaseContext = {
       signal: new AbortController().signal,
+      assertCurrent() {},
       async assertOwned() {},
       async renew() {},
     };
@@ -269,7 +270,7 @@ it("retains the canonical clear fence when native settlement is unknown despite 
           await settlement.promise;
           throw deliveryError;
         } finally {
-          admission.finish();
+          await admission.finish();
         }
       });
     try {

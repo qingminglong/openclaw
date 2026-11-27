@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { serialize } from "node:v8";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
@@ -33,10 +34,14 @@ import { withoutHostSql } from "./session-accessor.observation.test-support.js";
 import { memorySessionActorOwners } from "./session-actor-memory-owner.js";
 import { sessionTests } from "./session-entry-fixture.test-support.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
+import { measureSessionStoreTargetInventoryInputBytes } from "./session-store-read-candidates.js";
+import { prepareSessionStoreTargetInventory } from "./session-store-target-inventory.js";
+import { captureSessionStoreTargetInventory } from "./session-store-target-routing.js";
+import { prepareSessionStoreTargetInventoryRead } from "./session-store-target-runtime.js";
 import {
   historyLane,
-  projectionLane,
-  targetDiscoveryLane,
+  prepareSessionStoreCandidatesInWorker,
+  sessionStoreLane,
 } from "./session-transcript-worker-resources.js";
 import type { SessionEntry } from "./types.js";
 
@@ -84,10 +89,10 @@ function selection(
 }
 
 function interceptReads(hooks: {
-  beforeRequest?: (request: unknown) => void;
+  beforeRequest?: (request: unknown, inputBytes?: number) => void;
   afterReply?: (reply: unknown) => Promise<void>;
 }) {
-  const spies = [historyLane, projectionLane, targetDiscoveryLane].map(({ pool }) => {
+  const spies = [historyLane, sessionStoreLane].map(({ pool }) => {
     const run = pool.run.bind(pool);
     return vi.spyOn(pool, "run").mockImplementation((input, options) => {
       const prepare = typeof input === "function" ? input : () => input;
@@ -96,7 +101,7 @@ function interceptReads(hooks: {
           ? new Proxy(prepare, {
               async apply(target, receiver, args) {
                 const request: unknown = await Reflect.apply(target, receiver, args);
-                hooks.beforeRequest?.(request);
+                hooks.beforeRequest?.(request, options?.inputBytes);
                 return request;
               },
             })
@@ -113,6 +118,144 @@ function interceptReads(hooks: {
   });
   return { [Symbol.dispose]: () => spies.forEach((spy) => spy.mockRestore()) };
 }
+
+it("sends only the captured state root for physical path observations", async ({ state }) => {
+  const env = {
+    HOME: state.statePath("routing-home"),
+    OPENCLAW_STATE_DIR: state.statePath("storage-root"),
+    SYNTHETIC_SETTING: "caller-only-inventory-value",
+  };
+  const cfg = fleet(["main"], { store: "~/shared.sqlite" });
+  const storePath = path.join(env.HOME, "shared.sqlite");
+  fs.mkdirSync(env.HOME);
+  fs.writeFileSync(storePath, "");
+  const inventory = captureSessionStoreTargetInventory(cfg, ["main"], env);
+  const directRequest = { inventory: true as const, ...inventory };
+  const observedRequest = { observePaths: { inventory, requiredPaths: [storePath] } };
+  const charges: Array<number | undefined> = [];
+  const requests: boolean[] = [];
+  const replies: boolean[] = [];
+  using _ = interceptReads({
+    beforeRequest(request, inputBytes) {
+      charges.push(inputBytes);
+      requests.push(serialize(request).includes(env.SYNTHETIC_SETTING));
+    },
+    async afterReply(reply) {
+      replies.push(serialize(reply).includes(env.SYNTHETIC_SETTING));
+    },
+  });
+
+  const direct = await prepareSessionStoreCandidatesInWorker(directRequest);
+  expect(direct.inventory?.env).toEqual(env);
+  expect(direct.inventory?.env).not.toBe(inventory.env);
+  expect(direct.inventory?.paths.get("main")?.configured).toBe(storePath);
+  expect(direct.candidates).toContainEqual(expect.objectContaining({ path: storePath }));
+  const observed = await prepareSessionStoreCandidatesInWorker(observedRequest);
+  expect("observations" in observed && observed.observations).toContainEqual(
+    expect.objectContaining({ lexicalPath: storePath }),
+  );
+  expect(observed.inventory).toBeUndefined();
+
+  // Raw routing still expands the caller's home and returns its complete environment.
+  const raw = await prepareSessionStoreCandidatesInWorker({ config: cfg, agentIds: ["main"], env });
+  expect(raw.inventory?.paths.get("main")?.configured).toBe(storePath);
+  expect(raw.inventory?.env).toEqual(env);
+  expect(charges.slice(0, 2)).toEqual([
+    measureSessionStoreTargetInventoryInputBytes(directRequest),
+    measureSessionStoreTargetInventoryInputBytes({ ...observedRequest, paths: inventory.paths }),
+  ]);
+  expect(requests).toEqual([true, false, true]);
+  expect(replies).toEqual([true, false, true]);
+});
+
+it("keeps incognito inventory qualification with the captured state root", async ({ state }) => {
+  const env = { HOME: state.statePath("captured-home"), OPENCLAW_PROFILE: "inventory" };
+  const store = resolveIncognitoOpenClawAgentSqlitePath({ agentId: "main", env });
+  const inventory = captureSessionStoreTargetInventory(fleet(["main"], { store }), ["main"], env);
+  expect(inventory.env.OPENCLAW_STATE_DIR).toBe(path.join(env.HOME, ".openclaw-inventory"));
+  for (const request of [
+    { inventory: true as const, ...inventory },
+    { observePaths: { inventory } },
+  ]) {
+    await expect(prepareSessionStoreCandidatesInWorker(request)).rejects.toThrow(
+      "Incognito session discovery requires its process-held owner",
+    );
+  }
+});
+
+it("keeps discovery payloads bounded by routing config while preserving shared ACP stores", async ({
+  state,
+}) => {
+  const storePath = state.statePath("shared.sqlite");
+  const cfg: OpenClawConfig = {
+    agents: {
+      ownership: "explicit",
+      entries: { main: {}, ops: {} },
+      defaults: { sessionStore: { agentId: "main" } },
+    },
+    acp: { defaultAgent: "coder", allowedAgents: ["coder"] },
+    session: { store: storePath },
+    plugins: {
+      entries: Object.fromEntries(
+        Array.from({ length: 40 }, (_, index) => [
+          `fixture-${index}`,
+          { config: { description: "synthetic plugin metadata ".repeat(100) } },
+        ]),
+      ),
+    },
+    models: {
+      providers: {
+        fixture: {
+          baseUrl: "https://models.example.invalid",
+          models: [],
+          headers: { "X-Fixture": "synthetic provider config ".repeat(1_000) },
+        },
+      },
+    },
+  };
+  openOpenClawAgentDatabase({ agentId: "main", path: storePath });
+  seedAgents(["main", "ops", "coder"], () => ({}), storePath);
+  const configBytes = new Map<string, number[]>();
+  using _ = interceptReads({
+    beforeRequest(request) {
+      if (
+        isRecord(request) &&
+        (request.kind === "combined-store-topology" ||
+          request.kind === "session-target-inventory") &&
+        isRecord(request.request)
+      ) {
+        const sizes = configBytes.get(request.kind) ?? [];
+        sizes.push(serialize(request.request.config).byteLength);
+        configBytes.set(request.kind, sizes);
+      }
+    },
+  });
+  const combined = await loadCombinedStoreAsync(cfg, { configuredAgentsOnly: true });
+  expect(Object.keys(combined.store).toSorted()).toEqual([
+    "agent:coder:main",
+    "agent:main:main",
+    "agent:ops:main",
+  ]);
+  expect(combined.targetsBySessionKey.get("agent:coder:main")?.storeTarget).toEqual({
+    agentId: "main",
+    storePath,
+  });
+  const inventory = prepareSessionStoreTargetInventory(cfg, ["main", "ops", "coder"], state.env);
+  await prepareSessionStoreTargetInventoryRead(inventory).withRead(async (result) => {
+    expect(result.agents.map(({ agentId, result: found }) => [agentId, found.available])).toEqual([
+      ["main", true],
+      ["ops", true],
+      ["coder", true],
+    ]);
+  });
+  expect([...configBytes.keys()].toSorted()).toEqual([
+    "combined-store-topology",
+    "session-target-inventory",
+  ]);
+  for (const [kind, sizes] of configBytes) {
+    expect(Math.max(...sizes), `${kind} config bytes`).toBeLessThan(4_096);
+  }
+});
 
 it.for([
   ["separate", "before-read"],

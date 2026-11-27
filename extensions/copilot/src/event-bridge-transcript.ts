@@ -1,6 +1,7 @@
 import type { Attachment, SessionEvent } from "@github/copilot-sdk";
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { sanitizeToolResult } from "openclaw/plugin-sdk/agent-harness-runtime";
+import type { AssistantMessage } from "openclaw/plugin-sdk/llm";
 import { parseDateStringTimestampMs } from "openclaw/plugin-sdk/number-runtime";
 import {
   asNonArrayRecord,
@@ -8,7 +9,7 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { normalizeCopilotUsage, type CopilotUsageSnapshot } from "./usage-bridge.js";
 
-export type AssistantMessage = Extract<AgentMessage, { role: "assistant" }>;
+export type { AssistantMessage };
 export type AssistantUsageSnapshot = CopilotUsageSnapshot;
 
 export type AssistantProjectionChunk = {
@@ -124,8 +125,16 @@ export function buildAssistantProjectionGroup(
     });
     return message.content.length > 0 ? [message] : [];
   });
-  const replayIncomplete = group.chunks.some(({ event }) =>
-    hasUnprojectedAssistantReplayState(event),
+  // The SDK contract marks these as provider/session-bound state or custom
+  // call shape. AgentMessage cannot represent them, so native replay must stay.
+  const replayIncomplete = group.chunks.some(
+    ({ event }) =>
+      event.data.citations !== undefined ||
+      event.data.serverTools !== undefined ||
+      event.data.reasoningWireField !== undefined ||
+      event.data.reasoningOpaque !== undefined ||
+      event.data.encryptedContent !== undefined ||
+      event.data.toolRequests?.some((request) => request.type === "custom") === true,
   );
   const last = messages.at(-1);
   if (!last) {
@@ -174,21 +183,6 @@ export function buildAssistantProjectionGroup(
     replayIncomplete,
     toolCallIds,
   };
-}
-
-function hasUnprojectedAssistantReplayState(
-  event: Extract<SessionEvent, { type: "assistant.message" }>,
-): boolean {
-  // The SDK contract marks these as provider/session-bound state or custom
-  // call shape. AgentMessage cannot represent them, so native replay must stay.
-  return (
-    event.data.citations !== undefined ||
-    event.data.serverTools !== undefined ||
-    event.data.reasoningWireField !== undefined ||
-    event.data.reasoningOpaque !== undefined ||
-    event.data.encryptedContent !== undefined ||
-    event.data.toolRequests?.some((request) => request.type === "custom") === true
-  );
 }
 
 export function resolveAssistantUsage(

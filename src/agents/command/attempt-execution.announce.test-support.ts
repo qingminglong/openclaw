@@ -5,6 +5,7 @@ import type { AgentCommandOpts } from "./types.js";
 
 const CHILD_SESSION_KEY = "agent:main:subagent:child";
 const REQUESTER_TOOLS = ["read", "exec", "sessions_spawn", "message"];
+type HandoffTarget = Omit<NonNullable<AgentCommandOpts["trustedInternalHandoff"]>, "kind">;
 type AnnounceToolOptions = {
   sourceReplyDeliveryMode: "automatic" | "message_tool_only";
   disableMessageTool?: boolean;
@@ -16,7 +17,7 @@ type AnnounceToolOptions = {
 };
 
 export function createCompletionHandoff(
-  target: Omit<NonNullable<AgentCommandOpts["trustedInternalHandoff"]>, "kind">,
+  target: HandoffTarget,
 ): Pick<AgentCommandOpts, "trustedInternalHandoff" | "inputProvenance" | "internalEvents"> {
   return {
     trustedInternalHandoff: { kind: "subagent-completion", ...target },
@@ -55,12 +56,8 @@ export function createSubagentAnnounceConfig(
 }
 
 export function createSubagentAnnounceHandoffOptions(
-  params: AnnounceToolOptions & {
-    targetSessionKey: string;
-    targetSessionId: string;
-    provider: string;
-    model: string;
-  },
+  params: AnnounceToolOptions &
+    Omit<HandoffTarget, "sourceSessionKey" | "sourceSessionId" | "settleBatch">,
 ): Partial<AgentCommandOpts> {
   const { trustedInternalHandoff, ...handoff } = createCompletionHandoff({
     sourceSessionKey: CHILD_SESSION_KEY,
@@ -134,14 +131,12 @@ export const SUBAGENT_ANNOUNCE_CLAUDE_CLI_DELIVERY_CASES = [
     inheritedToolDeny: ["message"],
   }),
   deliveryCase("a current operator message deny", { operatorTools: { deny: ["message"] } }),
-  deliveryCase("an active sandbox message deny", {
-    operatorTools: { sandbox: { tools: { deny: ["message"] } } },
-    sandboxMode: "all",
-  }),
-  deliveryCase("a non-main sandbox message deny", {
-    operatorTools: { sandbox: { tools: { deny: ["message"] } } },
-    sandboxMode: "non-main",
-  }),
+  ...(["all", "non-main"] as const).map((sandboxMode) =>
+    deliveryCase(`a ${sandboxMode} sandbox message deny`, {
+      operatorTools: { sandbox: { tools: { deny: ["message"] } } },
+      sandboxMode,
+    }),
+  ),
   deliveryCase("an empty runtime allowlist", { runtimeToolsAllow: [] }),
   deliveryCase("an intersected runtime allowlist excluding message", {
     runtimeToolsAllow: attachToolAllowlistIntersection(["*", "message"], [["*"], ["read"]]),
@@ -183,16 +178,89 @@ export function createSubagentAnnounceSessionStore(
   };
 }
 
+const INDEPENDENT_SESSION_ENTRY = {
+  spawnDepth: 1,
+  spawnedBy: "agent:main:dashboard:creator",
+  parentSessionKey: "agent:main:dashboard:creator",
+  createdIndependently: true,
+} as const;
+
 export const INTER_SESSION_REPLY_POLICY_CASES = [
-  ["agent:main:subagent:reply-required", "discord"],
-  ["agent:main:subagent:optional-settle", "discord", true, true, "subagent_settle", "optional"],
-  ["agent:main:direct:optional-settle", "webchat", true, true, "subagent_settle", "optional"],
-  ["agent:main:direct:required-settle", "webchat", false, false, "subagent_settle", "required"],
-  ["agent:main:direct:peer-result", "webchat", false, true, "sessions_send", "optional"],
-  ["agent:main:direct:reply-required", "webchat"],
-  ["agent:main:direct:private-reply-required", "telegram", true],
-  ["agent:main:telegram:direct:reply-required", "telegram"],
-  ["agent:main:telegram:group:optional", "telegram", undefined, true],
-  ["agent:main:telegram:direct:delegated", "telegram", undefined, false, "sessions_send"],
-  ["agent:main:telegram:group:delegated", "telegram", undefined, true, "sessions_send"],
+  ["optional", "agent:main:subagent:completion", "discord"],
+  [
+    "result-required",
+    "agent:main:subagent:child-result",
+    "discord",
+    true,
+    "subagent_announce",
+    "result-required",
+  ],
+  [
+    "result-required",
+    "agent:main:subagent:settle-result",
+    "discord",
+    true,
+    "subagent_settle",
+    "result-required",
+  ],
+  [
+    "optional",
+    "agent:main:subagent:optional-settle",
+    "discord",
+    true,
+    "subagent_settle",
+    "optional",
+  ],
+  ["optional", "agent:main:direct:optional-settle", "webchat", true, "subagent_settle", "optional"],
+  [
+    "required",
+    "agent:main:direct:required-settle",
+    "webchat",
+    false,
+    "subagent_settle",
+    "required",
+  ],
+  ["optional", "agent:main:direct:peer-result", "webchat", false, "sessions_send", "optional"],
+  ["optional", "agent:main:direct:completion", "webchat"],
+  ["optional", "agent:main:direct:private-completion", "telegram", true],
+  ["required", "agent:main:direct:peer-send", "webchat", undefined, "sessions_send"],
+  ["optional", "agent:main:telegram:group:delegated", "webchat", undefined, "sessions_send"],
+  [
+    "result-required",
+    "agent:main:dashboard:visible-child",
+    "webchat",
+    undefined,
+    "sessions_send",
+    undefined,
+    { spawnDepth: 1 },
+  ],
+  // A sessions_create session keeps spawn lineage but receives sends as a peer.
+  [
+    "required",
+    "agent:main:dashboard:independent-peer",
+    "webchat",
+    undefined,
+    "sessions_send",
+    undefined,
+    INDEPENDENT_SESSION_ENTRY,
+  ],
+  // Its opening task still owes a result, whichever opening source the gateway records.
+  [
+    "result-required",
+    "agent:main:dashboard:independent-spawn-opening",
+    "webchat",
+    undefined,
+    "sessions_spawn",
+    undefined,
+    INDEPENDENT_SESSION_ENTRY,
+  ],
+  [
+    "result-required",
+    "agent:main:dashboard:independent-create-opening",
+    "webchat",
+    undefined,
+    "sessions_create",
+    undefined,
+    INDEPENDENT_SESSION_ENTRY,
+  ],
 ] as const;

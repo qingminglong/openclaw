@@ -5,16 +5,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as worktreeRegistry from "../../agents/worktrees/registry.js";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveExecutablePath } from "../../infra/executable-path.js";
+import { runGitWorkerOperation } from "../../infra/git-worker.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import * as execRunner from "../../process/exec-runner.js";
 import { captureSessionDiffBaseline } from "../../sessions/session-diff.js";
 import { collectCheckoutDiff } from "../../sessions/session-diff.runtime.js";
+import { createDeferredCore } from "../../shared/deferred.js";
 import { drainGlobalSingletonLifecycleState } from "../../shared/global-singleton.js";
 import {
   closeOpenClawStateDatabaseAsync,
@@ -28,6 +31,7 @@ import {
   fixedStoreConfig,
   seedManagedReview,
 } from "./sessions-diff.test-support.js";
+import type { GatewayRequestHandlerOptions } from "./types.js";
 
 const { sessionWorkspaceMocks: hoisted } =
   await import("./sessions-files.repository.test-support.js");
@@ -58,12 +62,16 @@ async function requestDiff(
   params: Record<string, unknown>,
   cfg: OpenClawConfig = {},
   reqParams: Record<string, unknown> = {},
+  authority: Partial<
+    Pick<GatewayRequestHandlerOptions, "client" | "hasCurrentClientAuthority">
+  > = {},
 ) {
   const calls: Array<{ ok: boolean; payload?: unknown; error?: unknown }> = [];
   await sessionsDiffHandlers["sessions.diff"]?.({
     req: { type: "req", id: "sessions.diff", method: "sessions.diff", params: reqParams },
     params,
     client: null,
+    ...authority,
     isWebchatConnect: () => false,
     respond: (ok, payload, error) => calls.push({ ok, payload, error }),
     context: {
@@ -161,6 +169,128 @@ describe("loadSessionDiff", () => {
     expect(result).toMatchObject({ unavailableReason: "unknown_session", files: [] });
   });
 
+  it("returns computing while sharing delayed workspace metadata across diff polls", async () => {
+    seedRepo({ "tracked.txt": "before\n" });
+    write("tracked.txt", "after\n");
+    const cfg = {};
+    const released = createDeferredCore();
+    const loaded = {
+      agentId: "main",
+      cfg,
+      entry: { sessionId: "s1", spawnedCwd: repoRoot },
+      storePath: "/tmp/sessions.json",
+      canonicalKey: "agent:main:s1",
+    };
+    hoisted.loadSessionEntry
+      .mockImplementation(() => {
+        throw new Error("Completed metadata was discarded before the next poll");
+      })
+      .mockImplementationOnce(async () => {
+        await released.promise;
+        return loaded;
+      });
+    const params = { sessionKey: "agent:main:s1", scope: "uncommitted", poll: true };
+    const responses: Awaited<ReturnType<typeof requestDiff>>[] = [];
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const pending = [
+      requestDiff(params, cfg).then((calls) => responses.push(calls)),
+      requestDiff(params, cfg).then((calls) => responses.push(calls)),
+    ];
+    try {
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(responses.length).toBe(2);
+      for (const calls of responses) {
+        expect(calls).toEqual([
+          {
+            ok: true,
+            payload: {
+              sessionKey: params.sessionKey,
+              files: [],
+              additions: 0,
+              deletions: 0,
+              computing: true,
+            },
+            error: undefined,
+          },
+        ]);
+      }
+      expect(hoisted.loadSessionEntry).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      released.resolve();
+      await Promise.all(pending);
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 500);
+    });
+    const completed = await requestDiff(params, cfg);
+    expect(hoisted.loadSessionEntry).toHaveBeenCalledTimes(1);
+    expect(completed).toMatchObject([
+      {
+        ok: true,
+        payload: {
+          sessionKey: params.sessionKey,
+          files: [
+            {
+              path: "tracked.txt",
+              additions: 1,
+              deletions: 1,
+              patch: expect.stringContaining("-before\n+after"),
+            },
+          ],
+          additions: 1,
+          deletions: 1,
+        },
+      },
+    ]);
+  });
+
+  it("keeps metadata separate per session while polls share preparation", async () => {
+    seedRepo({ "tracked.txt": "before\n" });
+    write("tracked.txt", "after\n");
+    const otherRoot = tempDir("openclaw-other-diff-");
+    initRepo(otherRoot);
+    fs.writeFileSync(path.join(otherRoot, "other.txt"), "other session\n");
+    const cfg = {};
+    const released = createDeferredCore();
+    hoisted.loadSessionEntry.mockImplementation(async (key: string) => {
+      await released.promise;
+      return {
+        agentId: "main",
+        cfg,
+        canonicalKey: key,
+        storePath: "/tmp/sessions.json",
+        entry: { sessionId: key, spawnedCwd: key.endsWith(":s1") ? repoRoot : otherRoot },
+      };
+    });
+    const params = { sessionKey: "agent:main:s1", scope: "uncommitted", poll: true };
+    const first = requestDiff(params, cfg);
+    const second = requestDiff(params, cfg);
+    const other = requestDiff({ ...params, sessionKey: "agent:main:s2" }, cfg);
+    released.resolve();
+    try {
+      for (const calls of [await first, await second]) {
+        expect(calls).toMatchObject([
+          {
+            ok: true,
+            payload: {
+              files: [{ path: "tracked.txt", patch: expect.stringContaining("-before\n+after") }],
+            },
+          },
+        ]);
+      }
+      expect(await other).toMatchObject([
+        {
+          ok: true,
+          payload: { sessionKey: "agent:main:s2", files: [{ path: "other.txt" }] },
+        },
+      ]);
+      expect(hoisted.loadSessionEntry).toHaveBeenCalledTimes(2);
+    } finally {
+      await Promise.allSettled([first, second, other]);
+    }
+  });
+
   it("keeps pending checkouts separate from the agent workspace", async () => {
     initFiles({ "AGENTS.md": "Agent workspace bootstrap\n" });
     mockSession(repoRoot, {
@@ -238,25 +368,30 @@ describe("loadSessionDiff", () => {
     write("large.txt", "after\n".repeat(100_001));
     write("small.txt", "after\n");
 
-    const result = await readDiff();
+    const lstat = vi.spyOn(fs.promises, "lstat");
+    const result = await collectCheckoutDiff({ cwd: repoRoot });
     expect(result.files).toEqual([
       { ...changedFile("large.txt", "modified", 100_001, 1), truncated: true },
       { ...changedFile("small.txt", "modified", 1, 1), truncated: true },
     ]);
     expect(result).toMatchObject({ additions: 100_002, deletions: 2 });
+    for (const file of ["large.txt", "small.txt"]) {
+      expect(lstat.mock.calls.some(([target]) => target === path.join(repoRoot, file))).toBe(false);
+    }
   });
 
   it.each([
-    { kind: "tracked", flag: "--numstat" },
-    { kind: "untracked", flag: "ls-files" },
-  ])("reports a failed $kind inventory instead of an empty diff", async ({ kind, flag }) => {
+    { kind: "tracked", flags: ["--numstat"] },
+    { kind: "untracked", flags: ["status", "ls-files"] },
+  ])("reports a failed $kind inventory instead of an empty diff", async ({ kind, flags }) => {
     seedRepo({ "tracked.txt": "before\n" }, "init");
     write("tracked.txt", "after\n");
     const runCommand = execRunner.runCommandBuffersWithTimeout;
     vi.spyOn(execRunner, "runCommandBuffersWithTimeout").mockImplementation(
       async (argv, options) => {
         const result = await runCommand(argv, options);
-        return argv[argv.indexOf("-C") + 1] === repoRoot && argv.includes(flag)
+        return argv[argv.indexOf("-C") + 1] === repoRoot &&
+          flags.some((flag) => argv.includes(flag))
           ? { ...result, code: 1, stdout: Buffer.alloc(0) }
           : result;
       },
@@ -343,8 +478,10 @@ describe("loadSessionDiff", () => {
     commitFiles("second change");
     append("second.txt", "working tree\n");
     write("loose.txt", "untracked\n");
+    repoGit("tag", baseRef);
+    repoGit("tag", "feature");
     const all = await readDiff();
-    expect(all.baseRef).toBe(baseRef);
+    expect(all).toMatchObject({ baseRef, branch: "feature" });
     expect(filePaths(all)).toEqual(["first.txt", "loose.txt", "second.txt"]);
     const uncommitted = await readDiff({ scope: "uncommitted" });
     expect(filePaths(uncommitted)).toEqual(["loose.txt", "second.txt"]);
@@ -365,6 +502,9 @@ describe("loadSessionDiff", () => {
   });
 
   it("uses the accepted managed base for working, committed, and archived reads", async () => {
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+    vi.stubEnv("GIT_CONFIG_GLOBAL", os.devNull);
+    await drainGlobalSingletonLifecycleState("restart");
     const stateRoot = tempDir("openclaw-review-base-");
     vi.stubEnv("OPENCLAW_STATE_DIR", stateRoot);
     const id = randomUUID();
@@ -380,6 +520,26 @@ describe("loadSessionDiff", () => {
       repoGit("checkout", "-qb", "task");
       const worktree = { id, repoRoot, branch: "task" };
       await seedManagedReview(worktree, { sessionKey, sessionId: "s1" }, stateRoot, acceptedBase);
+      // Native revision reads are disabled on Windows.
+      if (process.platform !== "win32") {
+        // A later raw diff must not mask whether status retained its verified stat data.
+        repoGit("config", "diff.autoRefreshIndex", "false");
+        const indexPath = path.join(repoRoot, ".git", "index");
+        const originalIndex = fs.readFileSync(indexPath);
+        fs.utimesSync(path.join(repoRoot, "base.txt"), new Date(0), new Date(0));
+        expect(
+          await runGitWorkerOperation({
+            type: "checkout.revision",
+            input: { root: repoRoot, scope: "diff" },
+          }),
+        ).toMatchObject({ worktreeStatus: { clean: true } });
+        expect(fs.readFileSync(indexPath)).toEqual(originalIndex);
+        mockSession(repoRoot, { worktree });
+        expect(await requestDiff({ sessionKey, scope: "uncommitted" })).toMatchObject([
+          { ok: true, payload: { files: [], additions: 0, deletions: 0 } },
+        ]);
+        expect(fs.readFileSync(indexPath)).not.toEqual(originalIndex);
+      }
       mockSession(repoRoot, { worktree });
       write("task.txt", "authored change\n");
       const beforePublication = await readDiff();
@@ -419,30 +579,30 @@ describe("loadSessionDiff", () => {
       const archived = await readDiff();
       expect(filePaths(archived)).toEqual(["task.txt"]);
       expect(archived).toMatchObject({ additions: 2, deletions: 0, aheadCount: 2 });
-      for (const patch of [
-        { agent_id: "other" },
-        { session_key: "agent:main:other" },
-        { session_id: "replaced" },
-      ]) {
+      const owner = { agent_id: "main", session_key: sessionKey, session_id: "s1" };
+      for (const field of ["agent_id", "session_key", "session_id"] as const) {
         await withLocalWorkspaceStore({ worktreeId: id }, (store) =>
-          store.update(store.get()!, patch),
+          store.update(store.get()!, { [field]: "other" }),
         );
         await expect(readDiff()).rejects.toThrow(/workspace.*incarnation/i);
         await withLocalWorkspaceStore({ worktreeId: id }, (store) =>
-          store.update(store.get()!, {
-            agent_id: "main",
-            session_key: sessionKey,
-            session_id: "s1",
-          }),
+          store.update(store.get()!, owner),
         );
       }
       mockSession(path.dirname(repoRoot), { worktree, archivedAt: 1 });
       await expect(readDiff()).rejects.toThrow("Local workspace review owner changed");
       mockSession(repoRoot, { worktree, archivedAt: 1 });
+      const removedMessage = /worktree was removed.*Use Restore in Settings > Worktrees/;
+      await worktreeRegistry.updateRegistryWorktree(process.env, id, { removedAt: 0 });
+      await expect(requestDiff({ sessionKey })).rejects.toThrow(removedMessage);
+      await worktreeRegistry.updateRegistryWorktree(process.env, id, { removedAt: undefined });
       await withLocalWorkspaceStore({ worktreeId: id }, (store) => store.delete(store.get()!));
       expect(filePaths(await readDiff())).toEqual(["task.txt", "upstream.txt"]);
+      await worktreeRegistry.deleteRegistryWorktree(process.env, id);
+      await expect(requestDiff({ sessionKey })).rejects.toThrow(removedMessage);
     } finally {
       await closeOpenClawStateDatabaseAsync();
+      await drainGlobalSingletonLifecycleState("restart");
     }
   });
 

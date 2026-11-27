@@ -39,6 +39,21 @@ export type ScheduledToolTargets = Readonly<{
    * it before each effect, so a requester who stops being an owner is refused.
    */
   assertOwnerCurrent?: () => void;
+  /**
+   * Where a scheduled occurrence runs relative to its requester. Undefined for
+   * ingress turns, which keep their existing surface.
+   */
+  placement?: ScheduledExecutionFacts["placement"];
+  /** The job's exec target pin, from the context's tool policy. */
+  execTarget?: ScheduledExecutionFacts["toolPolicy"]["execTarget"];
+  /** A host-set ceiling on session inventory and history reads. */
+  sessionReadAgentOnly?: true;
+  /**
+   * The owner bit sessions this run spawns record in their lineage receipt: a
+   * child-placement occurrence's admitted owner bit, rechecked through
+   * `assertOwnerCurrent` when a requester holds it.
+   */
+  spawnSenderIsOwner?: boolean;
 }>;
 
 /**
@@ -56,10 +71,19 @@ export function readScheduledToolTargets(
   // Admission sets the recheck only for a requester-held owner bit; in-session and
   // ingress runs keep their existing owner checks.
   const ownerRecheck = senderBitOf(context) ? context.assertOwnerCurrent : undefined;
+  const { execTarget, sessionReadAgentOnly } = context.toolPolicy;
+  const { memory } = context.resources;
   return {
     boardSessionKey: context.resources.boardSessionKey,
     assertCurrent: context.assertCurrent,
     ...(ownerRecheck ? { assertOwnerCurrent: ownerRecheck } : {}),
+    ...(context.principal.kind === "ingress" ? {} : { placement: context.placement }),
+    ...(execTarget ? { execTarget } : {}),
+    ...(sessionReadAgentOnly ? { sessionReadAgentOnly } : {}),
+    // Only a child-placement run row carries the receipt its spawned sessions follow.
+    ...(context.placement === "child" && memory.source === "parent"
+      ? { spawnSenderIsOwner: memory.owner }
+      : {}),
   };
 }
 
@@ -80,6 +104,31 @@ export function readScheduledToolOptions(
 }
 
 /**
+ * The automations scope a scheduled occurrence (not an ingress turn) takes from
+ * its admitted context, or undefined when the run has no such context.
+ */
+export function readScheduledOccurrenceAutomationsScope(
+  owner: Readonly<{ operationalRunInstance?: OperationalRunInstanceRef }> | undefined,
+): ScheduledExecutionFacts["toolPolicy"]["automations"] | undefined {
+  const run = owner?.operationalRunInstance;
+  const context = run ? contextsByRun.get(run) : undefined;
+  return context && context.principal.kind !== "ingress"
+    ? context.toolPolicy.automations
+    : undefined;
+}
+
+/**
+ * The job a scope restricts the automations tool to, or undefined for no tool.
+ * `self-and-parent-wake` offers the same self actions as `self`: waking the
+ * parent is not offered until the parent-wake action lands (openclaw-0d5.9).
+ */
+export function readScheduledAutomationsSelfJobId(
+  scope: ScheduledExecutionFacts["toolPolicy"]["automations"] | undefined,
+): string | undefined {
+  return scope && scope.scope !== "none" ? scope.jobId : undefined;
+}
+
+/**
  * The automations scope an ingress turn (hook or channel join introduction)
  * takes from its admitted context, or undefined when the run is not an ingress
  * turn admitted with a context.
@@ -92,11 +141,9 @@ export function readScheduledIngressAutomationsScope(
   return context?.principal.kind === "ingress" ? context.toolPolicy.automations : undefined;
 }
 
-/** The parent whose memory audience a child run inherits, or undefined to resolve from the run row. */
-export function readScheduledMemoryParent(
-  run: OperationalRunInstanceRef | undefined,
+function memoryParentOf(
+  memory: ScheduledExecutionFacts["resources"]["memory"] | undefined,
 ): ScheduledMemoryParent | undefined {
-  const memory = run ? contextsByRun.get(run)?.resources.memory : undefined;
   if (memory?.source !== "parent") {
     return undefined;
   }
@@ -109,11 +156,34 @@ export function readScheduledMemoryParent(
   };
 }
 
+/** The parent whose memory audience a child run inherits, or undefined to resolve from the run row. */
+export function readScheduledMemoryParent(
+  run: OperationalRunInstanceRef | undefined,
+): ScheduledMemoryParent | undefined {
+  return memoryParentOf(run ? contextsByRun.get(run)?.resources.memory : undefined);
+}
+
+/**
+ * The receipt a child-placement occurrence stamps on its own `:run:` row, so
+ * sessions it spawns reach the same parent. In-session runs execute on their
+ * parent's row and detached runs have no parent, so neither records one.
+ */
+export function resolveScheduledRunMemoryReceipt(
+  result: ScheduledExecutionContextResult,
+): ScheduledMemoryParent | undefined {
+  return result.status === "ready" && result.facts.placement === "child"
+    ? memoryParentOf(result.facts.resources.memory)
+    : undefined;
+}
+
 // In-session runs keep their session turn's own command-owner check, and ingress
 // turns keep their existing surface; neither takes the bit from the context.
 function senderBitOf(
   facts: Pick<ScheduledExecutionFacts, "authority" | "placement" | "principal">,
 ): Readonly<{ senderIsOwner?: false }> | undefined {
+  if (facts.authority.basis === "operator-source" && !facts.authority.owner) {
+    return { senderIsOwner: false };
+  }
   if (facts.placement === "in-session" || facts.principal.kind === "ingress") {
     return undefined;
   }

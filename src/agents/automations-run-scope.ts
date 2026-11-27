@@ -1,9 +1,13 @@
 /**
- * The automations scope a cron-runner turn's tools get. Ingress turns (hook and
- * channel join introduction) read it from their admitted execution context;
- * scheduled runs keep their job id until they read the context too.
+ * The automations scope a cron-runner turn's tools get. Scheduled occurrences and
+ * ingress turns (hook and channel join introduction) read it from their admitted
+ * execution context; a scheduled run never starts without one.
  */
-import { readScheduledIngressAutomationsScope } from "../cron/execution-context-registry.js";
+import {
+  readScheduledAutomationsSelfJobId,
+  readScheduledIngressAutomationsScope,
+  readScheduledOccurrenceAutomationsScope,
+} from "../cron/execution-context-registry.js";
 import type { OperationalRunInstanceRef } from "./operational-run-instance.js";
 
 type AutomationsRunScope = Readonly<{
@@ -15,22 +19,14 @@ type AutomationsRunScope = Readonly<{
 
 /** Resolves the automations scope for one tool construction. */
 export function resolveAutomationsRunScope(
-  options:
-    | Readonly<{
-        trigger?: string;
-        jobId?: string;
-        operationalRunInstance?: OperationalRunInstanceRef;
-      }>
-    | undefined,
+  options: Readonly<{ operationalRunInstance?: OperationalRunInstanceRef }> | undefined,
 ): AutomationsRunScope {
-  const jobId = options?.jobId?.trim();
-  if (options?.trigger === "event" && jobId) {
-    // The context owns an ingress turn's scope. A turn whose context was not
-    // admitted gets no automations tool rather than an unscoped one.
-    const scope = readScheduledIngressAutomationsScope(options);
-    return scope?.scope === "self" ? { selfJobId: scope.jobId, denied: false } : { denied: true };
+  const scope =
+    readScheduledOccurrenceAutomationsScope(options) ??
+    readScheduledIngressAutomationsScope(options);
+  if (!scope) {
+    return { denied: false };
   }
-  return options?.trigger === "cron" && jobId
-    ? { selfJobId: jobId, denied: false }
-    : { denied: false };
+  const selfJobId = readScheduledAutomationsSelfJobId(scope);
+  return selfJobId ? { selfJobId, denied: false } : { denied: true };
 }

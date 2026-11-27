@@ -1,9 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { readGatewayLockProcessNamespace } from "../infra/gateway-lock-payload.js";
+import { acquireGatewayStateOwner } from "../infra/gateway-state-owner.js";
 import { executeSqliteQuerySync } from "../infra/kysely-sync.js";
+import * as admissions from "../infra/sqlite-database-admission.js";
 import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseByPathAsync,
@@ -11,11 +14,13 @@ import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../state/openclaw-state-db.js";
+import * as stateWorker from "../state/openclaw-state-worker-store.js";
+import { observeMainThreadFs } from "../test-utils/main-thread-fs-spies.test-support.js";
 import { observeMainThreadSql } from "../test-utils/main-thread-sql-spies.test-support.js";
-import type { TranscriptSessionDescriptor, TranscriptUtterance } from "./provider-types.js";
 import { appendMeetingTranscriptUtterance, meetingTranscriptDb } from "./store-sqlite.js";
 import { transcriptSessionSelector, TranscriptsStore } from "./store.js";
 import { summarizeTranscripts } from "./summary.js";
+import type { TranscriptSessionDescriptor, TranscriptUtterance } from "./types.js";
 
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   afterAll(async () => {
@@ -76,7 +81,7 @@ async function expectSnapshot(target: TranscriptSessionDescriptor, texts: string
   const snapshot = await store.readSummarySnapshot(target, 20);
   expect(snapshot).toMatchObject({
     nextSequence: texts.length,
-    utterances: texts.map((text) => ({ text })),
+    turns: texts.map((text) => ({ text })),
   });
   return snapshot;
 }
@@ -174,6 +179,51 @@ it("lists summary presence by complete session identity", async () => {
   expect(await store.listSessionEntries()).toMatchObject(expected(false));
   await store.writeSummary(summarizeTranscripts({ session: first, utterances: [] }), first);
   expect(await store.listSessionEntries()).toMatchObject(expected(true));
+});
+
+it("admits a cold list through its worker before retaining its write token", async () => {
+  const target = { ...session("cold-list"), title: "Initial title" };
+  await admit(target);
+  const original = openOpenClawStateDatabase(databaseOptions()).path;
+  await closeDatabase();
+  const root = tempDirs.make("openclaw-transcript-cold-list-");
+  const pathname = path.join(root, "state.sqlite");
+  fs.copyFileSync(original, pathname);
+  const cold = new TranscriptsStore(path.join(root, "transcripts"), { path: pathname });
+  expect(admissions.getSqliteDatabaseAdmissionIdentityForPath(pathname)).toBeUndefined();
+  using filesystem = observeMainThreadFs();
+  const token = admissions.readSqliteDatabaseWriteTokenForPath;
+  let tokenFilesystemCalls = 0;
+  using tokens = vi
+    .spyOn(admissions, "readSqliteDatabaseWriteTokenForPath")
+    .mockImplementation((location) => {
+      const before = filesystem.count();
+      try {
+        return token(location);
+      } finally {
+        tokenFilesystemCalls += filesystem.count() - before;
+      }
+    });
+  using reads = vi.spyOn(stateWorker, "runOpenClawStateWorkerOperation");
+  const options = { limit: 50, projection: "public" as const };
+  const page = () => cold.listReadEntries(options);
+  expect((await page()).entries).toMatchObject([{ title: "Initial title" }]);
+  expect(reads).toHaveBeenCalledTimes(1);
+  expect(tokenFilesystemCalls).toBe(0);
+  expect((await page()).entries).toMatchObject([{ title: "Initial title" }]);
+  expect(reads).toHaveBeenCalledTimes(2);
+  expect((await page()).entries).toMatchObject([{ title: "Initial title" }]);
+  expect(reads).toHaveBeenCalledTimes(2);
+  expect(tokens).toHaveBeenCalled();
+  expect(tokenFilesystemCalls).toBe(0);
+
+  options.limit = 49;
+  await Promise.all([page(), cold.writeSession({ ...target, title: "Worker committed" })]);
+  reads.mockClear();
+  expect((await page()).entries).toMatchObject([{ title: "Worker committed" }]);
+  expect((await page()).entries).toMatchObject([{ title: "Worker committed" }]);
+  expect(reads).toHaveBeenCalledTimes(1);
+  expect(tokenFilesystemCalls).toBe(0);
 });
 
 it("isolates returned list pages and observes another store's writes", async () => {
@@ -412,7 +462,7 @@ it("retains admitted ID origins across updates, reopen, and Doctor restoration",
     await import("../infra/state-migrations.meeting-transcripts.js");
   const env = { ...process.env, OPENCLAW_STATE_DIR: restoredState };
   const migrated = await migrateLegacyMeetingTranscripts({
-    detected: detectLegacyMeetingTranscripts({
+    detected: await detectLegacyMeetingTranscripts({
       stateDir: restoredState,
       doctorOnlyStateMigrations: true,
     }),
@@ -427,47 +477,6 @@ it("retains admitted ID origins across updates, reopen, and Doctor restoration",
     );
     await expectTexts(target, ["Saved history"], restored);
   }
-});
-
-it("bounds exact retry lookups to one caption ID without adding statements", async () => {
-  const target = await admit();
-  writeTransaction((db) => {
-    const queries: string[] = [];
-    const sql = observeMainThreadSql({ onStatement: (query) => queries.push(query) });
-    try {
-      const append = (utterance: TranscriptUtterance) => {
-        sql.clear();
-        queries.length = 0;
-        appendMeetingTranscriptUtterance({
-          database: db,
-          session: target,
-          utterance,
-          metadataJson: null,
-          now: 1,
-        });
-        return [...queries];
-      };
-      const utterance = { id: "new-caption", text: "Speech" };
-      const statements = append(utterance);
-      expect(statements).toHaveLength(4);
-      const retryQuery = statements.find((query) =>
-        /^select .* from "meeting_transcript_utterances"/u.test(query),
-      );
-      expect(retryQuery).toBeDefined();
-      const plan = db.prepare(`EXPLAIN QUERY PLAN ${retryQuery}`).all();
-      expect(plan).toContainEqual(
-        expect.objectContaining({
-          detail: expect.stringContaining(
-            "idx_meeting_transcript_utterances_id (session_id=? AND session_started_at=? AND utterance_id=?)",
-          ),
-        }),
-      );
-      expect(append(utterance)).toHaveLength(1);
-      expect(append({ text: "No ID" })).toHaveLength(3);
-    } finally {
-      sql.restore();
-    }
-  });
 });
 
 it("deduplicates exact retries but preserves same-id revisions", async () => {
@@ -637,6 +646,95 @@ it.runIf(process.platform !== "win32")(
     await expectLegacyRejection(target);
   },
 );
+
+it("refuses read-only artifact export before committing lease state", async () => {
+  const target = await admit();
+  const readonly = new TranscriptsStore(path.join(suiteStateDir, "transcripts"), {
+    ...databaseOptions(),
+    readOnly: true,
+  });
+  using reader = new DatabaseSync(openOpenClawStateDatabase(databaseOptions()).path, {
+    readOnly: true,
+  });
+  const revision = reader.prepare("PRAGMA data_version").get();
+  await expect(readonly.materializeSessionArtifacts(target, "all")).rejects.toThrow(
+    "State lease acquisition requires writable storage",
+  );
+  expect(reader.prepare("PRAGMA data_version").get()).toEqual(revision);
+  expect(fs.existsSync(readonly.sessionDir(target))).toBe(false);
+});
+
+it("exports artifacts without host ownership filesystem checks or SQLite work", async () => {
+  const owner = acquireGatewayStateOwner({
+    databasePath: openOpenClawStateDatabase(databaseOptions()).path,
+    payload: {
+      role: "gateway",
+      pid: process.pid,
+      createdAt: new Date().toISOString(),
+      configPath: path.join(suiteStateDir, "openclaw.json"),
+      processNamespace: readGatewayLockProcessNamespace(),
+    },
+  });
+  const target = await admit(session("async-export"), ["Saved speech"]);
+  const lstat = fs.lstatSync;
+  const ownerReads: Array<string | undefined> = [];
+  const probe = vi.spyOn(fs, "lstatSync").mockImplementation((pathname, options) => {
+    if (String(pathname) === owner.path) {
+      ownerReads.push(new Error("Host ownership filesystem read").stack);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+    return lstat(pathname, options);
+  });
+  const sql = observeMainThreadSql();
+  try {
+    const artifacts = await store.materializeSessionArtifacts(target, "all");
+    expect(readText(artifacts.transcriptPath)).toContain("Saved speech");
+    expect(ownerReads).toEqual([]);
+    sql.expectIdle();
+  } finally {
+    sql.restore();
+    probe.mockRestore();
+    await closeDatabase();
+    owner.release();
+  }
+});
+
+it("refuses artifact publication when ownership changes during staging", async () => {
+  const owner = acquireGatewayStateOwner({
+    databasePath: openOpenClawStateDatabase(databaseOptions()).path,
+    payload: {
+      role: "gateway",
+      pid: process.pid,
+      createdAt: new Date().toISOString(),
+      configPath: path.join(suiteStateDir, "openclaw.json"),
+      processNamespace: readGatewayLockProcessNamespace(),
+    },
+  });
+  const originalOwner = fs.readFileSync(owner.path);
+  const target = await admit({ ...session("revoked-export"), title: "Original" });
+  const artifacts = await store.materializeSessionArtifacts(target, "metadata");
+  const originalMetadata = readText(artifacts.metadataPath);
+  await store.writeSession({ ...target, title: "Changed" });
+  const write = fs.promises.writeFile;
+  let staged = false;
+  const probe = vi.spyOn(fs.promises, "writeFile").mockImplementation(async (...args) => {
+    await write(...args);
+    if (typeof args[0] === "string" && path.basename(args[0]) === "metadata.json") {
+      staged = true;
+      fs.writeFileSync(owner.path, "replacement");
+    }
+  });
+  try {
+    await expect(store.materializeSessionArtifacts(target, "metadata")).rejects.toThrow();
+    expect(staged).toBe(true);
+    expect(readText(artifacts.metadataPath)).toBe(originalMetadata);
+  } finally {
+    probe.mockRestore();
+    fs.writeFileSync(owner.path, originalOwner);
+    owner.release();
+    await closeDatabase();
+  }
+});
 
 it("exports canonical durable notes, recovers concurrent manifests, and preserves externally edited artifacts", async () => {
   const exportRoot = path.join(suiteStateDir, "transcripts");

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { ExecResult } from "./exec-file.js";
+import { findSystemdServiceAccountMismatch } from "./service-inspection-error.js";
 import type { SystemdServiceReadTarget } from "./service-types.js";
 
 const systemBus = vi.hoisted(() => vi.fn<typeof import("./systemd-exec.js").execBusctlSystem>());
@@ -41,6 +42,7 @@ const defaults = {
   canStart: true,
   refuseManualStart: false,
   emptyCommand: false,
+  executable: "/usr/bin/openclaw",
 };
 let state = { ...defaults };
 
@@ -106,7 +108,7 @@ beforeEach(async () => {
         "a(sasbttttuii)",
         state.emptyCommand
           ? []
-          : [["/usr/bin/openclaw", ["/usr/bin/openclaw", "gateway"], false, 0, 0, 0, 0, 0, 0, 0]],
+          : [[state.executable, ["/usr/bin/openclaw", "gateway"], false, 0, 0, 0, 0, 0, 0, 0]],
       ),
       WorkingDirectory: property("s", "/home/gateway"),
       Environment: property("as", state.assignments),
@@ -130,6 +132,42 @@ beforeEach(async () => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("system-scope effective command", () => {
+  it.each(["/runtime/bun", "/runtime/node"])(
+    "reports native executable %s separately from argv zero",
+    async (executable) => {
+      const original = await readLoaded();
+      state.executable = executable;
+      const onEffectiveExecutable = vi.fn();
+      const command = await readSystemdServiceExecStart(env, {
+        requireEffective: true,
+        requireLoaded: true,
+        systemdReadTarget: target,
+        onEffectiveExecutable,
+      });
+      expect(command).toEqual(original);
+      expect(onEffectiveExecutable).toHaveBeenCalledExactlyOnceWith(executable);
+      expectNoLoad();
+    },
+  );
+
+  it.each(["invalid-command", "foreign-account", "manager-changed"] as const)(
+    "does not report an executable after %s",
+    async (failure) => {
+      state.emptyCommand = failure === "invalid-command";
+      state.serviceUser = failure === "foreign-account" ? "other" : "gateway";
+      state.managerChanges = failure === "manager-changed";
+      const onEffectiveExecutable = vi.fn();
+      await expect(
+        readSystemdServiceExecStart(env, {
+          requireEffective: true,
+          systemdReadTarget: target,
+          onEffectiveExecutable,
+        }),
+      ).rejects.toThrow();
+      expect(onEffectiveExecutable).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     { canStart: false, refuse: false, empty: true, reason: "disabled-no-start" },
     { canStart: true, refuse: true, empty: true, reason: "refuse-manual-start" },
@@ -294,6 +332,43 @@ describe("system-scope effective command", () => {
           sourcePath: target.unitPath,
         });
       }
+    },
+  );
+
+  it.each([
+    ["inline selectors", false, [], false],
+    ["an environment file", true, [], true],
+    ["an unset selector", false, ["OPENCLAW_STATE_DIR"], true],
+  ] as const)(
+    "names the unit, account and state selectors on refusal: %s",
+    async (_, file, unset, incomplete) => {
+      state.serviceUser = "other";
+      state.assignments = [
+        "OPENCLAW_SERVICE_KIND=gateway",
+        "HOME=/var/lib/other",
+        "OPENCLAW_STATE_DIR=/var/lib/other/.openclaw",
+        "OPENCLAW_GATEWAY_TOKEN=fixture-secret-value",
+      ];
+      state.unset = [...unset];
+      const protectedFile = path.join(path.dirname(target.unitPath), "protected-service.env");
+      state.fileSpecs = file ? [[protectedFile, false]] : [];
+      const reads = vi.spyOn(fs, "readFile");
+
+      const error = await readLoaded().catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ reason: "systemd-account-refused" });
+      const mismatch = findSystemdServiceAccountMismatch(error);
+      expect(mismatch).toEqual({
+        unitName: target.unitName,
+        unitPath: target.unitPath,
+        serviceUser: "other",
+        programArguments: ["/usr/bin/openclaw", "gateway"],
+        workingDirectory: "/home/gateway",
+        selectors: { HOME: "/var/lib/other", OPENCLAW_STATE_DIR: "/var/lib/other/.openclaw" },
+        selectorsIncomplete: incomplete,
+      });
+      expect(JSON.stringify(mismatch)).not.toContain("fixture-secret-value");
+      expect(reads.mock.calls.some(([read]) => read === protectedFile)).toBe(false);
     },
   );
 

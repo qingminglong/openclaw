@@ -241,9 +241,7 @@ function buildMSTeamsPollVoteBucketKey(pollId: string, bucket: string): string {
   return `${pollDigest}:${bucket}`;
 }
 
-export function createMSTeamsPollStoreState(params?: {
-  accountId?: string | null;
-}): MSTeamsPollStore {
+export function createMSTeamsPollStoreState(params?: { accountId?: string | null }) {
   const namespace = resolveMSTeamsAccountStateNamespace(MSTEAMS_POLLS_NAMESPACE, params?.accountId);
   const pollStore = getMSTeamsRuntime().state.openKeyedStore<StoredMSTeamsPoll>({
     namespace,
@@ -267,23 +265,6 @@ export function createMSTeamsPollStoreState(params?: {
         cachedRows?.delete(row.key);
       }
     }
-  };
-
-  const registerPollVote = async (
-    pollId: string,
-    voterId: string,
-    selections: string[],
-    updatedAt: string,
-  ): Promise<void> => {
-    const bucket = selectMSTeamsPollVoteBucket(pollId, voterId);
-    const key = buildMSTeamsPollVoteBucketKey(pollId, bucket);
-    const existing = await voteBucketStore.lookup(key);
-    await voteBucketStore.register(key, {
-      pollId,
-      bucket,
-      votes: { ...existing?.votes, [voterId]: selections },
-      updatedAt,
-    });
   };
 
   const prunePollStoreToLimit = async (): Promise<void> => {
@@ -316,11 +297,33 @@ export function createMSTeamsPollStoreState(params?: {
     }
   };
 
-  const createPoll = async (poll: StoredMSTeamsPoll) => {
+  const createPoll = async (poll: StoredMSTeamsPoll, options?: { pendingPublication: boolean }) => {
     await withMSTeamsSqliteMutationLock(namespace, async () => {
       await pollStore.register(buildMSTeamsPollStateKey(poll.id), toPluginJsonValue(poll));
-      await deletePollVotes(poll.id);
+      // A fresh card has no votes. Defer pruning until its publication succeeds.
+      if (!options?.pendingPublication) {
+        await deletePollVotes(poll.id);
+        await prunePollStoreToLimit();
+      }
+    });
+  };
+
+  const setPollMessageId = async (pollId: string, messageId: string) => {
+    await withMSTeamsSqliteMutationLock(namespace, async () => {
+      const key = buildMSTeamsPollStateKey(pollId);
+      const poll = await pollStore.lookup(key);
+      if (!poll) {
+        throw new Error("Published Teams poll is no longer in the poll store");
+      }
+      await pollStore.register(key, { ...poll, messageId });
       await prunePollStoreToLimit();
+    });
+  };
+
+  const discardPoll = async (pollId: string) => {
+    await withMSTeamsSqliteMutationLock(namespace, async () => {
+      await pollStore.delete(buildMSTeamsPollStateKey(pollId));
+      await deletePollVotes(pollId);
     });
   };
 
@@ -351,11 +354,21 @@ export function createMSTeamsPollStoreState(params?: {
       const updatedAt = new Date().toISOString();
       poll.updatedAt = updatedAt;
       await pollStore.register(pollKey, poll);
-      await registerPollVote(vote.pollId, vote.voterId, normalized, updatedAt);
+      const pollId = vote.pollId;
+      const voterId = vote.voterId;
+      const bucket = selectMSTeamsPollVoteBucket(pollId, voterId);
+      const key = buildMSTeamsPollVoteBucketKey(pollId, bucket);
+      const existing = await voteBucketStore.lookup(key);
+      await voteBucketStore.register(key, {
+        pollId,
+        bucket,
+        votes: { ...existing?.votes, [voterId]: normalized },
+        updatedAt,
+      });
       await prunePollStoreToLimit();
       return true;
     });
   };
 
-  return { createPoll, getPoll, recordVote };
+  return { createPoll, getPoll, recordVote, setPollMessageId, discardPoll };
 }

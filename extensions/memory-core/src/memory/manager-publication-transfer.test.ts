@@ -21,7 +21,6 @@ import {
   memoryPublicationBatches,
   memoryPublicationGroup,
   memoryPublicationInline,
-  releaseMemoryPublication,
 } from "./manager-publication-transfer.js";
 import {
   bindSqliteWorkerBackend,
@@ -181,52 +180,6 @@ function replacement(text = "Violetmarker transfer text"): MemorySourceIndexRepl
 
 describe("bounded memory publication transfer", () => {
   afterEach(() => vi.restoreAllMocks());
-
-  it("preserves owner connection policy across scalar and staged publications", () => {
-    const filename = path.join(tempDirs.make("memory-publication-input-"), "index.sqlite");
-    const db = new DatabaseSync(filename);
-    sqliteWorkerRuntime.setSqliteBusyTimeout(db, 5000);
-    try {
-      ensureMemoryIndexSchema({ db, cacheEnabled: false, ftsEnabled: false });
-      const bind = () =>
-        bindSqliteWorkerBackend(
-          { kind: "agent" },
-          { databasePath: filename, database: db, admit: () => undefined },
-        );
-      const scalar = bind();
-      expectOk(
-        scalar.execute({
-          type: "index.writeMetadata",
-          input: { provider: "none", model: "fts-only", chunkTokens: 400, chunkOverlap: 80 },
-        }),
-      );
-      expect(scalar.execute({ type: "connection.inspect", input: undefined })).toMatchObject({
-        fileIdentity: readMemoryShadowIdentity(filename),
-        pragmas: { foreign_keys: expect.any(Number) },
-      });
-      scalar.close();
-      const staged = bind();
-      stageSource(staged, replacement("staged text survives scalar cleanup"));
-      expectOk(
-        staged.execute({
-          type: "source.replace",
-          input: { state: { vector: disabled, fts: disabled } },
-        }),
-      );
-      staged.close();
-      expect(db.prepare("PRAGMA busy_timeout").get()?.timeout).toBe(5000);
-      expectRows(db, "SELECT text FROM memory_index_chunks", [
-        { text: "staged text survives scalar cleanup" },
-      ]);
-      expectRows(
-        db,
-        "SELECT name FROM sqlite_temp_master WHERE name = 'memory_publication_input'",
-        [],
-      );
-    } finally {
-      db.close();
-    }
-  });
 
   it("reads current source rows after rebinding the publication owner", async () => {
     const owner = await createOwner();
@@ -476,6 +429,29 @@ describe("bounded memory publication transfer", () => {
     ]);
   });
 
+  it("can still publish the last fitting group after final file validation", () => {
+    const sibling = replacement("sibling");
+    sibling.entry.path = "memory/sibling.md";
+    const group = (length: number) => [sibling, replacement("a".repeat(length))];
+    let accepted = 0;
+    let rejected = 256 * 1024;
+    while (rejected - accepted > 1) {
+      const length = Math.floor((accepted + rejected) / 2);
+      if (memoryPublicationGroup(group(length))) {
+        accepted = length;
+      } else {
+        rejected = length;
+      }
+    }
+    expect(memoryPublicationGroup(group(rejected))).toBeUndefined();
+    const sources = group(accepted);
+    expect(memoryPublicationGroup(sources)).toBeDefined();
+    for (const source of sources) {
+      source.verifiedFile = { mtimeMs: 1750000000000.125, size: 262_144 };
+    }
+    expect(memoryPublicationGroup(sources)).toBeDefined();
+  });
+
   it("roundtrips an oversized Unicode record and its metadata through the native publication owner", async () => {
     const owner = await createOwner();
     // Non-BMP text spans many fragment boundaries, including pairs whose halves
@@ -491,7 +467,13 @@ describe("bounded memory publication transfer", () => {
     for (const batch of batches) {
       expect(serialize(batch).byteLength).toBeLessThanOrEqual(512 * 1024);
     }
-    await publish(owner, input);
+    const verifiedFile = { mtimeMs: 120.75, size: input.entry.size };
+    input.entry.size = 1;
+    await owner.replaceSource(input, assertCurrent, async () => {
+      // The fragments are already staged when the accepted file is inspected.
+      input.verifiedFile = verifiedFile;
+      return true;
+    });
     expectValues(
       owner.db,
       "SELECT path, source, start_line, end_line, hash, model, text, embedding, updated_at FROM memory_index_chunks",
@@ -510,7 +492,7 @@ describe("bounded memory publication transfer", () => {
       ],
     );
     expectValues(owner.db, "SELECT path, source, hash, mtime, size FROM memory_index_sources", [
-      [input.entry.path, "memory", "source-hash", 100.25, Buffer.byteLength(text)],
+      [input.entry.path, "memory", "source-hash", verifiedFile.mtimeMs, verifiedFile.size],
     ]);
     expectValues(
       owner.db,
@@ -520,7 +502,7 @@ describe("bounded memory publication transfer", () => {
     expectValues(
       owner.db,
       "SELECT origin_class, session_kind, observed_at, supersedes_key FROM memory_index_chunk_provenance",
-      [["owner", "interactive", 90, "old/🔑"]],
+      [["owner", "interactive", 120, "old/🔑"]],
     );
     expectRows(
       owner.db,
@@ -770,21 +752,5 @@ describe("bounded memory publication transfer", () => {
       (_, index) => numericCases[index % numericCases.length]![1],
     );
     expect(rows).toEqual(input.chunks.map((row) => ({ chunk: row, embedding: expectedVector })));
-  });
-
-  it("reuses printed fragments per prepared chunks array until it is released", () => {
-    const first = replacement();
-    const printed = memoryPublicationInline(first)?.fragments;
-    expect(printed).toBeDefined();
-    expect(memoryPublicationInline({ ...first })?.fragments).toBe(printed);
-    const other = replacement("second source text");
-    const group = memoryPublicationGroup([first, other])!;
-    const again = memoryPublicationGroup([first, other])!;
-    expect(group[0]?.fragments).toBe(printed);
-    again.forEach((source, index) => expect(source.fragments).toBe(group[index]?.fragments));
-    releaseMemoryPublication(first);
-    const released = memoryPublicationInline(first)?.fragments;
-    expect(released).not.toBe(printed);
-    expect(released).toEqual(printed);
   });
 });

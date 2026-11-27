@@ -8,6 +8,7 @@ import { resolveCronJobConfigRevision } from "../cron/config-revision.js";
 import { makeCronJob } from "../cron/delivery.test-helpers.js";
 import { prepareCronRunAdmission } from "../cron/run-admission.js";
 import { TEST_SCHEDULED_EXECUTION } from "../cron/scheduled-occurrence.test-support.js";
+import { createCronCompletionDeliveryFence } from "../cron/service/delivery-attempt-fence.js";
 import { markServiceCronJobActive } from "../cron/service/run-receipts.js";
 import { createCronServiceState } from "../cron/service/state.js";
 import {
@@ -47,8 +48,9 @@ import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-cloc
 import { observeMainThreadSql } from "../test-utils/main-thread-sql-spies.test-support.js";
 import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
 import * as cronGrant from "./bash-tools.exec-cron-grant.js";
+import { runExecFixture } from "./bash-tools.exec-fixture.test-support.js";
 import { processGatewayAllowlist } from "./bash-tools.exec-host-gateway.js";
-import { runExecProcess } from "./bash-tools.exec-runtime.js";
+import { createExecTool } from "./bash-tools.exec-run.js";
 import { captureSecurityEvents } from "./test-helpers/security-events.js";
 
 const commitExecAuthorizationMock = vi.hoisted(() =>
@@ -165,6 +167,15 @@ const grantTempDirs = useAutoCleanupTempDirTracker((cleanup) =>
 );
 
 const databaseOptions = () => ({ env: { ...process.env } });
+const replacePolicy = (defaults: { security?: "deny"; ask?: "always" }, mergeDefaults = true) => {
+  const file = readExecApprovalsSnapshot().file;
+  return updateExecApprovals({
+    update: {
+      kind: "replace",
+      file: { ...file, defaults: mergeDefaults ? { ...file.defaults, ...defaults } : defaults },
+    },
+  });
+};
 
 function seedCronJobRow() {
   const database = openOpenClawStateDatabase(databaseOptions());
@@ -184,7 +195,11 @@ function seedCronJobRow() {
   return loadedJob;
 }
 
-async function mintStandingGrant(revision: string, expiresAtMs: number | null): Promise<void> {
+async function mintStandingGrant(
+  revision: string,
+  expiresAtMs: number | null,
+  env?: Record<string, string>,
+): Promise<void> {
   await insertOperatorApproval({
     approval: {
       id: "cron-approval-1",
@@ -216,7 +231,7 @@ async function mintStandingGrant(revision: string, expiresAtMs: number | null): 
       operationBinding: buildCronExecOperationBinding({
         command: grantCommand,
         cwd: workdir,
-        env: undefined,
+        env,
       }),
       expiresAtMs,
     },
@@ -227,22 +242,24 @@ async function mintStandingGrant(revision: string, expiresAtMs: number | null): 
 const readGrantUseCounts = async () =>
   (await listCronStandingGrants()).map((grant) => grant.useCount);
 
-async function prepareCronRun(mintGrant = true, expiresAtMs: number | null = null) {
+async function prepareCronRun(
+  mintGrant = true,
+  expiresAtMs: number | null = null,
+  env?: Record<string, string>,
+) {
   const job = seedCronJobRow();
   const revision = resolveCronJobConfigRevision(job);
   const receipt = claimCronRunReceiptForTest(CRON_STORE_KEY, job, Date.now());
-  const marker = markServiceCronJobActive(
-    createCronServiceState({
-      scheduler: createTestGatewayScheduler(),
-      storePath: CRON_STORE_KEY,
-      cronEnabled: true,
-      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-      enqueueSystemEvent: vi.fn(),
-      runIsolatedAgentJob: vi.fn(),
-    }),
-    job,
-    receipt,
-  );
+  const state = createCronServiceState({
+    scheduler: createTestGatewayScheduler(),
+    storePath: CRON_STORE_KEY,
+    cronEnabled: true,
+    log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    enqueueSystemEvent: vi.fn(),
+    runIsolatedAgentJob: vi.fn(),
+  });
+  const marker = markServiceCronJobActive(job, receipt);
+  controller = new AbortController();
   runOwner = prepareCronRunAdmission({
     scheduledExecution: TEST_SCHEDULED_EXECUTION,
     cfg: {},
@@ -250,16 +267,21 @@ async function prepareCronRun(mintGrant = true, expiresAtMs: number | null = nul
     runId: "cron-run-1",
     jobId: job.id,
     sessionKey: "agent:main:cron:job-1",
-    deliveryAttemptFence: null,
+    deliveryAttemptFence: createCronCompletionDeliveryFence({
+      state,
+      job,
+      handle: receipt,
+      activeJobMarker: marker,
+      signal: controller.signal,
+    }),
   });
-  controller = new AbortController();
   bindCronJobAdmittedRun(
     marker,
     await runOwner.preparedRunAdmission.admit("embedded"),
     controller.signal,
   );
   if (mintGrant) {
-    await mintStandingGrant(revision, expiresAtMs);
+    await mintStandingGrant(revision, expiresAtMs, env);
   }
   unregisterCronSource = registerCronRunExecSource("cron-run-1", {
     agentId: "main",
@@ -302,7 +324,7 @@ async function runNativeCron(approval: Awaited<ReturnType<typeof runCron>>) {
     processTree: "owned-only",
   });
   try {
-    const run = await runExecProcess({
+    const run = await runExecFixture({
       command: grantCommand,
       execCommand: approval.execCommandOverride ?? grantCommand,
       workdir,
@@ -311,11 +333,6 @@ async function runNativeCron(approval: Awaited<ReturnType<typeof runCron>>) {
         HOME: workdir,
         ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
       },
-      usePty: false,
-      warnings: [],
-      maxOutput: 1000,
-      pendingMaxOutput: 1000,
-      notifyOnExit: false,
       timeoutSec: 10,
       scopeKey,
       startupSignal: controller.signal,
@@ -382,6 +399,69 @@ it("executes a cron occurrence via a standing grant without prompting", async ()
   expect(await readGrantUseCounts()).toEqual([1]);
 });
 
+it.each(["pre-scratch", "11.10 scratch", "11.10 explicit env"] as const)(
+  "uses a %s standing grant through the exec tool without prompting",
+  async (binding) => {
+    const scratch = path.join(workdir, ".openclaw", "tmp");
+    const requestedEnv =
+      binding === "11.10 explicit env"
+        ? { TMPDIR: path.join(workdir, "requested-tmp"), CUSTOM: "approved" }
+        : undefined;
+    await prepareCronRun(
+      true,
+      null,
+      binding === "pre-scratch"
+        ? undefined
+        : { TMPDIR: scratch, TMP: scratch, TEMP: scratch, ...requestedEnv },
+    );
+    const [originalGrant] = await listCronStandingGrants();
+    const tool = createExecTool({
+      agentId: "main",
+      runId: "cron-run-1",
+      cwd: workdir,
+      host: "gateway",
+      security: "allowlist",
+      ask: "on-miss",
+      notifyOnExit: false,
+    });
+    const result = await tool.execute(
+      "cron-scratch",
+      { command: grantCommand, env: requestedEnv, awaitResults: true },
+      controller.signal,
+    );
+    expect(callGatewayToolMock).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({ status: "completed", exitCode: 0 });
+    expect(readNativeEffects()).toBe("cron-native-launch");
+    expect(await listCronStandingGrants()).toEqual([
+      expect.objectContaining({
+        grantId: originalGrant!.grantId,
+        operationBinding: originalGrant!.operationBinding,
+        useCount: 1,
+      }),
+    ]);
+
+    await tool.execute(
+      "cron-changed-env",
+      { command: grantCommand, env: { ...requestedEnv, CUSTOM: "changed" }, awaitResults: true },
+      controller.signal,
+    );
+    expect(callGatewayToolMock).toHaveBeenCalled();
+    expect(readNativeEffects()).toBe("cron-native-launch");
+    expect(await readGrantUseCounts()).toEqual([1]);
+
+    callGatewayToolMock.mockClear();
+    await revokeCronStandingGrant({ grantId: originalGrant!.grantId, revokedBy: "operator" });
+    await tool.execute(
+      "cron-revoked",
+      { command: grantCommand, env: requestedEnv, awaitResults: true },
+      controller.signal,
+    );
+    expect(callGatewayToolMock).toHaveBeenCalled();
+    expect(readNativeEffects()).toBe("cron-native-launch");
+    expect(await readGrantUseCounts()).toEqual([1]);
+  },
+);
+
 it.each(["revoked grant", "finished receipt", "replacement receipt"] as const)(
   "prevents native I/O after consult with a %s",
   async (invalidation) => {
@@ -439,21 +519,9 @@ it.each([
     } else if (intervention === "cancel") {
       controller.abort();
     } else if (intervention === "policy deny" || intervention === "policy ask") {
-      const file = readExecApprovalsSnapshot().file;
-      await updateExecApprovals({
-        update: {
-          kind: "replace",
-          file: {
-            ...file,
-            defaults: {
-              ...file.defaults,
-              ...(intervention === "policy deny"
-                ? { security: "deny" as const }
-                : { ask: "always" as const }),
-            },
-          },
-        },
-      });
+      await replacePolicy(
+        intervention === "policy deny" ? { security: "deny" } : { ask: "always" },
+      );
     } else if (intervention === "fallback") {
       // A proven no-initiation retry revalidates without another consume.
       result.releaseSpawn?.("retry");
@@ -550,22 +618,17 @@ it("refuses policy tightening until a consumed remote launch acknowledges initia
   const result = await runCron();
   await expect(result.revalidateBeforeExecution?.()).resolves.toBeUndefined();
   const acknowledgement = createDeferredCore();
-  const deny = () =>
-    updateExecApprovals({
-      update: {
-        kind: "replace",
-        file: { ...readExecApprovalsSnapshot().file, defaults: { security: "deny" } },
-      },
-    });
   try {
     const launch = vi.fn();
     result.initiateSpawn?.(launch, acknowledgement.promise);
     expect(launch).toHaveBeenCalledOnce();
     result.releaseSpawn?.();
-    await expect(deny()).rejects.toThrow("native launch acknowledgement is pending");
+    await expect(replacePolicy({ security: "deny" }, false)).rejects.toThrow(
+      "native launch acknowledgement is pending",
+    );
     acknowledgement.resolve();
     await acknowledgement.promise;
-    await expect(deny()).resolves.not.toBeNull();
+    await expect(replacePolicy({ security: "deny" }, false)).resolves.not.toBeNull();
     expect(await readGrantUseCounts()).toEqual([1]);
   } finally {
     acknowledgement.resolve();

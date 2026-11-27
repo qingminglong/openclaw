@@ -12,13 +12,14 @@ import {
 } from "../../plugins/services.test-support.js";
 import { prepareUserProfileCatalog } from "../../state/user-profile-list.js";
 import type { OpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { createVisitorAccessPluginConfig } from "../../test-utils/visitor-access-config.test-support.js";
 import {
   createCoreGatewayMethodDescriptors,
   createGatewayMethodRegistry,
 } from "../methods/registry.js";
 import { ADMIN_SCOPE, SESSION_WRITE_SCOPE, WRITE_SCOPE } from "../operator-scopes.js";
 import { loadGatewayPlugins } from "../server-plugins.js";
-import { agentHandlers } from "./agent.js";
+import { agentRunHandler } from "./agent-run-handler.js";
 import { toolsInvokeHandlers } from "./tools-invoke.js";
 import type { GatewayContextResolver, GatewayRequestContext } from "./types.js";
 import { usersHandlers } from "./users.js";
@@ -36,7 +37,10 @@ export const visitorTestStateOptions = {
 
 export function createVisitorGatewayConfig(workspaceDir: string): OpenClawConfig {
   return {
-    agents: { defaults: { workspace: workspaceDir }, entries: { main: {} } },
+    agents: {
+      defaults: { workspace: workspaceDir, model: "openai/gpt-6-astra" },
+      entries: { main: {} },
+    },
     gateway: {
       controlUi: { github: { token: "synthetic-visitor-github-token" } },
       roles: {
@@ -56,16 +60,7 @@ export function createVisitorGatewayConfig(workspaceDir: string): OpenClawConfig
       },
     },
     tools: { allow: ["visitor_invite"] },
-    plugins: {
-      allow: ["visitor-access"],
-      slots: { memory: "none" },
-      entries: {
-        "visitor-access": {
-          enabled: true,
-          config: { accountId: "test-account", appId: "test-app", apiToken: "test-token" },
-        },
-      },
-    },
+    plugins: createVisitorAccessPluginConfig("test-account", "test-app", "test-token"),
   };
 }
 
@@ -159,7 +154,7 @@ export async function startVisitorGateway({
   resolveGatewayContext: GatewayContextResolver;
 }) {
   const handlers = {
-    agent: expectDefined(agentHandlers.agent, "agent handler missing"),
+    agent: agentRunHandler,
     "tools.invoke": expectDefined(toolsInvokeHandlers["tools.invoke"], "tools.invoke missing"),
     "users.list": expectDefined(usersHandlers["users.list"], "users.list handler missing"),
   };

@@ -1,6 +1,7 @@
 import { expect } from "vitest";
 import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import type { ModelAuthStatusResult, WizardNextResult } from "../../api/types.ts";
+import { loginOption } from "../../test-helpers/model-providers.ts";
 import { waitForSolid } from "../../test-helpers/solid-settle.ts";
 import {
   clickLoginChoice,
@@ -19,14 +20,10 @@ export function museCodeCapability(): NonNullable<
     apiKeySupported: true,
     quickApiKeySetup: true,
     loginOptions: [
-      {
-        id: "meta/muse-code",
-        brandId: "meta",
-        label: "Muse Code",
-        kind: "device-code",
+      loginOption("meta/muse-code", "meta", "Muse Code", "device-code", {
         featured: true,
         requiresSetup: true,
-      },
+      }),
     ],
   };
 }
@@ -112,13 +109,13 @@ async function clickEnabled(page: ModelProvidersPageTestElement, selector: strin
   await page.updateComplete;
 }
 
+/** The page lists every provider; this waits until its catalog rows can start a connection. */
 export async function openPicker(page: ModelProvidersPageTestElement) {
   await waitForProviders(page);
-  await clickEnabled(page, "[data-models-connect]");
 }
 
 export async function selectProvider(page: ModelProvidersPageTestElement, provider: string) {
-  await clickEnabled(page, `[data-models-login-provider="${provider}"]`);
+  await clickEnabled(page, `[data-models-catalog-provider="${provider}"] button`);
 }
 
 export async function chooseLogin(page: ModelProvidersPageTestElement, label = "Example API key") {

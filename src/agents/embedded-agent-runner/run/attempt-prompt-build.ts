@@ -14,6 +14,7 @@ import { buildInterSessionPromptContext } from "../../../sessions/input-provenan
 import { getUserTurnTranscriptAdmissionOwner } from "../../../sessions/user-turn-transcript-admission.js";
 import { joinPresentTextSegments } from "../../../shared/text/join-segments.js";
 import { resolveAdmittedRunActiveAssertion } from "../../admitted-run-context.js";
+import type { McpToolCatalogDiagnostic } from "../../agent-bundle-mcp-catalog.types.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../defaults.js";
 import {
   buildAgentInternalEventContext,
@@ -29,7 +30,7 @@ import type { AgentSession, SessionManager } from "../../sessions/index.js";
 import {
   appendModelIdentitySystemPrompt,
   buildModelIdentityPromptLine,
-} from "../../system-prompt.js";
+} from "../../system-prompt-model-identity.js";
 import { log } from "../logger.js";
 import { normalizeAssistantReplayContent } from "../replay-history.js";
 import {
@@ -58,12 +59,12 @@ import {
 } from "./attempt-prompt-helpers.js";
 import { applyResolvedToolPromptFinalizer } from "./attempt-prompt-support.js";
 import { composeSystemPromptWithHookContext } from "./attempt-thread-helpers.js";
+import { buildMcpDiagnosticPromptFragments } from "./mcp-diagnostic-prompt.js";
 import {
   buildRuntimeContextCustomMessage,
   buildSystemUpdateMessage,
   resolveRuntimeContextPromptParts,
 } from "./runtime-context-prompt.js";
-import { buildTurnDeliveryContextFragments } from "./turn-delivery-context.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
 type HookRunner = ReturnType<typeof getGlobalHookRunner>;
@@ -150,15 +151,20 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
     inputProvenance: attempt.inputProvenance,
   };
   const promptBuildMessages = input.activeSession.messages;
-  const promptEvent = { prompt: effectivePrompt, messages: promptBuildMessages };
+  // A reload continuation's prompt is synthetic; prompt hooks see the user's request.
+  const promptEvent = {
+    prompt: attempt.pluginRuntimeRefreshUserPrompt ?? effectivePrompt,
+    messages: promptBuildMessages,
+  };
   const hookResult = preserveExactPrompt
     ? undefined
     : await resolvePromptBuildHookResult({
         config: attempt.config ?? getRuntimeConfig(),
-        prompt: effectivePrompt,
+        prompt: promptEvent.prompt,
         messages: promptBuildMessages,
         hookCtx,
         hookRunner: input.hookRunner,
+        refreshContinuation: attempt.pluginRuntimeRefreshUserPrompt !== undefined,
       });
 
   const assertAdmittedActive = resolveAdmittedRunActiveAssertion(
@@ -236,11 +242,22 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
   const authorizedHookResult =
     preserveExactPrompt || !hookRunner || !attempt.toolAuthorityFingerprint || !assertHostActive
       ? undefined
-      : await hookRunner.runAuthorizedPromptBuild(promptEvent, hookCtx, {
-          toolAuthorityFingerprint: attempt.toolAuthorityFingerprint,
-          activeToolNames: callableToolNames,
-          assertHostActive,
-        });
+      : await hookRunner.runAuthorizedPromptBuild(
+          {
+            ...promptEvent,
+            // The embedded runner owns its transcript; there is no native binding to invalidate.
+            continuity:
+              promptBuildMessages.length > 0
+                ? { state: "resumed", history: "included" }
+                : { state: "fresh", history: "none" },
+          },
+          hookCtx,
+          {
+            toolAuthorityFingerprint: attempt.toolAuthorityFingerprint,
+            activeToolNames: callableToolNames,
+            assertHostActive,
+          },
+        );
   const promptBeforeResolvedToolFinalization = effectivePrompt;
   effectivePrompt = applyResolvedToolPromptFinalizer({
     prompt: effectivePrompt,
@@ -344,22 +361,16 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
 
 type PromptContextAttempt = Pick<
   EmbeddedRunAttemptParams,
-  | "chatType"
   | "config"
   | "contextTokenBudget"
   | "currentInboundContext"
   | "currentInboundEventKind"
   | "internalEvents"
-  | "messageChannel"
-  | "messageProvider"
   | "fallbackActive"
-  | "requireExplicitMessageTarget"
-  | "messageToolFinalByDefault"
   | "runtimeContextFragments"
   | "sessionId"
   | "sessionKey"
   | "sessionTarget"
-  | "sourceReplyDeliveryMode"
   | "suppressNextUserMessagePersistence"
   | "skipPreparedUserTurnMessage"
   | "userTurnTranscriptRecorder"
@@ -379,6 +390,8 @@ export async function prepareEmbeddedAttemptPromptContext(input: {
   appendOnlyRuntimeContext?: boolean;
   executionHost?: boolean;
   inHistorySystemUpdates?: boolean;
+  /** The route drops turn-scoped system updates after the next user message. */
+  clearsTurnScopedSystemUpdates?: boolean;
   attempt: PromptContextAttempt;
   capabilityToolNames: ReadonlySet<string>;
   boundaryTimezone?: string;
@@ -389,6 +402,8 @@ export async function prepareEmbeddedAttemptPromptContext(input: {
   prompt: PromptAssemblyContext;
   replaceSessionMessages: (messages: AgentMessage[]) => void;
   sessionAgentId: string;
+  systemPromptRuntimeContextFragments?: readonly RuntimeContextFragment[];
+  mcpDiagnostics?: readonly McpToolCatalogDiagnostic[];
   systemPromptReport?: SessionSystemPromptReport;
   systemPromptText: string;
   toolResultPromptProjectionState: ToolResultPromptProjectionState;
@@ -451,17 +466,10 @@ export async function prepareEmbeddedAttemptPromptContext(input: {
 
   const escapedProjection = !input.isRawModelRun && usesEscapedRuntimeContext(input.sessionVersion);
   const eventFragments: RuntimeContextFragment[] = [
-    ...buildTurnDeliveryContextFragments({
-      config: attempt.config,
-      sessionKey: attempt.sessionKey,
-      chatType: attempt.chatType,
-      channel: attempt.messageChannel ?? attempt.messageProvider,
-      sourceReplyDeliveryMode: attempt.sourceReplyDeliveryMode,
-      requireExplicitMessageTarget: attempt.requireExplicitMessageTarget,
-      messageToolFinalByDefault: attempt.messageToolFinalByDefault,
-    }),
     ...buildAgentInternalEventContext(attempt.internalEvents),
     ...(attempt.runtimeContextFragments ?? []),
+    ...(input.systemPromptRuntimeContextFragments ?? []),
+    ...buildMcpDiagnosticPromptFragments(input.mcpDiagnostics ?? []),
     ...(input.prompt.originContext
       ? escapedProjection
         ? input.prompt.originContext.fragments
@@ -506,7 +514,21 @@ export async function prepareEmbeddedAttemptPromptContext(input: {
           sessionTarget: attempt.sessionTarget,
           runId: attempt.runId,
           agentId: input.sessionAgentId,
-          includeEmptySnapshots: input.appendOnlyRuntimeContext === true,
+          // Diff base: earlier carriers this request sends. Routes that do not retain
+          // carriers send none; routes that clear turn-scoped updates drop those.
+          sentHistory: input.appendOnlyRuntimeContext
+            ? sessionMessages.filter(
+                (message) =>
+                  !input.clearsTurnScopedSystemUpdates ||
+                  !(
+                    "details" in message &&
+                    typeof message.details === "object" &&
+                    message.details !== null &&
+                    "turnScoped" in message.details &&
+                    message.details.turnScoped === true
+                  ),
+              )
+            : [],
         });
   // A dispatched user's projection is frozen. Fresh fallback hooks belong to
   // the continuation context, never a second copy of the user or their images.
@@ -549,10 +571,12 @@ export async function prepareEmbeddedAttemptPromptContext(input: {
       ? { currentUserTimestamp: preparedUserTurnTimestamp }
       : {}),
   };
-  const hookMessagesForCurrentPrompt = normalizeMessagesForCurrentPromptBoundary({
-    ...boundaryInput,
-    messages: messagesForCurrentPrompt,
-  });
+  const projectHistoryForCurrentPrompt = (messages: AgentMessage[]) =>
+    normalizeMessagesForCurrentPromptBoundary({
+      ...boundaryInput,
+      messages,
+    });
+  const hookMessagesForCurrentPrompt = projectHistoryForCurrentPrompt(messagesForCurrentPrompt);
   if (input.systemPromptReport) {
     input.systemPromptReport.currentTurn = {
       ...(attempt.currentInboundEventKind ? { kind: attempt.currentInboundEventKind } : {}),
@@ -583,6 +607,7 @@ export async function prepareEmbeddedAttemptPromptContext(input: {
     prePromptMessageCount,
     promptForModel,
     promptForSession,
+    projectHistoryForCurrentPrompt,
     promptSubmission,
     promptToolResultAggregateMaxChars,
     promptToolResultMaxChars,

@@ -46,6 +46,7 @@ import {
   normalizeAskUserParams,
   reserveAskUserPromptDelivery,
 } from "./tools/ask-user-tool.js";
+import { createDeploymentQuestion } from "./tools/ask-user-tool.test-support.js";
 import * as gatewayTransport from "./tools/gateway.js";
 import { createSecretsTool } from "./tools/secrets-tool.js";
 import { markCoreTtsToolResult } from "./tools/tts-tool-result-provenance.js";
@@ -287,17 +288,7 @@ describe("handleToolExecutionStart read path checks", () => {
     const onToolResult = vi.fn(() => delivered.resolve());
     ctx.params.onToolResult = onToolResult;
     const args = {
-      questions: [
-        {
-          id: "deploy_target",
-          header: "Target",
-          question: "Where should this deploy?",
-          options: [
-            { label: "Staging (Recommended)", description: "Safer default" },
-            { label: "Production" },
-          ],
-        },
-      ],
+      questions: [createDeploymentQuestion("Target")],
     };
 
     const pending = startTool(ctx, { toolName: "ask_user", toolCallId: "ask-call-1", args });
@@ -830,25 +821,24 @@ describe("handleToolExecutionEnd MCP App channel view tracking", () => {
   });
 });
 
-describe("handleToolExecutionEnd MCP connect action tracking", () => {
-  it("retains only a successful HTTP(S) connect action", async () => {
-    const { ctx } = createTestContext();
+it.each([false, true])("retains HTTP(S) sign-in recovery (tool failed: %s)", async (isError) => {
+  const { ctx } = createTestContext();
 
-    await endTool(ctx, {
-      toolName: "mcp_connect",
-      toolCallId: "mcp-connect",
-      result: resultWithDetails({
-        mcpConnect: {
-          serverName: "calendar",
-          authorizationUrl: "https://auth.example/authorize?state=opaque",
-        },
-      }),
-    });
+  await endTool(ctx, {
+    toolName: "mcp_connect",
+    toolCallId: "mcp-connect",
+    isError,
+    result: resultWithDetails({
+      mcpConnect: {
+        serverName: "calendar",
+        authorizationUrl: "https://auth.example/authorize?state=opaque",
+      },
+    }),
+  });
 
-    expect(ctx.state.latestMcpConnectAction).toEqual({
-      serverName: "calendar",
-      authorizationUrl: "https://auth.example/authorize?state=opaque",
-    });
+  expect(ctx.state.latestMcpConnectAction).toEqual({
+    serverName: "calendar",
+    authorizationUrl: "https://auth.example/authorize?state=opaque",
   });
 });
 
@@ -1502,7 +1492,7 @@ describe("handleToolExecutionEnd exec approval prompts", () => {
     );
     expect(text).toContain("no interactive approval client is currently available");
     expect(text).toContain(
-      "Print the Control UI URL with `openclaw dashboard --no-open`, open it in a browser, then use the approval inbox.",
+      "Print the web app URL with `openclaw dashboard --no-open`, open it in a browser, then use the approval inbox.",
     );
     expect(text).toContain(
       "Inspect the node's effective exec policy with `openclaw approvals get --node node-mac-1`.",

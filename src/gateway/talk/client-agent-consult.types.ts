@@ -2,7 +2,7 @@ import type {
   ReplyToolAuthorityOverlay,
   SessionControllerInput,
 } from "../../sessions/session-controller.contracts.js";
-import type { controlRealtimeVoiceAgentRun } from "../../talk/agent-run-control.js";
+import type { controlTalkAgentRun } from "../../talk/agent-run-control.js";
 import type {
   RealtimeVoiceAgentConsultRunner,
   RealtimeVoiceGatewayControl,
@@ -21,7 +21,7 @@ export type TalkAgentConsultRequest = Parameters<RealtimeVoiceAgentConsultRunner
 
 export type TalkAgentConsultSource = "tool-call" | "native-delegation";
 
-export type TalkAgentConsultLifecycleMethods = {
+type TalkAgentConsultLifecycleMethods = {
   adoptCompletionClaims?: () => void;
   claimAppend?: () => boolean;
   claimFailureAppend?: () => boolean;
@@ -29,7 +29,7 @@ export type TalkAgentConsultLifecycleMethods = {
   steer?: RealtimeVoiceAgentConsultRunner;
 };
 
-export type LifecycleBoundTalkAgentConsult = ((
+type LifecycleBoundTalkAgentConsult = ((
   args: unknown,
   signal: AbortSignal,
   ready?: () => Promise<void>,
@@ -48,7 +48,7 @@ export type ReusableTalkAgentConsult = (
   sourceInput?: SessionControllerInput,
 ) => Promise<{ text: string }>;
 
-export type GatewayTalkAgentConsultRunner = (
+type GatewayTalkAgentConsultRunner = (
   request: TalkAgentConsultRequest,
 ) => ReturnType<RealtimeVoiceAgentConsultRunner>;
 
@@ -81,8 +81,7 @@ export type TalkClientGatewayControlOptions = {
   controlSource?: "delegation" | "transcript";
   sessionTarget: PreparedTalkSessionTarget;
   connId: string;
-  context: Pick<GatewayRequestContext, "broadcastToConnIds" | "logGateway" | "inputRecovery"> &
-    TalkRunCancelContext;
+  context: Pick<GatewayRequestContext, "broadcastToConnIds" | "logGateway"> & TalkRunCancelContext;
   assertConnectionOpen?: () => void;
   runToolAgentConsult: ReusableTalkAgentConsult;
   runAgentConsult: LifecycleBoundTalkAgentConsult;
@@ -94,6 +93,6 @@ export type TalkClientGatewayControlOptions = {
   flushTranscript: () => Promise<void>;
   closeLogicalSession: () => Promise<void>;
   withCloseSettlement?: (run: () => Promise<void>) => Promise<void>;
-  controlAgentRun?: typeof controlRealtimeVoiceAgentRun;
-  getToolAuthorityOverlay?: (source?: "reply" | "attempt") => ReplyToolAuthorityOverlay;
+  controlAgentRun?: typeof controlTalkAgentRun;
+  getToolAuthorityOverlay?: (source?: "reply" | "attempt") => Promise<ReplyToolAuthorityOverlay>;
 };

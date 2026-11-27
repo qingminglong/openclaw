@@ -26,6 +26,7 @@ import {
 import { setChatHistoryLoad } from "./chat-history-state.ts";
 import { makeChatHost } from "./chat-host.test-support.ts";
 import { createTestPageState } from "./chat-page-state.test-support.ts";
+import { applyChatPendingInputs } from "./chat-pending-inputs.ts";
 import { reconcileChatRunLifecycle } from "./run-lifecycle.ts";
 
 const goal: SessionGoal = createSessionGoalFixture("goal-a", "Review the UI", {
@@ -98,6 +99,8 @@ describe("Goal control requests", () => {
       value: activeGoal,
       executionConfirmed: false,
     });
+    host.chatSending = false;
+    host.chatRunId = null;
     const submitted = mutateChatGoal(host, { action: "resume", goalId: goal.id });
     expect(chatGoalPresentation(host, activeGoal)?.executionConfirmed).toBe(false);
     pending.resolve({ status: "started", goalId: goal.id, runId: "goal-run", goal: activeGoal });
@@ -444,7 +447,9 @@ describe("Goal control requests", () => {
     const captured = chatGoalRecovery(host);
     expect
       .soft(renderedError)
-      .toBe("Goal update was not sent because its recovery request could not be saved.");
+      .toBe(
+        "Couldn’t save the recovery request. Free browser storage and try again. Your goal update wasn’t sent.",
+      );
     expect.soft(host.request).not.toHaveBeenCalled();
     expect.soft(sessionStorage.length).toBe(0);
     // Credentials changed, but both clients lack a distinguishable scope and share a session.
@@ -716,6 +721,89 @@ describe("Goal control requests", () => {
     expect(host.request).toHaveBeenCalledTimes(2);
     await firstRecovery?.onCheck();
     expect(host.request).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["sending", "queued", "running"] as const)(
+    "keeps a fresh Resume unsent while the session is %s, then admits it after settlement",
+    async (busy) => {
+      const host = goalHost({
+        "sessions.goal.update": { status: "started", goalId: goal.id, runId: "goal-run", goal },
+      });
+      host.chatSending = busy === "sending";
+      host.chatRunId = busy === "running" ? "current-run" : null;
+      if (busy === "queued") {
+        host.sessionsResult!.sessions[0] = {
+          ...host.sessionsResult!.sessions[0]!,
+          status: "queued",
+          hasActiveRun: true,
+          activeRunIds: ["waiting-human-input"],
+        };
+      }
+      expect(await mutateChatGoal(host, { action: "resume", goalId: goal.id })).toBe(false);
+      expect(host.request).not.toHaveBeenCalled();
+      expect(chatGoalRecovery(host)).toBeUndefined();
+      host.chatSending = false;
+      host.chatRunId = null;
+      host.sessionsResult!.sessions[0] = {
+        ...host.sessionsResult!.sessions[0]!,
+        status: "done",
+        hasActiveRun: false,
+        activeRunIds: [],
+      };
+      expect(await mutateChatGoal(host, { action: "resume", goalId: goal.id })).toBe(true);
+      expect(
+        host.request.mock.calls.filter(([method]) => method === "sessions.goal.update"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("admits an active goal Resume only for the same idle goal with no queued input", async () => {
+    const activeGoal: SessionGoal = { ...goal, status: "active" };
+    const host = goalHost({
+      "sessions.goal.update": {
+        status: "started",
+        goalId: goal.id,
+        runId: "goal-run",
+        goal: activeGoal,
+      },
+    });
+    const idle = {
+      ...host.sessionsResult!.sessions[0]!,
+      goal: activeGoal,
+      status: "running" as const,
+      hasActiveRun: false,
+      activeRunIds: [],
+    };
+    const resume = () =>
+      mutateChatGoal(host, { action: "resume", goalId: goal.id, expectedResumeStatus: "active" });
+
+    for (const row of [
+      { ...idle, activeRunIds: undefined },
+      { ...idle, hasActiveSubagentRun: true },
+      { ...idle, sessionId: "replacement-session" },
+      { ...idle, goal },
+      { ...idle, goal: { ...activeGoal, id: "replacement-goal" } },
+    ]) {
+      host.sessionsResult!.sessions[0] = row;
+      expect(await resume()).toBe(false);
+    }
+    host.sessionsResult!.sessions[0] = idle;
+    host.chatQueue = [{ id: "follow-up", text: "Wait for this", createdAt: 1 }];
+    expect(await resume()).toBe(false);
+    host.chatQueue = [];
+
+    applyChatPendingInputs(host, { items: [], total: 1, queuedCount: 1 });
+    expect(await resume()).toBe(false);
+    expect(host.request).not.toHaveBeenCalled();
+    expect(sessionStorage.length).toBe(0);
+
+    applyChatPendingInputs(host, { items: [], total: 0, queuedCount: 0 });
+    expect(await resume()).toBe(true);
+    expect(host.request).toHaveBeenCalledExactlyOnceWith(
+      "sessions.goal.update",
+      expect.objectContaining({ action: "resume", sessionId: "session-a", goalId: goal.id }),
+      expect.anything(),
+    );
   });
 
   it("retires a busy Resume refusal without retrying and permits a distinct later Resume", async () => {

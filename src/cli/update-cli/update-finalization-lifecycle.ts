@@ -1,6 +1,7 @@
 import { writeSync } from "node:fs";
 import os from "node:os";
 import { collectNestedErrorCandidates } from "@openclaw/normalization-core/error-coercion";
+import { UPDATE_RUN_PHASES } from "../../../packages/gateway-protocol/src/update-run-vocabulary.js";
 import { resolveStateDir } from "../../config/paths.js";
 import { extractErrorCode, formatErrorMessage } from "../../infra/errors.js";
 import { resolveAggregateSqliteInspectionTimeoutMs } from "../../infra/sqlite-readonly-worker.js";
@@ -11,23 +12,27 @@ import {
   DoctorMaintenanceRefusalError,
   UpdateDoctorError,
 } from "../../infra/update-doctor-result.js";
+import { formatRepairedUpdateRun } from "../../infra/update-failure-facts-format.js";
 import {
   createUpdateFailureFact,
   type UpdateFailureFact,
 } from "../../infra/update-failure-facts.js";
 import type { ManagedHandoffRepair } from "../../infra/update-managed-service-handoff-lease-types.js";
 import { POST_CORE_UPDATE_ENV } from "../../infra/update-post-core-context.js";
+import { sendUpdateResultTelemetry } from "../../infra/update-result-telemetry.js";
 import { readUpdateRunDriver, type UpdateRunDriver } from "../../infra/update-run-driver.js";
 import {
   adoptUpdateRun,
   createUpdateRun,
   finishUpdateRun,
   heartbeatUpdateRun,
+  listUpdateRuns,
   recordUpdateRunDiagnostic,
   recordUpdateRunPhase,
   recordUpdateRunRepairContinuation,
   recordUpdateRunStep,
 } from "../../infra/update-run-ledger.js";
+import { isUpdateRepairRun, UPDATE_RUN_REPAIRED_STEP } from "../../infra/update-run-record.js";
 import type { UpdateRunStep } from "../../infra/update-run-record.js";
 import { updateRunStepsFromResultStep } from "../../infra/update-run-step.js";
 import {
@@ -39,6 +44,7 @@ import type { UpdateStepResult } from "../../infra/update-step-result.js";
 import { redactSupportDiagnosticLine } from "../../logging/diagnostic-support-redaction.js";
 import { formatConsoleDiagnosticLine } from "../../logging/json-console-line.js";
 import { getLogger } from "../../logging/logger.js";
+import { redactSensitiveText } from "../../logging/redact.js";
 import { hasCommandProcessCleanupError } from "../../process/exec-result.js";
 import { resolveCommandProcessSignal, withCommandProcessScope } from "../../process/exec-spawn.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -63,9 +69,14 @@ type Phase =
   | "doctor"
   | "plugins"
   | "targetConfigConvergence"
-  | "completionCache";
+  | "completionCache"
+  | "gatewayRestoration";
 type DoctorPhase = "doctor" | "targetConfigConvergence";
 type Outcome = "completed" | "failed" | "warning" | "skipped" | "deferred";
+
+// Match only Doctor's parent-held package deferral, not unfinished migrations generally.
+const PARENT_INSTALL_RECORD_DEFERRAL =
+  /^Plugin "[^"]+" data\/settings upgrade is unfinished: Package convergence must wait until the updating parent releases its install records\./u;
 
 export type UpdateFinalizationPhase = {
   signal: AbortSignal;
@@ -99,23 +110,42 @@ export class UpdateFinalizationLifecycle {
   private failureReason?: string;
   private unrecordedPhaseFailure?: { step: UpdateRunStep; reason: string };
   private readonly recordedWarningCounts = new Map<"doctor" | "plugins", number>();
+  private reportedParentDeferrals = false;
 
   constructor(
     private readonly json: boolean,
     private readonly timeoutMs: number | undefined,
     private readonly stopChildren: () => void,
+    /** False for a stage inside another command, which owns the only result document. */
+    private readonly reportsResult = true,
   ) {}
 
   get ownsUpdateRun(): boolean {
     return this.ownsRun;
   }
 
-  attachLedger(repair = false): string {
+  get ownsUpdateRepairRun(): boolean {
+    return this.ownsRepairRun;
+  }
+
+  attachLedger(repair = false, reportResult = false): string {
     this.driver = readUpdateRunDriver();
     const inherited = process.env[UPDATE_RUN_ID_ENV]?.trim();
     this.ledgerOptions = { env: { ...process.env }, busyTimeoutMs: this.budget("preflight") };
+    // Read the prior run before this repair's own run exists.
+    const prior =
+      repair && !inherited
+        ? listUpdateRuns({ limit: 3, excludeReason: "dry-run" }, this.ledgerOptions).find(
+            (run) =>
+              !run.steps.some((step) => step.step === "reconcile:settle") ||
+              run.steps.some(
+                ({ step }) =>
+                  step !== "requested" && UPDATE_RUN_PHASES.some((phase) => phase === step),
+              ),
+          )
+        : undefined;
     this.runId = createUpdateRun(
-      { runId: inherited || undefined, trigger: "cli" },
+      { runId: inherited || undefined, trigger: "cli", reportResult },
       this.ledgerOptions,
     ).runId;
     this.ownsRun = !inherited;
@@ -123,7 +153,25 @@ export class UpdateFinalizationLifecycle {
     this.handoff?.bindRun(this.runId);
     this.ownsRepairRun = repair && this.ownsRun;
     if (this.ownsRepairRun) {
+      recordUpdateRunPhase(this.runId, "repairing", {}, this.ledgerOptions);
       recordUpdateRunRepairContinuation(this.runId, this.runId, this.ledgerOptions);
+      const detail =
+        prior && isUpdateRepairRun(prior)
+          ? prior.status !== "succeeded" &&
+            prior.steps.find((step) => step.step === UPDATE_RUN_REPAIRED_STEP)?.detail
+          : prior?.status === "failed" && formatRepairedUpdateRun(prior);
+      if (detail) {
+        recordUpdateRunStep(
+          this.runId,
+          {
+            step: UPDATE_RUN_REPAIRED_STEP,
+            status: "completed",
+            endedAtMs: Date.now(),
+            detail,
+          },
+          this.ledgerOptions,
+        );
+      }
     }
     if (this.active) {
       recordUpdateRunStep(
@@ -181,15 +229,20 @@ export class UpdateFinalizationLifecycle {
       ...(status === "in_progress" ? { startedAtMs: at } : { endedAtMs: at }),
       ...(startedAtMs !== undefined ? { startedAtMs } : {}),
     };
-    const message = `[update finalize] ${JSON.stringify(step)}`;
     if (status === "failed") {
       this.failureReason = failureReason;
-      defaultRuntime.error(message);
-    } else if (name.startsWith("warning:")) {
-      console.warn(message);
-    } else {
-      getLogger().info(message);
-      process.stderr.write(`${formatConsoleDiagnosticLine({ level: "info", message })}\n`);
+    }
+    const parentDeferral =
+      status === "completed" &&
+      name.startsWith("warning:finalize:doctor:") &&
+      PARENT_INSTALL_RECORD_DEFERRAL.test(detail ?? "");
+    if (!parentDeferral) {
+      const level = status === "failed" ? "error" : name.startsWith("warning:") ? "warn" : "info";
+      const message = `[update finalize] ${name}: ${status}${detail ? `: ${detail}` : ""}`;
+      getLogger()[level](step, message);
+      process.stderr.write(
+        `${formatConsoleDiagnosticLine({ level, message: redactSensitiveText(message) })}\n`,
+      );
     }
     if (this.runId) {
       try {
@@ -220,6 +273,15 @@ export class UpdateFinalizationLifecycle {
 
   /** Records the phase's complete current warning list, retiring rows a shorter list drops. */
   recordWarnings(warnings: readonly string[], phase: "doctor" | "plugins" = "doctor"): void {
+    if (phase === "doctor" && !this.reportedParentDeferrals) {
+      const count = warnings.filter((detail) => PARENT_INSTALL_RECORD_DEFERRAL.test(detail)).length;
+      if (count > 0) {
+        this.reportedParentDeferrals = true;
+        const message = `[update finalize] ${count} ${count === 1 ? "plugin" : "plugins"} will converge after the parent releases install records.`;
+        getLogger().info({ count }, message);
+        process.stderr.write(`${formatConsoleDiagnosticLine({ level: "info", message })}\n`);
+      }
+    }
     warnings.forEach((detail, index) => {
       this.record(`warning:finalize:${phase}:${index}`, "completed", Date.now(), detail);
     });
@@ -375,7 +437,7 @@ export class UpdateFinalizationLifecycle {
             `[update finalize] Stalled phase children: ${JSON.stringify(diagnostics)}\n`,
           );
           this.recordDiagnostic(JSON.stringify(diagnostics));
-          if (this.json) {
+          if (this.json && this.reportsResult) {
             defaultRuntime.writeJson({
               status: "failed",
               mode: "finalize",
@@ -557,6 +619,7 @@ export class UpdateFinalizationLifecycle {
               : this.failureObservation,
           },
           this.ledgerOptions,
+          (payload) => void sendUpdateResultTelemetry(payload, { env: this.ledgerOptions?.env }),
         );
         this.unrecordedPhaseFailure = undefined;
       } catch {

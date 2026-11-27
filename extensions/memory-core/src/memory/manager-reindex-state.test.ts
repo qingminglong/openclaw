@@ -5,6 +5,7 @@ import {
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { describe, expect, it } from "vitest";
 import {
+  canUpgradeMemoryIndexProviderKey,
   MEMORY_INDEX_PROVENANCE_VERSION,
   resolveConfiguredScopeHash,
   resolveConfiguredSourcesForMeta,
@@ -58,6 +59,43 @@ const scope = (
 ) => resolveConfiguredScopeHash({ workspaceDir: "/tmp/workspace", extraPaths, multimodal });
 
 describe("memory reindex state", () => {
+  it.each<[string, Partial<MemoryIndexMeta>, boolean]>([
+    ["valid", {}, true],
+    ["older chunking", { chunkingVersion: MEMORY_CHUNKING_VERSION - 1 }, true],
+    ["newer chunking", { chunkingVersion: MEMORY_CHUNKING_VERSION + 1 }, false],
+    ["older provenance", { provenanceVersion: MEMORY_INDEX_PROVENANCE_VERSION - 1 }, false],
+    ["newer provenance", { provenanceVersion: MEMORY_INDEX_PROVENANCE_VERSION + 1 }, false],
+    ["older format", { embeddingInputFormatVersion: 0 }, false],
+    ["newer format", { embeddingInputFormatVersion: 2 }, false],
+    [
+      "older chunking and format",
+      { chunkingVersion: MEMORY_CHUNKING_VERSION - 1, embeddingInputFormatVersion: 0 },
+      false,
+    ],
+    ["changed scope", { scopeHash: "other" }, false],
+    ["undeclared provider", { provider: "other" }, false],
+    ["undeclared model", { model: "other" }, false],
+    ["undeclared key", { providerKey: "other" }, false],
+    ["already canonical", { providerKey: "current" }, false],
+  ])("promotes only compatible published aliases: %s", (_name, overrides, eligible) => {
+    const provider = { id: "openai", model: "embeddinggemma" };
+    const alias = { model: provider.model, providerKey: "legacy" };
+    const meta = createMeta({
+      ...alias,
+      embeddingInputFormatVersion: 1,
+      ...overrides,
+    });
+    const state = resolveMemoryIndexIdentityState(
+      createIdentityParams({ provider, providerKey: "current", providerAliases: [alias], meta }),
+    );
+    expect(
+      canUpgradeMemoryIndexProviderKey(state, meta, [
+        { provider: provider.id, model: provider.model, providerKey: "current" },
+        { provider: provider.id, ...alias },
+      ]),
+    ).toBe(eligible);
+  });
+
   it("automatically upgrades raw EmbeddingGemma indexes before checking the changed cache key", () => {
     expect(
       identity({
@@ -139,6 +177,16 @@ describe("memory reindex state", () => {
     expect(
       resolveMemoryIndexProviderIdentities({
         provider,
+        aliases: [alias],
+        documentPrefix: "title: none | text: ",
+      }),
+    ).not.toEqual(identities);
+    expect(
+      resolveMemoryIndexProviderIdentities({ provider, aliases: [alias], documentPrefix: "" }),
+    ).not.toEqual(identities);
+    expect(
+      resolveMemoryIndexProviderIdentities({
+        provider,
         cacheKeyData: { embeddingInputFormatVersion: 1 },
       }),
     ).not.toEqual(
@@ -152,6 +200,14 @@ describe("memory reindex state", () => {
     ).toMatchObject([
       { providerKey: hashText(JSON.stringify({ provider: "local", model: "other" })) },
     ]);
+    expect(
+      resolveMemoryIndexProviderIdentities({
+        provider: { id: "local", model: "other" },
+        documentPrefix: "",
+      }),
+    ).not.toEqual(
+      resolveMemoryIndexProviderIdentities({ provider: { id: "local", model: "other" } }),
+    );
   });
   it("invalidates indexes with missing provenance version as OpenClaw-owned", () => {
     expect(identity({ meta: createMeta({ provenanceVersion: undefined }) })).toEqual({
@@ -339,6 +395,26 @@ describe("memory reindex state", () => {
         configuredScopeHash: changedScopeHash,
       }).status !== "valid",
     ).toBe(true);
+  });
+
+  it("keeps extra path scope hashes in persisted code-unit order", () => {
+    const paths = [
+      { path: "notes/备", pattern: "reference/**/*.md" },
+      { path: "notes/阿", pattern: "reference/**/*.md" },
+    ];
+
+    const persistedScopeHash = "64b0edd0082f34c4531b871e3fb2bc509ae1d6a7b37fa053afb5ec92a5906ee2";
+
+    expect(scope(paths)).toBe(persistedScopeHash);
+    expect(scope(paths.toReversed())).toBe(persistedScopeHash);
+  });
+
+  it("orders distinct Unicode path spellings independently of input order", () => {
+    const composed = { path: "notes/é", pattern: "reference/**/*.md" };
+    const decomposed = { path: "notes/e\u0301", pattern: "reference/**/*.md" };
+
+    expect(scope([composed, decomposed])).toBe(scope([decomposed, composed]));
+    expect(scope([composed, decomposed])).not.toBe(scope([composed]));
   });
 
   it("keeps scope identity stable when only extra-path recency policy changes", () => {

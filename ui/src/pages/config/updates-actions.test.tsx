@@ -35,43 +35,66 @@ function renderUpdates(overrides: UpdatesViewOverrides = {}) {
   mountUpdates(createUpdatesViewProps(overrides));
 }
 
-function failedRun() {
-  return createUpdateRunFixture({ status: "failed", phase: "finished", reason: "build-failed" });
-}
-
 function toggle(title: string) {
   return row(title).querySelector<HTMLInputElement>('input[role="switch"]')!;
 }
 
-it.each(["confirmation", "report"] as const)(
+it.each([
+  ["onUpdateNow", "Update Gateway…"],
+  ["onReportFailure", "Report update failure"],
+] as const)(
   "retains %s progress until its admitted operation completes",
-  async (operation) => {
-    const confirmation = Promise.withResolvers<void>();
-    const report = Promise.withResolvers<void>();
-    const onUpdateNow = vi.fn(() => confirmation.promise);
-    const onReportFailure = vi.fn(() => report.promise);
-    const run = failedRun();
+  async (operation, label) => {
+    const pending = Promise.withResolvers<void>();
+    const command = vi.fn(() => pending.promise);
+    const run = createUpdateRunFixture({
+      status: "failed",
+      phase: "finished",
+      reason: "build-failed",
+    });
     renderUpdates({
-      onUpdateNow,
-      onReportFailure,
+      [operation]: command,
       update: { updateRun: run, reportableUpdateFailureId: run.runId },
     });
-    const label = operation === "confirmation" ? "Update Gateway…" : "Report update failure";
     const button = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
       (candidate) => candidate.textContent?.trim() === label,
     )!;
     button.click();
     await waitForSolid(() => expect(button.disabled).toBe(true));
     button.click();
-    expect(operation === "confirmation" ? onUpdateNow : onReportFailure).toHaveBeenCalledOnce();
-    if (operation === "confirmation") {
-      confirmation.resolve();
-    } else {
-      report.resolve();
-    }
+    expect(command).toHaveBeenCalledOnce();
+    pending.resolve();
     await waitForSolid(() => expect(button.disabled).toBe(false));
   },
 );
+
+it("offers retry after rollback without telling the user to diagnose before retrying", () => {
+  const onUpdateNow = vi.fn(async () => {});
+  const run = createUpdateRunFixture({
+    status: "failed",
+    phase: "finished",
+    reason: "The new version did not finish starting; v2026.9.1 is still running",
+    verification: {
+      serviceRunning: true,
+      runningVersion: "2026.9.1",
+      coreReady: true,
+      rollbackOutcome: { status: "succeeded", reason: "startup timed out" },
+    },
+  });
+  renderUpdates({
+    onUpdateNow,
+    gatewayVersion: "2026.9.1",
+    update: { updateRun: run, reportableUpdateFailureId: run.runId },
+  });
+  const retry = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+    (button) => button.textContent?.trim() === "Retry update",
+  )!;
+  expect(retry.disabled).toBe(false);
+  expect(container.textContent).not.toContain("Diagnose the cause before retrying");
+  expect(container.textContent).toContain("Report update failure");
+  retry.click();
+  expect(onUpdateNow).toHaveBeenCalledOnce();
+});
 
 it("shows a failed confirmation load and retries the command", async () => {
   const onUpdateNow = vi
@@ -80,13 +103,10 @@ it("shows a failed confirmation load and retries the command", async () => {
     .mockResolvedValue(undefined);
   renderUpdates({ onUpdateNow });
   row("Update Gateway…").querySelector<HTMLButtonElement>("button")!.click();
-  await waitForSolid(() =>
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
-      "Confirmation unavailable",
-    ),
-  );
+  const alert = () => container.querySelector('[role="alert"]');
+  await waitForSolid(() => expect(alert()?.textContent).toContain("Confirmation unavailable"));
   container.querySelector<HTMLButtonElement>('[role="alert"] button')!.click();
-  await waitForSolid(() => expect(container.querySelector('[role="alert"]')).toBeNull());
+  await waitForSolid(() => expect(alert()).toBeNull());
   expect(onUpdateNow).toHaveBeenCalledTimes(2);
 });
 
@@ -102,23 +122,24 @@ it("keeps native automatic-update intent until acknowledgement and permits retry
   nativeCapability = createNativeDeviceSettingsCapability();
   post.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
   renderUpdates({ nativeDeviceSettings: nativeCapability });
-  const input = toggle("Check for updates automatically");
+  const title = "Check for updates automatically";
+  const input = toggle(title);
   input.checked = false;
   input.dispatchEvent(new Event("change"));
   await waitForSolid(() => {
     expect(input.checked).toBe(false);
     expect(input.getAttribute("aria-disabled")).toBe("true");
+    expect(input.closest(".settings-row")?.textContent).not.toContain("Saving");
   });
   first.reject(new Error("Automatic updates could not be saved"));
   await waitForSolid(() =>
     expect(container.textContent).toContain("Automatic updates could not be saved"),
   );
-  const retry = row("Check for updates automatically").querySelector<HTMLButtonElement>("button")!;
-  retry.click();
+  row(title).querySelector<HTMLButtonElement>("button")!.click();
   flush();
   second.resolve({ ...snapshot, updates: { ...snapshot.updates, automatic: false } });
   await waitForSolid(() => {
-    const confirmed = toggle("Check for updates automatically");
+    const confirmed = toggle(title);
     expect(confirmed.getAttribute("aria-disabled")).toBeNull();
     expect(confirmed.checked).toBe(false);
   });

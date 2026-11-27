@@ -13,12 +13,12 @@ import { throwIfAborted } from "./abort.js";
 import { createChannelHandler } from "./deliver-channel.js";
 import type { DeliverOutboundPayloadsParams } from "./deliver-contracts.js";
 import { applyMessageSendingHook, applyReplyPayloadSendingHook } from "./deliver-hooks.js";
+import { stripInternalRuntimeScaffoldingFromPayload } from "./deliver-payload-normalize.js";
 import {
   buildPayloadSummary,
   normalizePayloadsForChannelDelivery,
   normalizeTransformedPayloadForDelivery,
   resolveChannelHandlerParams,
-  stripInternalRuntimeScaffoldingFromPayload,
 } from "./deliver-payload.js";
 import {
   createOutboundPayloadPlan,
@@ -180,7 +180,7 @@ export async function prepareStructuredOutboundPayloadBatch(
   const hasMessageSendingHooks = hookRunner?.hasHooks("message_sending") ?? false;
   const hasModifyingHooks = hasReplyPayloadSendingHooks || hasMessageSendingHooks;
   const { resolveCurrentReplyTo } = createReplyToDeliveryPolicy(params);
-  const sessionKeyForHooks = params.mirror?.sessionKey ?? params.session?.key;
+  const sessionKeyForHooks = params.session?.key;
   const modifiers = [
     {
       changedKey: "replyHookChanged",

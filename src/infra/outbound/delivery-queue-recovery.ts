@@ -54,6 +54,7 @@ import {
   settleDurableDelivery,
 } from "./delivery-completion.js";
 import { prepareOutboundDeliveryGeneration } from "./delivery-generation.js";
+import { settleFailedQueuedDeliveryCompletion } from "./delivery-queue-failure-completion.js";
 import { collectEntrySpoolPaths, releaseSpoolArtifacts } from "./delivery-queue-media-spool.js";
 import {
   cancelDeliveryQueueMediaRetention,
@@ -70,7 +71,9 @@ import { buildRecoveryDeliverParams } from "./delivery-queue-recovery-params.js"
 import {
   canReplayAmbiguousFinalText,
   isPermanentDeliveryError,
+  recoveryPlatformAttemptId,
   resolveMaxRetries,
+  resolveUnknownSendReplay,
   shouldInspectQueuedDelivery,
 } from "./delivery-queue-recovery-policy.js";
 import {
@@ -86,6 +89,7 @@ import {
   restoreDeliveryAttemptBeforeDispatch,
   type QueuedDelivery,
 } from "./delivery-queue-storage.js";
+import { commitRecoveredVisibleMessages } from "./delivery-queue-transcript.js";
 import type { DeliveryFailureSettlement } from "./delivery-queue-types.js";
 import { createOutboundMessageSentEmitter, type MessageSentEvent } from "./message-sent-hook.js";
 import {
@@ -289,11 +293,9 @@ async function settleQueuedFailure(
     // Failed custody forbids sends even after a restart. Keep the completion
     // payload until its idempotent owner projection succeeds, then compact once.
     if (entry.deliveryCompletion) {
-      await settleDurableDelivery(
+      await settleFailedQueuedDeliveryCompletion(
         entry.deliveryCompletion,
-        settlement.outcome === "failed" && settlement.rejectionError !== undefined
-          ? { rejectionError: settlement.rejectionError }
-          : { platformSendStarted: true },
+        settlement,
         params.stateDir,
         stateContext,
       );
@@ -433,18 +435,6 @@ async function runReconciledSentCommitHooks(params: {
   }
 }
 
-function recoveryPlatformAttemptId(entry: QueuedDelivery, claimedAttemptId?: string) {
-  return claimedAttemptId !== undefined
-    ? claimedAttemptId
-    : typeof entry.platformSendAttemptId === "string"
-      ? entry.platformSendAttemptId
-      : entry.recoveryState === "producer_claimed" && typeof entry.producerClaimId === "string"
-        ? entry.producerClaimId
-        : typeof entry.completionRetention === "object" || entry.requiresProducerClaim === true
-          ? null
-          : undefined;
-}
-
 async function resolveCompletedOwnerBeforeRecovery(
   opts: EntryRecoveryOptions & { owner: QueuedDeliveryOwner },
   stateContext: DeliveryQueueStateContext,
@@ -493,6 +483,7 @@ async function resolveCompletedOwnerBeforeRecovery(
     return "failed";
   }
   if (operation.state === "delivered") {
+    await commitRecoveredVisibleMessages(opts, stateContext);
     const messageId = operation.platformMessageId;
     if (messageId) {
       const result: OutboundDeliveryResult = { channel: opts.entry.channel, messageId };
@@ -544,13 +535,13 @@ async function drainQueuedEntry(
   const attemptBudgetExhausted = resolveDeliveryQueueAttemptCount(entry) >= maxRetries;
   let reconciledPlatformSendAttemptId: string | undefined;
   let reconciledPlatformSendStartedAt: number | undefined;
+  let unknownSendReplay: "blind" | "proven" | undefined;
   const ownerState = await resolveCompletedOwnerBeforeRecovery({ ...opts, owner }, stateContext);
   if (ownerState !== "continue") {
     return ownerState;
   }
   if (needsUnknownSendReconciliation(entry)) {
-    // A crash after platform send start cannot be blindly replayed; adapters
-    // must reconcile whether the platform already committed the message.
+    // Unconfirmed sends: adapter reconciliation decides first, then the shared final-text rule.
     const reconciliation =
       entry.legacyUnknownSendReconciliation ??
       (await reconcileUnknownQueuedDelivery({
@@ -579,6 +570,7 @@ async function drainQueuedEntry(
           );
         }
         await owner.ack();
+        await commitRecoveredVisibleMessages(opts, stateContext);
         emitRecoveredTerminalEvents(entry, { result });
         await runReconciledSentCommitHooks({
           entry,
@@ -602,14 +594,12 @@ async function drainQueuedEntry(
         return await recordRecoveryFailure(owner, errMsg);
       }
     }
-    const reconciliationProvedPreSendFailure =
-      reconciliation?.status === "not_sent" && entry.recoveryState === "send_attempt_started";
-    const replayFinalText = !attemptBudgetExhausted && canReplayAmbiguousFinalText(entry);
-    if (reconciliationProvedPreSendFailure || replayFinalText) {
+    unknownSendReplay = resolveUnknownSendReplay(entry, reconciliation);
+    if (unknownSendReplay) {
       reconciledPlatformSendAttemptId = entry.platformSendAttemptId;
       reconciledPlatformSendStartedAt = entry.platformSendStartedAt;
       opts.log.info(
-        replayFinalText
+        unknownSendReplay === "blind"
           ? `Delivery entry ${entry.id} retrying an unconfirmed final text reply`
           : `Delivery entry ${entry.id} reconciled ${entry.recoveryState} as not sent; replaying`,
       );
@@ -677,7 +667,7 @@ async function drainQueuedEntry(
         reconciledPlatformSendStartedAt,
         reconciledPlatformSendAttemptId,
         stateContext,
-        canReplayAmbiguousFinalText(entry) ? true : undefined,
+        unknownSendReplay === "blind" ? true : undefined,
       )
     : undefined;
   if (requiresProducerClaim && !producerClaimId) {
@@ -1244,13 +1234,14 @@ export async function drainPendingDeliveriesCore(
   const drained = await recoveryCoordinator.withDrain(opts.drainKey, async () => {
     const now = Date.now();
     const matchingEntries = (await loadUnfinishedDeliveries(opts.stateDir, stateContext)).filter(
-      (entry) => shouldInspectQueuedDelivery(entry, now, opts.selectEntry),
+      (entry) => Boolean(entry.settlement) || opts.selectEntry(entry, now).match,
     );
+    // Leased matches still need a later scan, but cannot acquire an inspection claim yet.
     if (matchingEntries.length > 0) {
       opts.onPending?.();
     }
     await recoveryCoordinator.scan({
-      entries: matchingEntries,
+      entries: matchingEntries.filter((entry) => shouldInspectQueuedDelivery(entry, now)),
       laneKey: (entry) => recoveryLaneKey(entry, opts.cfg, stateContext.stateDir),
       loadEntry: (id) => loadUnfinishedDelivery(id, opts.stateDir, stateContext),
       onMissingEntry: (entry) => {

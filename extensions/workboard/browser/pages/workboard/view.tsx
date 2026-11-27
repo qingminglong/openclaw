@@ -1,5 +1,5 @@
 /** @jsxImportSource @solidjs/web */
-import { createMemo, For } from "solid-js";
+import { createMemo, For, Show } from "solid-js";
 import { SelectPicker } from "../../components/host-components.tsx";
 import { icons } from "../../components/icons.tsx";
 import { WorkboardToast } from "../../components/toast.tsx";
@@ -7,7 +7,6 @@ import { t } from "../../i18n/index.ts";
 import { listSelectableAgents } from "../../lib/agents/display.ts";
 import { createElementRefs } from "../../lib/element-refs.ts";
 import {
-  filterWorkboardCards,
   groupWorkboardCardsByStatus,
   workboardCardMatchesHealthKey,
 } from "../../lib/workboard/derived.ts";
@@ -52,6 +51,8 @@ import { boardScrollEdgesRef } from "./view-scroll-fade.ts";
 import { WorkboardSearch } from "./view-search.tsx";
 import { matchesWorkboardCardScope, SelectionActions, SelectionDialog } from "./view-selection.tsx";
 import type { WorkboardSelectOption } from "./workboard-select.ts";
+
+const WORKBOARD_RECENT_DONE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 const workboardFilterPopoverId = "workboard-filter-popover";
 
@@ -140,8 +141,13 @@ export function WorkboardView(
   const state = workboardViewState(() => props);
   const view = createMemo(() => {
     const current = state();
+    const cardsKnown = current.loaded || current.cards.length > 0;
     const agentOptions = buildAgentFilterOptions(props.agentsList, current.cards);
-    const boardOptions = buildBoardFilterOptions(current.boards, current.cards);
+    const boardOptions = buildBoardFilterOptions(
+      current.boards,
+      current.cards,
+      !current.nextCursor,
+    );
     // A deleted board keeps its route filter instead of exposing every board.
     const activeBoardFilter = current.boardFilter;
     const scopedCards = current.cards
@@ -149,14 +155,31 @@ export function WorkboardView(
       .filter((card) => matchesWorkboardCardScope(props, card))
       .filter((card) => matchesCardQuery(card, current.query));
     const now = Date.now();
-    const cardsForFilters = (ignore?: "status" | "priority" | "attention") =>
-      filterWorkboardCards({
-        cards: scopedCards,
-        filters: current,
-        sessions: props.sessions,
-        now,
-        ignore,
+    const cardsForFilters = (ignore?: "status" | "priority" | "attention") => {
+      const sessions = props.sessions;
+      const { statusFilter, priorityFilter, attentionFilter, donePeriod } = current;
+      return scopedCards.filter((card) => {
+        if (ignore !== "status" && statusFilter.size && !statusFilter.has(card.status)) {
+          return false;
+        }
+        if (ignore !== "priority" && priorityFilter.size && !priorityFilter.has(card.priority)) {
+          return false;
+        }
+        if (
+          ignore !== "attention" &&
+          attentionFilter.size &&
+          ![...attentionFilter].some((key) => workboardCardMatchesHealthKey(card, key, sessions))
+        ) {
+          return false;
+        }
+        // The completion window trims history without hiding unfinished work.
+        return (
+          donePeriod === "all" ||
+          card.status !== "done" ||
+          (card.completedAt ?? card.updatedAt) >= now - WORKBOARD_RECENT_DONE_WINDOW_MS
+        );
       });
+    };
     const filtered = cardsForFilters();
     const visibleError = workboardErrorMessage(current, props.pageError);
     const selectedCards = current.cards.filter((card) => current.selectedCardIds.has(card.id));
@@ -172,16 +195,19 @@ export function WorkboardView(
       value: priority,
       label: formatPriorityLabel(priority),
       icon: () => <PriorityIcon priority={priority} />,
-      count: priorityCards.filter((card) => card.priority === priority).length,
+      count: cardsKnown
+        ? priorityCards.filter((card) => card.priority === priority).length
+        : undefined,
     }));
     const attentionCards = cardsForFilters("attention");
     const attentionOptions = (["stale", "missingProof"] as const).map((key) => ({
       value: key,
       label: t(key === "stale" ? "workboard.filterStale" : "workboard.filterMissingProof"),
       title: t(key === "stale" ? "workboard.filterStaleHint" : "workboard.filterMissingProofHint"),
-      count: attentionCards.filter((card) =>
-        workboardCardMatchesHealthKey(card, key, props.sessions),
-      ).length,
+      count: cardsKnown
+        ? attentionCards.filter((card) => workboardCardMatchesHealthKey(card, key, props.sessions))
+            .length
+        : undefined,
     }));
     const agentFilterOptions: WorkboardSelectOption[] = agentOptions.map((option) => ({
       value: option.id,
@@ -288,7 +314,8 @@ export function WorkboardView(
       boardOptions,
       activeBoardFilter,
       filtered,
-      statusCards: cardsForFilters("status"),
+      cardsKnown,
+      statusCards: cardsKnown ? cardsForFilters("status") : null,
       visibleError,
       selectedCards,
       byStatus,
@@ -354,10 +381,7 @@ export function WorkboardView(
                     {t("workboard.newBoard")}
                   </button>
                 ) : null}
-                <span
-                  class="workboard-refresh-control"
-                  title={view().refreshStatus || t("common.refresh")}
-                >
+                <span class="workboard-refresh-control" title={view().refreshStatus || undefined}>
                   <button
                     class={[
                       "btn btn--icon btn--ghost workboard-refresh",
@@ -597,26 +621,28 @@ export function WorkboardView(
                 </button>
               </div>
             ) : null}
-            {(view().filtered.length === 0 && view().activeFiltering) ||
-            view().visibleStatuses.length === 0 ? (
-              <div class="workboard-empty-state" role="status">
-                <strong>{t("workboard.emptyFilteredTitle")}</strong>
-                <span>{t("workboard.emptyFilteredHint")}</span>
-                {view().hasActiveFilters ? (
-                  <button class="btn" type="button" onClick={clearFilters}>
-                    {t("workboard.clearFilters")}
-                  </button>
-                ) : null}
-              </div>
-            ) : (
-              <WorkboardColumns
-                workboard={props}
-                statuses={view().visibleStatuses}
-                byStatus={view().byStatus}
-                cardRefs={cardRefs}
-                menuCardId={selectedMenuCardId()}
-              />
-            )}
+            <Show when={view().cardsKnown}>
+              {(view().filtered.length === 0 && view().activeFiltering) ||
+              view().visibleStatuses.length === 0 ? (
+                <div class="workboard-empty-state" role="status">
+                  <strong>{t("workboard.emptyFilteredTitle")}</strong>
+                  <span>{t("workboard.emptyFilteredHint")}</span>
+                  {view().hasActiveFilters ? (
+                    <button class="btn" type="button" onClick={clearFilters}>
+                      {t("workboard.clearFilters")}
+                    </button>
+                  ) : null}
+                </div>
+              ) : (
+                <WorkboardColumns
+                  workboard={props}
+                  statuses={view().visibleStatuses}
+                  byStatus={view().byStatus}
+                  cardRefs={cardRefs}
+                  menuCardId={selectedMenuCardId()}
+                />
+              )}
+            </Show>
             {menu}
           </div>
           <WorkboardToast

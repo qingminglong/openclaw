@@ -1,13 +1,13 @@
 import path from "node:path";
+import type { StatementSync } from "node:sqlite";
 import type { Message } from "openclaw/plugin-sdk/llm";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { requireNodeSqlite } from "../../infra/node-sqlite.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
 import { readActiveTranscriptEntryAnchor, replaceSessionEntry } from "./session-accessor.js";
-import {
-  readTranscriptExportSnapshotReadOnlySync,
-  readTranscriptStatsSync,
-} from "./session-accessor.sqlite-read.js";
+import { readTranscriptExportSnapshotReadOnlySync } from "./session-accessor.sqlite-export-read.js";
+import { readTranscriptStatsSync } from "./session-accessor.sqlite-read.js";
 import {
   resolveSqliteTranscriptReadScope,
   toDatabaseOptions,
@@ -145,6 +145,22 @@ describe("SQLite transcript readers release the read snapshot before parsing", (
     async (bytes) => {
       const { events, scope } = await seedSession();
       sliceBudget.bytes = bytes;
+      const prototype = requireNodeSqlite().StatementSync.prototype;
+      const iterate = vi.spyOn(prototype, "iterate");
+      let expandedPayloadBytes = 0;
+      prototype.iterate = function* (this: StatementSync, ...params) {
+        const rows: ReturnType<StatementSync["iterate"]> = Reflect.apply(iterate, this, params);
+        for (const row of rows) {
+          for (const value of Object.values(row)) {
+            // Compressed fixture bodies must not round-trip through SQLite as expanded text.
+            if (typeof value === "string" && value.includes(MARKER) && value.length > 1024) {
+              expandedPayloadBytes += Buffer.byteLength(value);
+            }
+          }
+          yield row;
+        }
+        return undefined;
+      };
       const realParse = JSON.parse.bind(JSON);
       vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
         if (typeof text === "string" && text.includes(MARKER)) {
@@ -158,6 +174,7 @@ describe("SQLite transcript readers release the read snapshot before parsing", (
         return event;
       });
       expect(readEvents(scope, projectEvent)).toEqual(events);
+      expect(expandedPayloadBytes).toBe(0);
       expect(projectEvent.mock.calls.map(([event]) => event)).toEqual(events);
       expect(transactionLog.entries).toEqual(
         bytes === 1
@@ -234,6 +251,21 @@ describe("SQLite transcript readers release the read snapshot before parsing", (
     for (const id of ["entry-0", "entry-2", ...unicode.map((event) => event.id)]) {
       expect(entries[entries.indexOf(`parse ${id}`) + 1]).toBe("transaction");
     }
+  });
+
+  it("reads small SQLite rows in one transaction while they fit the byte budget", async () => {
+    const { events: seeded, scope } = await seedSession();
+    const rows = Array.from({ length: 600 }, (_, index) => ({
+      type: "message",
+      id: `small-${index}`,
+      parentId: index === 0 ? "entry-3" : `small-${index - 1}`,
+      timestamp: "2026-04-01T05:46:41.000Z",
+      message: userMessage(`small ${index}`),
+    }));
+    const events = [...seeded, ...rows];
+    await replaceTranscriptEvents(scope, events);
+    expect(readEvents(scope)).toEqual(events);
+    expect(transactionLog.entries).toEqual(["transaction"]);
   });
 
   it("continues an incremental export after the previous projection in slices", async () => {
